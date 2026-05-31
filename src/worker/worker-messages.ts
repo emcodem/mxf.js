@@ -22,6 +22,11 @@ export type WorkerCommand =
     }
   | { type: 'seek'; targetFrame: number }
   | {
+      /** Abandon any in-flight/queued forward prefetch immediately (e.g. when a scrub starts), so the
+       *  worker is free for previews. Bumps the seek generation so the in-flight transcode bails. */
+      type: 'cancelPrefetch';
+    }
+  | {
       /** Fast-drag scrub: resolve the GOP-head keyframe for targetFrame, decode just that I-frame
        *  stretched across its GOP, and reply with previewDone{seq}. One round-trip (vs seek→seeked
        *  →fetch). `seq` lets the player's single-flight pump match the reply to its request. */

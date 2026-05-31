@@ -147,6 +147,12 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    * preview frame); endScrub() resumes playback if it was running.
    */
   beginScrub(): void {
+    // Free the worker for previews the instant scrubbing starts: drop any in-flight/queued forward
+    // prefetch (the in-flight transcode bails on the generation bump). Without this, a scrub that
+    // begins while a forward buffer-fill is running waits behind it before previews appear. The
+    // abandoned fetch won't post segmentDone, so clear fetchPending — endScrub's seek re-arms it.
+    this.worker?.postMessage({ type: 'cancelPrefetch' } as WorkerCommand);
+    this.fetchPending = false;
     this.scrub.beginScrub();
   }
 
@@ -426,6 +432,8 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // already asked for, so this bounds prefetch to maxBufferSeconds regardless of how the decoded
     // timeline lands in `buffered` (a transcode timeline that lags, or fragmented ranges, made the
     // old buffered-ahead check undercount and prefetch the WHOLE file → worker saturation + quota).
+    // Prefetch is cancelled wholesale when a scrub starts (beginScrub → cancelPrefetch), so it's
+    // fine to fill the full look-ahead here regardless of play/pause state.
     const requestedAheadSeconds = this.nextFetchFrame / fps - currentTime;
     if (requestedAheadSeconds >= this.config.maxBufferSeconds) return;
 

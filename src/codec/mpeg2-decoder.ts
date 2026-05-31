@@ -602,6 +602,14 @@ export class Mpeg2Decoder {
   // picture state
   private pictureType = 0;
   private hasHeldAnchor = false;
+  // Type of the frame currently held back as the display-reorder anchor (the I/P in forwardY).
+  // Tracked separately because at emit time `pictureType` is the NEXT picture being decoded, so it
+  // can't tell us whether the HELD frame was the keyframe.
+  private heldAnchorIsKeyframe = false;
+  // Set by reset(): after a seek/scrub we discard emitted frames until the random-access I-frame is
+  // emitted, so an undecodable open-GOP leading B never lands at the keyframe's slot. Cleared the
+  // moment that keyframe is emitted.
+  private suppressUntilKeyframe = false;
   private fullPelForward = false;
 
   // macroblock state
@@ -669,8 +677,10 @@ export class Mpeg2Decoder {
    */
   flush(): void {
     if (this.hasHeldAnchor) {
-      this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr,
-        this.pictureType === PICTURE_TYPE.INTRA);
+      if (!this.suppressUntilKeyframe || this.heldAnchorIsKeyframe) {
+        this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr, this.heldAnchorIsKeyframe);
+        if (this.heldAnchorIsKeyframe) this.suppressUntilKeyframe = false;
+      }
       this.hasHeldAnchor = false;
     }
   }
@@ -701,13 +711,22 @@ export class Mpeg2Decoder {
    * are constant for the whole clip, so retaining them lets the decoder restart at any keyframe
    * even when that keyframe's access unit does not re-transmit a sequence header — otherwise
    * decode() would bail (hasSequenceHeader=false) and the seeked frame would never appear.
-   * Stale reference frames are harmless: the keyframe is intra-coded, and following P/B frames
-   * reference freshly-decoded anchors.
+   *
+   * OPEN GOPs (XDCAM long-GOP): a GOP's leading B-frames are coded after the I but displayed before
+   * it and reference the PREVIOUS GOP's anchor. After a seek/scrub into such a GOP that anchor is
+   * gone, so those B-frames are undecodable. We therefore SUPPRESS emitted frames until the
+   * random-access I-frame is emitted (`suppressUntilKeyframe`) — the keyframe, not an undecodable
+   * leading B, lands at the keyframe's slot. As defence-in-depth the reference buffers are also
+   * blanked to neutral grey (Y=0, chroma=128 — NOT all-zero, which is bright green in YUV).
    */
   reset(): void {
     this.bits.reset();
     this.hasHeldAnchor = false;
     this.pictureType = 0;
+    this.suppressUntilKeyframe = true;
+    this.currentY.fill(0);  this.currentCb.fill(128);  this.currentCr.fill(128);
+    this.forwardY.fill(0);  this.forwardCb.fill(128);  this.forwardCr.fill(128);
+    this.backwardY.fill(0); this.backwardCb.fill(128); this.backwardCr.fill(128);
   }
 
   // -------------------------------------------------------------------------
@@ -849,10 +868,17 @@ export class Mpeg2Decoder {
     // Display reordering: I/P frames hold back previous anchor; B frames emit immediately
     if (this.pictureType === PICTURE_TYPE.INTRA || this.pictureType === PICTURE_TYPE.PREDICTIVE) {
       if (this.hasHeldAnchor) {
-        this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr,
-          this.pictureType === PICTURE_TYPE.INTRA);
+        // Emit the PREVIOUSLY held anchor (in forwardY). Its keyframe-ness is heldAnchorIsKeyframe,
+        // not the current pictureType. While suppressing after a reset, drop everything until this
+        // is the random-access keyframe.
+        const key = this.heldAnchorIsKeyframe;
+        if (!this.suppressUntilKeyframe || key) {
+          this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr, key);
+          if (key) this.suppressUntilKeyframe = false;
+        }
       }
       this.hasHeldAnchor = true;
+      this.heldAnchorIsKeyframe = this.pictureType === PICTURE_TYPE.INTRA; // the frame now held
       // Rotate buffers: current → forward, forward → backward, backward → current
       let tmp = this.backwardY; let tmp32 = this.backwardY32;
       this.backwardY = this.forwardY; this.backwardY32 = this.forwardY32;
@@ -869,8 +895,11 @@ export class Mpeg2Decoder {
       this.forwardCb  = this.currentCb; this.forwardCb32  = this.currentCb32;
       this.currentCb  = tmp;            this.currentCb32  = tmp32;
     } else {
-      // B-frame: emit immediately, no rotation
-      this.emitFrame(this.currentY, this.currentCb, this.currentCr, false);
+      // B-frame: emit immediately, no rotation — unless still suppressing leading B's after a reset
+      // (those reference a previous GOP we no longer have).
+      if (!this.suppressUntilKeyframe) {
+        this.emitFrame(this.currentY, this.currentCb, this.currentCr, false);
+      }
     }
   }
 

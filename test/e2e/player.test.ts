@@ -420,6 +420,117 @@ describe('MXF player E2E', () => {
     // drag is far slower and paints reliably), so asserting it would be flaky.
   }, 60_000);
 
+  // Scrub THROUGHPUT characterization: drive the drag at controlled content-time-per-real-time
+  // speeds and measure how many frames the <video> actually PRESENTS (via requestVideoFrameCallback,
+  // which fires once per frame painted to the compositor — even for a paused seek). This surfaces the
+  // known limit: MPEG-2 is a per-keyframe transcode (~few previews/s) so display-fps drops as the
+  // drag outruns it, whereas XAVC remux stays smooth. Defaults to the MPEG-2 long-GOP file (the
+  // interesting case); override with TEST_SPEED_FILE.
+  const SPEED_FILE = process.env.TEST_SPEED_FILE ?? process.env.TEST_SCRUB_FILE ?? 'C:/temp/jsmxf/xdcam_vistek.mxf';
+  test('scrub throughput at varying speeds (frames actually displayed)', async () => {
+    if (!fs.existsSync(SPEED_FILE)) {
+      console.log(`skip scrub-speed test — file not found: ${SPEED_FILE}`);
+      return;
+    }
+    const page = await browser.newPage();
+    const logs: string[] = [];
+    page.on('console', m => logs.push(`[${m.type()}] ${m.text()}`));
+    page.on('pageerror', e => logs.push(`[pageerror] ${e.message}`));
+    await page.goto(`http://localhost:${PORT}/demo/index.html`, { waitUntil: 'networkidle0' });
+
+    const input = await page.$('#fileInput');
+    await input!.uploadFile(SPEED_FILE);
+    await page.waitForFunction(
+      () => (document.querySelector('#log')?.textContent ?? '').includes('Manifest loaded'),
+      { timeout: 30_000 },
+    );
+    await new Promise(r => setTimeout(r, 2_000)); // let initial buffer-ahead settle
+
+    // content seconds advanced per real second
+    const SPEEDS = [
+      { label: '10s/s', cps: 10 },
+      { label: '1min/s', cps: 60 },
+      { label: '5min/s', cps: 300 },
+    ];
+    const WINDOW_MS = 3_000;
+
+    const results = await page.evaluate(async (speeds, windowMs) => {
+      const bar = document.getElementById('seekBar') as HTMLInputElement;
+      const video = document.getElementById('video') as HTMLVideoElement;
+      const dur = parseFloat(bar.max);
+      const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+      const decoded = () => video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0;
+
+      // requestVideoFrameCallback: fires once per frame actually presented to the compositor.
+      // Count them and record the distinct content (media) times shown.
+      const rvfc = (video as unknown as {
+        requestVideoFrameCallback?: (cb: (now: number, md: { mediaTime: number }) => void) => number;
+      }).requestVideoFrameCallback?.bind(video);
+      let presented = 0;
+      const shownMediaTimes = new Set<string>();
+      let running = true;
+      if (rvfc) {
+        const onF = (_now: number, md: { mediaTime: number }) => {
+          presented++;
+          if (md && typeof md.mediaTime === 'number') shownMediaTimes.add(md.mediaTime.toFixed(2));
+          if (running) rvfc(onF);
+        };
+        rvfc(onF);
+      }
+
+      const out: Array<Record<string, number | string | boolean>> = [];
+      for (const sp of speeds) {
+        const presentedStart = presented;
+        const shownStart = shownMediaTimes.size;
+        const decodedStart = decoded();
+        const targets = new Set<string>();
+
+        bar.dispatchEvent(new Event('mousedown')); // beginScrub
+        const t0 = performance.now();
+        let last = t0, pos = 0, dir = 1;
+        while (performance.now() - t0 < windowMs) {
+          const now = performance.now();
+          const dt = (now - last) / 1000; last = now;
+          pos += dir * sp.cps * dt;
+          if (pos >= dur) { pos = dur; dir = -1; }   // ping-pong so motion stays continuous
+          if (pos <= 0) { pos = 0; dir = 1; }
+          bar.value = String(pos);
+          bar.dispatchEvent(new Event('input'));     // scrubTo
+          targets.add(pos.toFixed(1));
+          await sleep(16);                            // ~60 drag updates/s
+        }
+        bar.dispatchEvent(new Event('change'));       // endScrub (settle)
+        await sleep(1_500);
+
+        const presentedDuring = presented - presentedStart;
+        out.push({
+          speed: sp.label,
+          targetsIssued: targets.size,
+          presentedFrames: presentedDuring,
+          distinctFramesShown: shownMediaTimes.size - shownStart,
+          decodedFrames: decoded() - decodedStart,
+          displayedFps: +(presentedDuring / (windowMs / 1000)).toFixed(1),
+          rvfcAvailable: !!rvfc,
+        });
+      }
+      running = false;
+      return out;
+    }, SPEEDS, WINDOW_MS);
+
+    console.log('scrub-speed results:', JSON.stringify(results, null, 2));
+    await page.close();
+
+    const fatal = logs.filter(l => l.includes('FATAL') || l.includes('pageerror'));
+    expect(fatal, `Errors during speed scrub:\n${fatal.join('\n')}`).toHaveLength(0);
+    // Characterization, not a perf bar: just assert the scrub never wedged at ANY speed — every
+    // speed must keep issuing distinct targets and present at least one frame (the displayed-fps
+    // table is the real, logged, output).
+    for (const r of results) {
+      expect(r.targetsIssued as number, `no drag motion at ${r.speed}: ${JSON.stringify(r)}`).toBeGreaterThan(1);
+      expect(r.presentedFrames as number, `nothing displayed at ${r.speed}: ${JSON.stringify(r)}`).toBeGreaterThanOrEqual(1);
+    }
+  }, 90_000);
+
   // Buffering regression: high-bitrate AVC-Intra (~280 Mbps) must NOT prefetch the whole file
   // (which saturated the worker and overflowed the SourceBuffer with QuotaExceededError). The
   // resident buffer must stay bounded and no quota/SourceBuffer error must fire.

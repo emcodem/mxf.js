@@ -512,6 +512,9 @@ const commandHandlers: CommandHandlers = {
   },
   seek: (cmd) => handleSeek(cmd.targetFrame),
   scrubPreview: (cmd) => handleScrubPreview(cmd.targetFrame, cmd.seq),
+  // Scrub started: drop in-flight/queued forward prefetch so the worker is free for previews. The
+  // in-flight transcode checks the generation after each frame and bails; queued jobs are cleared.
+  cancelPrefetch: () => { fetchQ.supersede(); },
 };
 
 self.addEventListener('message', (event: MessageEvent<WorkerCommand>) => {
