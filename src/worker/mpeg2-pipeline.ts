@@ -39,6 +39,8 @@ export class Mpeg2Pipeline {
   /** Display dimensions from the decoded frame. */
   readonly displayWidth: number;
   readonly displayHeight: number;
+  /** Chroma format the stream opened with (1 = 4:2:0, 2 = 4:2:2). */
+  readonly chromaFormat: number;
 
   private constructor(
     private readonly decoder: Mpeg2Decoder,
@@ -57,6 +59,7 @@ export class Mpeg2Pipeline {
     this.codedHeight = probe.codedHeight;
     this.displayWidth = probe.width;
     this.displayHeight = probe.height;
+    this.chromaFormat = probe.chromaFormat;
   }
 
   /**
@@ -113,6 +116,19 @@ export class Mpeg2Pipeline {
     // One persistent decoder for the whole stream; its onFrame callback drives the encoder.
     let pipeline: Mpeg2Pipeline;
     const decoder = new Mpeg2Decoder((decoded) => {
+      // The transcoder + avc1 box are configured from the FIRST frame's coded dimensions and chroma
+      // (the probe). A later frame that differs (multi-programme MXF, mid-stream resolution/chroma
+      // change) would silently produce a wrong-sized VideoFrame or mis-downsampled chroma — surface
+      // it as an error instead. (The decoder independently rejects an unsupported chroma_format.)
+      if (decoded.codedWidth !== pipeline.codedWidth ||
+          decoded.codedHeight !== pipeline.codedHeight ||
+          decoded.chromaFormat !== pipeline.chromaFormat) {
+        throw new Error(
+          `Mid-stream format change not supported: a later frame is ${decoded.codedWidth}×${decoded.codedHeight} ` +
+          `chroma=${decoded.chromaFormat}, but the stream opened as ${pipeline.codedWidth}×${pipeline.codedHeight} ` +
+          `chroma=${pipeline.chromaFormat}`,
+        );
+      }
       const tsUs = Number(pipeline.editUnitCounter) * pipeline.frameDurUs;
       transcoder.encodeFrame(decoded, tsUs, pipeline.firstFrameOfSegment);
       pipeline.firstFrameOfSegment = false;

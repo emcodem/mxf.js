@@ -174,6 +174,10 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
     let pendingVideoInit: { codec: string; description: Uint8Array; width: number; height: number } | null = null;
 
     if (pd?.codec === 'h264') {
+      // The init segment's avc1/avcC box is built from the SPS/PPS in the FIRST video frame (it must
+      // be a keyframe carrying parameter sets). If that extraction fails there is no correct init
+      // segment to build, so fail loudly rather than guessing dimensions (see mp4-fragmenter).
+      let gotSpsPps = false;
       try {
         const extractor = new EssenceExtractor(loader_, bootstrap);
         for await (const frame of extractor.fetchFrames(0n, 1)) {
@@ -181,6 +185,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
           const avccData = isAnnexB(frame.data) ? annexBtoAVCC(frame.data) : frame.data;
           const { sps, pps } = extractSPSPPS(avccData);
           if (sps.length > 0 && pps.length > 0) {
+            gotSpsPps = true;
             fragmenter!.setSPSPPS(sps[0], pps[0]);
             if (videoMode === 'webcodecs') {
               const desc = buildAVCDecoderConfigRecord(sps[0], pps[0]);
@@ -192,7 +197,12 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
           break;
         }
       } catch (e) {
-        console.error('[worker] H.264 pre-fetch failed:', e);
+        postError(`H.264: failed to read SPS/PPS from the first frame: ${e instanceof Error ? e.message : String(e)}`, true);
+        return;
+      }
+      if (!gotSpsPps) {
+        postError('H.264: no SPS/PPS in the first video frame — cannot build an init segment (the first frame must be a keyframe carrying parameter sets)', true);
+        return;
       }
     }
 

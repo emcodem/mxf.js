@@ -757,6 +757,14 @@ export class Mpeg2Decoder {
     this.bits.skip(8); // profile_and_level_indication
     this.bits.skip(1); // progressive_sequence
     this.chromaFormat = this.bits.read(2);
+    // Only 4:2:0 (1) and 4:2:2 (2) are supported. 4:4:4 (3) and the reserved value (0) would
+    // silently mis-size the chroma planes (initBuffers) and block counts (decodeMacroblock),
+    // producing corrupt output or a buffer overrun — so reject them loudly here at parse time.
+    // (D-10 is 4:2:2; most Long-GOP MPEG-2 is 4:2:0.)
+    if (this.chromaFormat !== 1 && this.chromaFormat !== 2) {
+      const name = this.chromaFormat === 3 ? '4:4:4' : `reserved (${this.chromaFormat})`;
+      throw new Error(`Unsupported MPEG-2 chroma_format ${name} — only 4:2:0 and 4:2:2 are supported`);
+    }
     this.bits.skip(2 + 2 + 12 + 1 + 8 + 1 + 2 + 5);
   }
 

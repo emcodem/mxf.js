@@ -81,20 +81,15 @@ export class Mp4Fragmenter {
 
       let codecBox: Uint8Array;
       if (this.videoCodec === 'h264') {
-        if (this.spsNALU && this.ppsNALU) {
-          codecBox = avc1(w, h, this.spsNALU, this.ppsNALU);
-        } else {
-          // Fallback: minimal syntactically-valid SPS for 1920×1080 High profile level 4.0
-          // This is only used if the pre-fetch in the worker failed to extract SPS/PPS.
-          const fallbackSPS = new Uint8Array([
-            0x67,0x64,0x00,0x28,0xac,0xd9,0x40,0xa0,
-            0x2f,0xf9,0x70,0x11,0x00,0x00,0x03,0x00,
-            0x01,0x00,0x00,0x03,0x00,0x32,0x0f,0x18,
-            0x31,0x96,
-          ]);
-          const fallbackPPS = new Uint8Array([0x68,0xeb,0xe3,0xcb,0x22,0xc0]);
-          codecBox = avc1(w, h, fallbackSPS, fallbackPPS);
+        if (!this.spsNALU || !this.ppsNALU) {
+          // No SPS/PPS means we cannot build a correct avc1/avcC box. This used to silently emit a
+          // hardcoded 1920×1080 High@4.0 SPS, which produced a WRONG-SIZED init segment for any
+          // other resolution/profile — Chrome's MSE parser then rejected it (or, worse, mis-sized
+          // the video). Fail loudly instead: the worker should have extracted SPS/PPS from the
+          // first keyframe; surface that it couldn't rather than guessing.
+          throw new Error('Cannot build H.264 init segment: SPS/PPS unavailable (extraction from the first keyframe failed)');
         }
+        codecBox = avc1(w, h, this.spsNALU, this.ppsNALU);
       } else {
         codecBox = mp4v(w, h);
       }

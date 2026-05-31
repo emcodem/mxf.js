@@ -120,6 +120,13 @@ export class Mpeg2Transcoder {
   encodeFrame(frame: YUVFrame, timestampUs: number, forceKeyframe: boolean): void {
     if (this.encoderError) throw this.encoderError;
 
+    // Only 4:2:0 (1, pass-through) and 4:2:2 (2, downsampled below) are handled. The decoder already
+    // rejects other chroma formats, but guard here too: the `else` branch assumes 4:2:0 layout, so an
+    // unexpected format would silently mis-interpret the chroma planes rather than fail.
+    if (frame.chromaFormat !== 1 && frame.chromaFormat !== 2) {
+      throw new Error(`Transcoder: unsupported chroma format ${frame.chromaFormat} (only 4:2:0 and 4:2:2)`);
+    }
+
     const ySize = frame.codedWidth * frame.codedHeight;
     const uvW   = frame.codedWidth >> 1;
     const uvH   = frame.codedHeight >> 1; // always 4:2:0 output
