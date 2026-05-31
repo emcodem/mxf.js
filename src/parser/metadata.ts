@@ -60,11 +60,7 @@ const CLASS_CDCI_DESCRIPTOR     = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x
 const CLASS_RGBA_DESCRIPTOR     = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x29,0x00);
 const CLASS_MPEGVID_DESCRIPTOR  = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x51,0x00);
 const CLASS_AVC_DESCRIPTOR      = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x5a,0x00);
-const CLASS_WAVE_DESCRIPTOR     = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x48,0x00);
-const CLASS_SOUND_DESCRIPTOR    = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x42,0x00);
-const CLASS_AES_DESCRIPTOR      = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x47,0x00);
-// Generic Multi-channel Sound Descriptor (used by some encoders)
-const CLASS_MULTICHAN_DESCRIPTOR = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x7a,0x00);
+// (Sound descriptors are detected by their audio local tags, not class UL — see below.)
 
 // ── Data definition ULs (for track type identification) ────────────────────────
 // Only bytes 8-15 are significant; bytes 5-7 vary by spec version.
@@ -154,6 +150,17 @@ export function parseHeaderMetadata(
     const pkt = iter.next();
     if (!pkt) break;
 
+    const k = pkt.key;
+    // Skip KLV fill (06 0E 2B 34 01 01 01 02 03 01 02 10 …) that may sit between/after sets.
+    if (k[8] === 0x03 && k[9] === 0x01 && k[10] === 0x02 && k[11] === 0x10) continue;
+    // Stop at the first non-metadata KLV so we can safely read past an understated headerByteCount
+    // (XAVC, D-10) without mis-parsing index/essence as sets. Header-metadata sets are keyed
+    // 06 0E 2B 34 .. 0D 01 01 01 .. (byte10 === 0x01); Index Table Segments and partition packs are
+    // 0D 01 02 01 (byte10 === 0x02) and Generic Container essence is 0D 01 03 01 (byte10 === 0x03).
+    // Everything else (incl. dark/unknown sets) is still parsed as before — only these explicit
+    // boundaries end the metadata region.
+    if (k[8] === 0x0d && k[9] === 0x01 && k[10] !== 0x01) break;
+
     const localItems = parseLocalTagItems(buffer, pkt.valueOffset, pkt.valueLength);
     const instanceUID = localItems.get(TAG_INSTANCE_UID) ?? new Uint8Array(16);
     const classUL = new Uint8Array(pkt.key);
@@ -188,12 +195,15 @@ export function parseHeaderMetadata(
       if (debug) console.log(`[jsmxf] found picture descriptor: codec=${pictureDescriptor.codec} ${pictureDescriptor.storedWidth}x${pictureDescriptor.storedHeight}`);
     }
 
-    if (ulMatchClass(cls, CLASS_WAVE_DESCRIPTOR) ||
-        ulMatchClass(cls, CLASS_AES_DESCRIPTOR) ||
-        ulMatchClass(cls, CLASS_SOUND_DESCRIPTOR) ||
-        ulMatchClass(cls, CLASS_MULTICHAN_DESCRIPTOR)) {
+    // Detect a sound descriptor by the presence of audio local tags rather than by descriptor
+    // class UL. All uncompressed audio is treated as PCM (WaveAudio, AES3, GenericSound, and the
+    // various sub-classed sound descriptors all just carry sample rate / channel count / bit depth);
+    // matching on class missed e.g. XAVC's sound descriptor whose class UL isn't one of the
+    // canonical four. Tags 0x3D01/0x3D03/0x3D07 are audio-specific (picture uses 0x32xx).
+    if (!soundDescriptor &&
+        (set.localItems.has(0x3d03) || set.localItems.has(0x3d07) || set.localItems.has(0x3d01))) {
       soundDescriptor = parseSoundDescriptorFromSet(set);
-      if (debug) console.log(`[jsmxf] found sound descriptor: codec=${soundDescriptor.codec} ${soundDescriptor.sampleRate}Hz ${soundDescriptor.channelCount}ch`);
+      if (debug) console.log(`[jsmxf] found sound descriptor: codec=${soundDescriptor.codec} ${soundDescriptor.sampleRate}Hz ${soundDescriptor.channelCount}ch ${soundDescriptor.bitDepth}bit`);
     }
 
     if (ulMatchClass(cls, CLASS_MATERIAL_PACKAGE) ||
@@ -269,7 +279,9 @@ function parseSoundDescriptorFromSet(set: RawSet): SoundDescriptor {
   const asr = set.localItems.get(0x3d03);
   const cc  = set.localItems.get(0x3d07);
   const qb  = set.localItems.get(0x3d01);
-  const ba  = set.localItems.get(0x3d09);
+  // BlockAlign is local tag 0x3D0A. (0x3D09 is AvgBytesPerSecond — reading that here gave a
+  // ~144000 "block align" for 24-bit mono, which collapsed PCM decode to zero samples = silence.)
+  const ba  = set.localItems.get(0x3d0a);
 
   const sampleRate    = asr && asr.length >= 4 ? readI32(asr) : 48000;
   const channelCount  = cc  && cc.length  >= 4 ? readU32(cc)  : 2;

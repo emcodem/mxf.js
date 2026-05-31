@@ -97,10 +97,15 @@ export const UL_EC_GENERIC_SOUND       = ul(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0
 
 // Content package essence element key prefixes
 // Byte 12 identifies item type:
+//   0x05 = SDTI-CP (SMPTE 326M) Picture — used by D-10 / SMPTE 386M
+//   0x06 = SDTI-CP Sound (D-10 carries all channels as one AES3 element, byte 14 = 0x10)
+//   0x07 = SDTI-CP Data / AUX
 //   0x15 = Generic Container (GC) Picture  SMPTE 379M
 //   0x16 = Generic Container (GC) Sound    SMPTE 379M
 //   0x17 = Generic Container (GC) Data     SMPTE 379M
 //   0x18 = D-10 / SMPTE 386M item; byte 14 distinguishes video (0x01) from audio (0x03)
+export const UL_CP_PICTURE_ITEM_PREFIX  = ul(0x06,0x0e,0x2b,0x34,0x01,0x02,0x01,0x01,0x0d,0x01,0x03,0x01,0x05);
+export const UL_CP_SOUND_ITEM_PREFIX    = ul(0x06,0x0e,0x2b,0x34,0x01,0x02,0x01,0x01,0x0d,0x01,0x03,0x01,0x06);
 export const UL_GC_PICTURE_ITEM_PREFIX  = ul(0x06,0x0e,0x2b,0x34,0x01,0x02,0x01,0x01,0x0d,0x01,0x03,0x01,0x15);
 export const UL_GC_SOUND_ITEM_PREFIX    = ul(0x06,0x0e,0x2b,0x34,0x01,0x02,0x01,0x01,0x0d,0x01,0x03,0x01,0x16);
 export const UL_GC_DATA_ITEM_PREFIX     = ul(0x06,0x0e,0x2b,0x34,0x01,0x02,0x01,0x01,0x0d,0x01,0x03,0x01,0x17);
@@ -143,12 +148,25 @@ export function isGenericContainerElement(key: Uint8Array): boolean {
 
 export function isPictureEssence(key: Uint8Array): boolean {
   return ulStartsWith(key, UL_GC_PICTURE_ITEM_PREFIX) ||
+         ulStartsWith(key, UL_CP_PICTURE_ITEM_PREFIX) ||
          ulStartsWith(key, UL_D10_VIDEO_ITEM_PREFIX);
 }
 
 export function isSoundEssence(key: Uint8Array): boolean {
   return ulStartsWith(key, UL_GC_SOUND_ITEM_PREFIX) ||
+         ulStartsWith(key, UL_CP_SOUND_ITEM_PREFIX) ||
          ulStartsWith(key, UL_D10_SOUND_ITEM_PREFIX);
+}
+
+/**
+ * True if a sound essence element is AES3-wrapped (SMPTE 331M, used by D-10): the element is a
+ * 4-byte header followed by interleaved 8-channel 32-bit AES3 subframe words (the 24-bit sample
+ * sits in bits 4–27). The element-type byte (key[14]) is 0x10 for AES3 vs 0x03 for plain BWF/PCM;
+ * SDTI-CP sound items (key[12] === 0x06) are likewise AES3. The decoder unpacks these differently
+ * from plain little-endian PCM, so this flag is propagated on each audio EssenceFrame.
+ */
+export function isAes3Sound(key: Uint8Array): boolean {
+  return isSoundEssence(key) && (key[12] === 0x06 || key[14] === 0x10);
 }
 
 export function isIndexTableSegment(key: Uint8Array): boolean {

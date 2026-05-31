@@ -2,7 +2,7 @@ import { ILoader } from '../loader/loader.js';
 import { MxfBootstrap } from '../mxf-file.js';
 import { KLVIterator } from '../core/klv.js';
 import { decodeBerLength } from '../core/ber.js';
-import { isPictureEssence, isSoundEssence, isPartitionPack, isFill } from '../core/ul.js';
+import { isPictureEssence, isSoundEssence, isAes3Sound, isPartitionPack, isFill } from '../core/ul.js';
 import { resolveFrameOffset, resolveExactFrameOffset, IndexTableSegment } from '../parser/index-table.js';
 
 /** Base read window for the no-index sequential reader. */
@@ -19,6 +19,8 @@ export interface EssenceFrame {
   dts: bigint;
   isKeyframe: boolean;
   data: ArrayBuffer;
+  /** Audio only: true when the sound element is AES3-wrapped (SMPTE 331M / D-10) rather than plain PCM. */
+  aes3?: boolean;
 }
 
 export class EssenceExtractor {
@@ -64,15 +66,17 @@ export class EssenceExtractor {
     const resolved = resolve(segments, startFrame, essenceContainerStart, vid);
     if (!resolved) return;
 
-    // Determine end byte: resolve the frame AFTER the last wanted frame.
-    // Add a 512 KB pad to capture trailing audio KLVs for the last video frame.
+    // Determine end byte: resolve the frame AFTER the last wanted frame. Its offset is the start of
+    // the NEXT edit unit, so [rangeStart, that-1] already covers the wanted frames' whole edit units
+    // (video + their interleaved audio) — no read-ahead pad. (The old +512 KB pad made every
+    // consecutive chunk overlap the next by 512 KB, re-downloading data we'd already fetched.)
     const endFrame = startFrame + BigInt(frameCount);
     const resolvedEnd = resolve(segments, endFrame, essenceContainerStart, vid);
     const fileSize = await this.loader.fileSize;
 
     const rangeStart = Number(resolved.byteOffset);
     const rangeEnd = resolvedEnd
-      ? Math.min(Number(resolvedEnd.byteOffset) + 512 * 1024, fileSize) - 1
+      ? Number(resolvedEnd.byteOffset) - 1
       : fileSize - 1;
 
     if (rangeStart > rangeEnd) return;
@@ -212,6 +216,7 @@ export class EssenceExtractor {
         dts: state.editUnit,
         isKeyframe: isVideo, // refined via index flags at seek time
         data,
+        aes3: !isVideo && isAes3Sound(pkt.key),
       };
     }
 

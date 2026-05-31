@@ -48,6 +48,10 @@ export type WorkerEvent =
       resolvedVideoMode: 'mse' | 'webcodecs';
       /** Seeking strategy this file supports: 'cbg' | 'vbe' | 'none'. */
       indexMode: IndexMode;
+      /** True PCM output channel count (decoded from the first audio, may exceed descriptor count
+       *  for AES3 / separate-mono layouts). 0 if no audio. Lets the UI build a channel selector
+       *  at load time rather than waiting for audio to start. */
+      audioChannelCount: number;
     }
   | { type: 'initSegment'; data: ArrayBuffer }
   | { type: 'videoInit'; codec: string; description: ArrayBuffer; width: number; height: number }
@@ -59,6 +63,9 @@ export type WorkerEvent =
        *  next preview at the latest dragged position. Always emitted so the pump can't deadlock. */
       type: 'previewDone';
       seq: number;
+      /** Edit unit the preview actually represents (its GOP-head keyframe). The player seeks the
+       *  playhead here to render it — this is what's buffered, not the mid-GOP dragged target. */
+      editUnit: number;
     }
   | { type: 'videoSegment'; data: ArrayBuffer; seq: number; editUnit: number }
   | { type: 'audioSegment'; data: ArrayBuffer; seq: number; editUnit: number }

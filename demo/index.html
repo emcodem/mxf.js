@@ -32,7 +32,7 @@
   <div class="controls">
     <input type="file" id="fileInput" accept=".mxf,.MXF">
     <span style="color:#666">or</span>
-    <input type="text" id="urlInput" placeholder="https://example.com/clip.mxf">
+    <input type="text" id="urlInput" placeholder="https://example.com/clip.mxf" value="http://localhost:8000/vistek.mxf">
     <button id="loadUrl">Load URL</button>
   </div>
 
@@ -44,6 +44,11 @@
     <span class="time" id="timeCurrent">0:00</span>
     <input type="range" id="seekBar" min="0" max="100" step="0.1" value="0">
     <span class="time" id="timeDuration">0:00</span>
+  </div>
+
+  <div id="audioChannels" style="display:none; margin:8px 0; font:13px/1.6 system-ui,sans-serif;">
+    <span style="color:#666">Audio channels:</span>
+    <span id="channelBoxes"></span>
   </div>
 
   <div id="log"></div>
@@ -59,8 +64,33 @@
     const seekBar  = document.getElementById('seekBar');
     const timeCur  = document.getElementById('timeCurrent');
     const timeDur  = document.getElementById('timeDuration');
+    const audioChannelsEl = document.getElementById('audioChannels');
+    const channelBoxesEl  = document.getElementById('channelBoxes');
     let player = null;
     let seeking = false;
+
+    // Build one checkbox per source audio channel. Checked channels are played (mixed to stereo);
+    // default is the first pair (1 + 2). Any change pushes the new selection to the player.
+    function buildChannelSelector(channelCount, activeChannels) {
+      channelBoxesEl.innerHTML = '';
+      const active = new Set(activeChannels);
+      for (let i = 0; i < channelCount; i++) {
+        const label = document.createElement('label');
+        label.style.marginRight = '10px';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = String(i);
+        cb.checked = active.has(i);
+        cb.addEventListener('change', () => {
+          const sel = [...channelBoxesEl.querySelectorAll('input:checked')].map(c => parseInt(c.value, 10));
+          player?.setAudioChannels(sel);
+          log(`Audio channels → ${sel.map(c => c + 1).join(', ') || 'none (muted)'}`);
+        });
+        label.append(cb, ` ${i + 1}`);
+        channelBoxesEl.appendChild(label);
+      }
+      audioChannelsEl.style.display = channelCount > 0 ? 'block' : 'none';
+    }
 
     function fmt(s) {
       if (!isFinite(s) || s < 0) return '0:00';
@@ -84,12 +114,14 @@
     function initPlayer() {
       player?.destroy();
       playback.style.display = 'none';
+      audioChannelsEl.style.display = 'none';
+      channelBoxesEl.innerHTML = '';
       playBtn.disabled = true;
       seekBar.value = 0;
       timeCur.textContent = '0:00';
       timeDur.textContent = '0:00';
 
-      player = new MxfPlayer(video, { debug: true, startBufferSeconds: 5, maxBufferSeconds: 30, seekMode: 'accurate' });
+      player = new MxfPlayer(video, { debug: true, startBufferSeconds: 3, maxBufferSeconds: 8, seekMode: 'accurate' });
 
       player.on('manifest', (data) => {
         const fps = (data.editRateNumerator / data.editRateDenominator).toFixed(2);
@@ -121,6 +153,12 @@
 
       player.on('codec-unsupported', ({ codec, reason }) => {
         log(`Codec unsupported: ${codec} — ${reason}`, 'warn');
+      });
+
+      // PCM channel count is known once the first audio chunk decodes — build the selector then.
+      player.on('audio-info', ({ channelCount, activeChannels }) => {
+        log(`Audio: ${channelCount} channel(s); playing ${activeChannels.map(c => c + 1).join(', ')}`);
+        buildChannelSelector(channelCount, activeChannels);
       });
     }
 

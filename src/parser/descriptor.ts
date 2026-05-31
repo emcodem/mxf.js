@@ -56,7 +56,7 @@ const TAG_PICTURE_ESSENCE_CODING = 0x3201;
 const TAG_AUDIO_SAMPLING_RATE  = 0x3D03;
 const TAG_CHANNEL_COUNT        = 0x3D07;
 const TAG_QUANTIZATION_BITS    = 0x3D01;
-const TAG_BLOCK_ALIGN          = 0x3D09;
+const TAG_BLOCK_ALIGN          = 0x3D0A; // 0x3D09 is AvgBytesPerSecond, not BlockAlign
 
 interface LocalSet {
   tag: number;

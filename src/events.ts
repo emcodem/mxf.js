@@ -23,6 +23,8 @@ export interface MxfPlayerEvents {
   seeked: { actualTime: number };
   'codec-unsupported': { codec: string; reason: string };
   'pcm-audio': { samples: Float32Array; sampleRate: number; channelCount: number; editUnit: number };
+  /** Fired when the PCM audio channel count is first known or changes — populate a channel selector. */
+  'audio-info': { channelCount: number; activeChannels: number[] };
   destroyed: void;
 }
 

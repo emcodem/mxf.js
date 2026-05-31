@@ -72,16 +72,13 @@ export class MxfFile {
     // headerByteCount = Primer Pack + all metadata Sets (exact byte count from spec).
     // This avoids the problem of hitting large essence KLVs that follow the metadata.
     const metaSize = Number(headerPartition.headerByteCount);
-    let metaBuf: ArrayBuffer;
-
-    if (metaSize > 0) {
-      metaBuf = await this.loader.fetchRange(afterPP, afterPP + metaSize - 1, 'bootstrap: header metadata');
-    } else {
-      // Non-conformant file: headerByteCount not set. Heuristic: read 2 MB and stop
-      // at the next partition pack boundary inside findHeaderMetadata.
-      const fallbackSize = Math.min(2 * 1024 * 1024, fileSize - afterPP);
-      metaBuf = await this.loader.fetchRange(afterPP, afterPP + fallbackSize - 1, 'bootstrap: header metadata (fallback)');
-    }
+    // Read generously. Some encoders (XAVC, D-10) understate headerByteCount so it doesn't cover all
+    // metadata sets — the sound descriptor in particular can sit past it, which previously made the
+    // file look like it had no audio. Read at least a comfortable window (or 2 MB when the count is
+    // absent) and rely on parseHeaderMetadata stopping at the first non-metadata KLV.
+    const wantBytes = metaSize > 0 ? Math.max(metaSize, 1024 * 1024) : 2 * 1024 * 1024;
+    const readSize = Math.min(wantBytes, fileSize - afterPP);
+    const metaBuf = await this.loader.fetchRange(afterPP, afterPP + readSize - 1, 'bootstrap: header metadata');
 
     const { primer, metadataStart, metadataLength } = this.findHeaderMetadata(metaBuf);
     if (this.debug) {
@@ -123,6 +120,45 @@ export class MxfFile {
       if (!dup) indexSegments.push(seg);
     }
     if (this.debug) console.log(`[jsmxf] essenceStart=${essenceStart}, essenceBodySID=${essenceBodySID}, +${essencePartitionIndex.length} in-partition index segs`);
+
+    // ── Step 5b: Multi-partition VBE index (XDCAM-style OP1a) ──────────────────
+    // VBE index entry streamOffsets are essence-CONTAINER-relative — they count only essence bytes,
+    // excluding the partition packs / index / fill interleaved between body partitions — so
+    // `essenceStart + streamOffset` only lands correctly within the first body partition. Whenever
+    // the essence spans body partitions, walk them (via the RIP) to build a {bodyOffset →
+    // essenceFileStart} table and remap every VBE entry's streamOffset to a file offset. This is
+    // needed even when the footer index already covers frame 0 (the offsets are still container-
+    // relative). Skipped for CBG (offset is pure math) and when there's no usable RIP (growing/live
+    // files fall through to indexMode 'none' + percentage seeking).
+    const hasCbg = indexSegments.some(s => s.editUnitByteCount > 0);
+    const hasVbeEntries = indexSegments.some(s => s.entries.length > 0);
+    if (!hasCbg && hasVbeEntries && ripEntries.some(e => e.bodySID > 0)) {
+      const { partitions, segments } = await this.collectMultiPartitionIndex(ripEntries, fileSize);
+      if (partitions.length > 0) {
+        for (const seg of segments) {
+          const dup = indexSegments.some(s =>
+            s.bodySID === seg.bodySID && s.indexSID === seg.indexSID &&
+            s.indexStartPosition === seg.indexStartPosition && s.entries.length === seg.entries.length);
+          if (!dup) indexSegments.push(seg);
+        }
+        // For a stream offset SO, find the body partition whose essence it falls in (largest
+        // bodyOffset ≤ SO) and map: fileOffset = partition.essenceFileStart + (SO − bodyOffset).
+        // Expressed relative to essenceStart so the resolver's `essenceStart + streamOffset` is
+        // unchanged. Single-partition files yield an identity remap (bodyOffset 0, essenceFileStart
+        // === essenceStart), so this is safe to always apply to multi-segment VBE files.
+        const es = Number(essenceStart);
+        const mapStreamOffset = (so: number): number => {
+          let p = partitions[0];
+          for (const q of partitions) { if (q.bodyOffset <= so) p = q; else break; }
+          return p.essenceFileStart + (so - p.bodyOffset) - es;
+        };
+        for (const seg of indexSegments) {
+          if (seg.editUnitByteCount > 0) continue; // CBG has no entry array
+          for (const e of seg.entries) e.streamOffset = BigInt(mapStreamOffset(Number(e.streamOffset)));
+        }
+        if (this.debug) console.log(`[jsmxf] multi-partition VBE index: ${partitions.length} partitions, ${indexSegments.length} segs (remapped)`);
+      }
+    }
 
     // ── Step 6: Determine the seeking strategy ────────────────────────────────
     const indexMode: IndexMode = classifyIndexMode(indexSegments, essenceBodySID);
@@ -287,6 +323,64 @@ export class MxfFile {
       }
     }
     return segments;
+  }
+
+  /**
+   * For OP1a files with incremental per-partition indexing (e.g. XDCAM HD422), build what's needed
+   * to resolve VBE frame offsets across body partitions. Index entry `streamOffset`s are essence-
+   * container-relative — they count only essence bytes, excluding the partition packs / index / fill
+   * interleaved between body partitions — so `essenceStart + streamOffset` lands on the wrong byte
+   * once past the first partition. Walk each RIP body partition to record its essence-stream offset
+   * (`bodyOffset`, from the partition pack) and the file offset of its first essence element, then
+   * the caller remaps every index entry's `streamOffset` to a file offset via this table.
+   *
+   * Bounded: one ~256 KB read per body partition.
+   */
+  private async collectMultiPartitionIndex(
+    rip: RandomIndexPackEntry[],
+    fileSize: number
+  ): Promise<{ partitions: { bodyOffset: number; essenceFileStart: number }[]; segments: IndexTableSegment[] }> {
+    const MAX_SCANS = 4096;
+    const WINDOW = 64 * 1024; // PP + index region + first essence element fit comfortably
+    const partitions: { bodyOffset: number; essenceFileStart: number }[] = [];
+    const segments: IndexTableSegment[] = [];
+    let scans = 0;
+
+    for (const entry of rip) {
+      if (entry.bodySID === 0) continue;          // body partitions only
+      if (scans++ >= MAX_SCANS) break;
+      const partOffset = Number(entry.byteOffset);
+      if (partOffset <= 0 || partOffset >= fileSize) continue;
+
+      try {
+        const buf = await this.loader.fetchRange(
+          partOffset, Math.min(partOffset + WINDOW, fileSize) - 1, 'bootstrap: body partition + index');
+        const ppStart = KLVIterator.skipRunIn(buf);
+        const pp = parsePartitionPack(buf, partOffset);
+        const afterPP = ppStart + readKLV(buf, ppStart).totalLength;
+
+        // Walk: collect any index segments, then stop at the first essence element (its file offset
+        // is this partition's essence start, the anchor for bodyOffset). peekKey() avoids readKLV
+        // choking on the large essence value that won't fit in the window.
+        let essenceFileStart = -1;
+        const iter = new KLVIterator(buf, afterPP);
+        while (iter.hasMore()) {
+          const key = iter.peekKey();
+          if (!key) break;
+          if (isGenericContainerElement(key)) { essenceFileStart = partOffset + iter.offset; break; }
+          const pkt = iter.next();
+          if (!pkt) break;
+          if (isIndexTableSegment(pkt.key)) {
+            try { segments.push(parseIndexTableSegment(buf, pkt)); } catch { /* skip malformed */ }
+          }
+        }
+        if (essenceFileStart < 0) continue; // couldn't locate essence in this partition — skip it
+        partitions.push({ bodyOffset: Number(pp.bodyOffset), essenceFileStart });
+      } catch { /* skip this partition */ }
+    }
+
+    partitions.sort((a, b) => a.bodyOffset - b.bodyOffset);
+    return { partitions, segments };
   }
 
   private async fetchIndexSegments(footerOffset: bigint, fileSize: number): Promise<IndexTableSegment[]> {

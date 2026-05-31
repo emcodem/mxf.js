@@ -8,6 +8,7 @@ import { resolveFrameOffset, gopLengthFromKeyframe } from '../parser/index-table
 import { isAnnexB, annexBtoAVCC, extractSPSPPS, buildAVCDecoderConfigRecord } from '../essence/avc-tools.js';
 import { Mpeg2Decoder } from '../codec/mpeg2-decoder.js';
 import { Mpeg2Transcoder } from '../codec/mpeg2-transcoder.js';
+import { decodePcmElements } from '../audio/pcm.js';
 import { WorkerCommand, WorkerEvent } from './worker-messages.js';
 import type { EssenceFrame } from '../essence/essence-extractor.js';
 
@@ -86,6 +87,25 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
     const sd = metadata.soundDescriptor;
     storedEditRateNumerator = metadata.editRateNumerator;
     storedEditRateDenominator = metadata.editRateDenominator;
+
+    // Decode the first edit unit's audio up front to learn the true PCM channel count (separate-mono
+    // and AES3 layouts can differ from the descriptor's channelCount). Surfaced in the manifest so
+    // the UI can build a channel selector immediately, not only once audio starts playing.
+    let audioChannelCount = 0;
+    if (sd?.codec === 'pcm') {
+      try {
+        const aex = new EssenceExtractor(loader_, bootstrap);
+        const aud: { editUnit: bigint; data: ArrayBuffer; aes3?: boolean }[] = [];
+        for await (const f of aex.fetchFrames(0n, 2)) {
+          if (f.trackType === 'audio') aud.push({ editUnit: f.editUnit, data: f.data, aes3: f.aes3 });
+        }
+        if (aud.length) {
+          audioChannelCount = decodePcmElements(
+            aud, { bitDepth: sd.bitDepth, blockAlign: sd.blockAlign, channelCount: sd.channelCount },
+          ).channelCount;
+        }
+      } catch { /* refined later from pcmSamples if this fails */ }
+    }
 
     const durationSec = pd
       ? Number(metadata.duration) * (metadata.editRateDenominator / metadata.editRateNumerator)
@@ -209,6 +229,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
         resolvedVideoCodec: actualCodecStr,
         resolvedVideoMode: 'mse',
         indexMode: bootstrap.indexMode,
+        audioChannelCount,
       });
 
       const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
@@ -261,6 +282,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       resolvedVideoCodec: pd?.codec ?? 'unknown',
       resolvedVideoMode: resolvedMode,
       indexMode: bootstrap.indexMode,
+      audioChannelCount,
     });
 
     if (resolvedMode === 'webcodecs' && pendingVideoInit) {
@@ -311,13 +333,13 @@ async function handleFetchSegment(
   const isScrubPreview = previewSeq !== undefined;
   if (!loader || !mxfFile || !fragmenter) {
     postError('Not initialized');
-    if (isScrubPreview) post({ type: 'previewDone', seq: previewSeq! });
+    if (isScrubPreview) post({ type: 'previewDone', seq: previewSeq!, editUnit: startFrame });
     return;
   }
   const bootstrap = mxfFile.getBootstrap();
   if (!bootstrap) {
     postError('Bootstrap not complete');
-    if (isScrubPreview) post({ type: 'previewDone', seq: previewSeq! });
+    if (isScrubPreview) post({ type: 'previewDone', seq: previewSeq!, editUnit: startFrame });
     return;
   }
 
@@ -467,18 +489,15 @@ async function handleFetchSegment(
     if (!isScrubPreview && audioFrames.length > 0) {
       const sd = bootstrap.metadata.soundDescriptor;
       if (sd?.codec === 'pcm') {
-        const rawPCM = audioFrames.reduce((acc, f) => acc + f.data.byteLength, 0);
-        const combined = new Int16Array(rawPCM / 2);
-        let offset = 0;
-        for (const frame of audioFrames) {
-          const samples = new Int16Array(frame.data);
-          combined.set(samples, offset);
-          offset += samples.length;
-        }
-        const float32 = new Float32Array(combined.length);
-        for (let i = 0; i < combined.length; i++) float32[i] = combined[i] / 32768;
+        // MXF PCM is little-endian signed at the descriptor's bit depth (24-bit for these
+        // files, not 16). Channels arrive either as one interleaved element or as N separate
+        // mono elements per edit unit; decodePcmElements handles both → interleaved Float32.
+        const { samples: float32, channelCount } = decodePcmElements(
+          audioFrames.map(f => ({ editUnit: f.editUnit, data: f.data, aes3: f.aes3 })),
+          { bitDepth: sd.bitDepth, blockAlign: sd.blockAlign, channelCount: sd.channelCount },
+        );
         post(
-          { type: 'pcmSamples', samples: float32, editUnit: startFrame, sampleRate: sd.sampleRate, channelCount: sd.channelCount },
+          { type: 'pcmSamples', samples: float32, editUnit: startFrame, sampleRate: sd.sampleRate, channelCount },
           [float32.buffer],
         );
       } else {
@@ -499,7 +518,7 @@ async function handleFetchSegment(
   } finally {
     // Always answer a scrub preview, even when superseded (gen mismatch returns above) or errored,
     // so the player's single-flight pump can fire the next preview at the latest dragged position.
-    if (isScrubPreview) post({ type: 'previewDone', seq: previewSeq! });
+    if (isScrubPreview) post({ type: 'previewDone', seq: previewSeq!, editUnit: startFrame });
   }
 }
 
@@ -542,9 +561,9 @@ function handleSeek(targetFrame: number): void {
  * matters while dragging.
  */
 function handleScrubPreview(targetFrame: number, seq: number): void {
-  if (!mxfFile) { post({ type: 'previewDone', seq }); return; }
+  if (!mxfFile) { post({ type: 'previewDone', seq, editUnit: targetFrame }); return; }
   const bootstrap = mxfFile.getBootstrap();
-  if (!bootstrap) { post({ type: 'previewDone', seq }); return; }
+  if (!bootstrap) { post({ type: 'previewDone', seq, editUnit: targetFrame }); return; }
 
   const resolved = resolveFrameOffset(
     bootstrap.indexSegments,
@@ -563,22 +582,19 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
     const copy = cached.slice();
     post({ type: 'videoSegment', data: copy.buffer as ArrayBuffer, seq: scrubSeqBase, editUnit: keyframe }, [copy.buffer]);
     scrubSeqBase += 2;
-    post({ type: 'previewDone', seq });
+    post({ type: 'previewDone', seq, editUnit: keyframe });
     return;
   }
 
-  const gop = gopLengthFromKeyframe(bootstrap.indexSegments, BigInt(keyframe));
-  // Fetch a small CONTIGUOUS run of real frames (keyframe → past the target + ~0.5 s lookahead),
-  // NOT a single stretched I-frame. A paused <video> paints a seek into a contiguous multi-frame
-  // region (exactly why scrubbing the already-buffered area works) but will not settle on a lone
-  // stretched sample. Covering the whole GOP keeps the run consistent per keyframe (cacheable) and
-  // ensures the dragged target frame is inside it.
+  // Fetch a small CONTIGUOUS run of real frames starting AT the keyframe (the player renders the
+  // keyframe, not the mid-GOP target — standard keyframe-granularity scrub). A paused <video> paints
+  // a seek into a contiguous multi-frame region (exactly why scrubbing the already-buffered area
+  // works) but will NOT settle on a lone stretched sample. ~0.4 s of lookahead is enough contiguous
+  // future data to paint, while keeping the per-preview decode small — critical for MPEG-2, where
+  // decoding a whole GOP+lookahead per preview saturated the worker so nothing painted. Constant per
+  // keyframe (independent of target) so it stays cacheable.
   const fps = storedEditRateNumerator / storedEditRateDenominator;
-  const lookahead = Math.max(1, Math.round(fps * 0.5));
-  // GOP + ~0.5 s lookahead so the dragged target is inside a contiguous run with enough future data
-  // for the element to settle and paint; capped at ~1.5 s so a long-GOP MPEG-2 preview can't blow up
-  // into a huge decode that re-saturates the worker during a drag.
-  const runFrames = Math.min(gop + lookahead, Math.max(1, Math.round(fps * 1.5)));
+  const runFrames = 1 + Math.max(4, Math.round(fps * 0.4));
 
   // Seek part (mirrors handleSeek): supersede in-flight work and reset the decoder to the keyframe.
   seekGeneration++;
