@@ -1,6 +1,6 @@
 import { MxfMetadata } from '../parser/metadata.js';
 import { EssenceFrame } from '../essence/essence-extractor.js';
-import { isAnnexB, annexBtoAVCC, extractSPSPPS } from '../essence/avc-tools.js';
+import { isAnnexB, annexBtoAVCC, extractSPSPPS, parseSPSCodedDimensions } from '../essence/avc-tools.js';
 import {
   ftyp, moov, mvhd, trak, tkhd, mdia, vmhd, smhd, stbl, stsd,
   avc1, mp4v, mp4a, sowt, mvex, trex, moof, mdat, traf, TrunSample,
@@ -67,8 +67,17 @@ export class Mp4Fragmenter {
       // In transcode mode use dimensions from the MPEG-2 elementary stream (parsed by the
       // decoder from sequence headers) rather than the MXF descriptor, which may be wrong
       // (e.g. 1920×544 stored-height for a 1920×1080 programme) or missing entirely.
-      const w = this.transcodeWidth || pd.storedWidth || pd.width;
-      const h = this.transcodeHeight || pd.storedHeight || pd.height;
+      let w = this.transcodeWidth || pd.storedWidth || pd.width;
+      let h = this.transcodeHeight || pd.storedHeight || pd.height;
+
+      // For native H.264, the avc1 box dimensions must match the coded size Chrome derives from
+      // the SPS, or its MSE stream parser rejects the init segment. The MXF descriptor often
+      // stores per-field height for interlaced AVC-Intra (e.g. 544 for a 1088-line MBAFF frame),
+      // so prefer the SPS-derived coded dimensions when available.
+      if (this.videoCodec === 'h264' && this.spsNALU && !this.transcodeWidth) {
+        const dims = parseSPSCodedDimensions(this.spsNALU);
+        if (dims) { w = dims.width; h = dims.height; }
+      }
 
       let codecBox: Uint8Array;
       if (this.videoCodec === 'h264') {

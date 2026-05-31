@@ -44,10 +44,22 @@ let mpeg2FirstFrameOfSegment = true;
 // SAME encoder queue — so a single flush() drains everyone's frames (the "50 in → 200 out"
 // symptom). These serialize fetches and let a seek discard superseded work.
 let fetchBusy = false;
-const fetchQueue: Array<{ startFrame: number; frameCount: number; seqBase: number; stretchToFrames: number; gen: number }> = [];
+const fetchQueue: Array<{ startFrame: number; frameCount: number; seqBase: number; stretchToFrames: number; gen: number; previewSeq?: number }> = [];
+// seqBase pool for internally-scheduled scrub-preview decodes (kept apart from the player's seqBase).
+let scrubSeqBase = 1_000_000;
 // Bumped on every seek. A fetch whose captured generation no longer matches has been
 // superseded and drops its work instead of appending stale frames.
 let seekGeneration = 0;
+
+// Scrub-preview cache: GOP-head keyframe edit unit → already-encoded fMP4 video segment bytes.
+// A preview segment is fully determined by its keyframe (fixed baseTime + GOP-length stretch), so
+// it can be re-served verbatim. This is what makes MPEG-2 scrubbing usable: the costly part is the
+// per-keyframe JS MPEG-2 decode + H.264 encode, and without a cache every drag position — even
+// repeated passes over the same region, or several positions within one GOP — pays it again, so
+// the picture lags further behind the thumb the faster you drag. With the cache, each GOP head is
+// decoded at most once per session and revisits are instant. Cleared on each new file load.
+const scrubSegmentCache = new Map<number, Uint8Array>();
+const SCRUB_CACHE_MAX = 128;
 
 function post(event: WorkerEvent, transferables: Transferable[] = []): void {
   self.postMessage(event, transferables);
@@ -64,6 +76,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
   mpeg2Transcoder = null;
   mpeg2EditUnitCounter = 0n;
   mpeg2FirstFrameOfSegment = true;
+  scrubSegmentCache.clear();
 
   try {
     const bootstrap = await mxfFile.open();
@@ -195,6 +208,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
         pcmMseSupported: false,
         resolvedVideoCodec: actualCodecStr,
         resolvedVideoMode: 'mse',
+        indexMode: bootstrap.indexMode,
       });
 
       const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
@@ -246,6 +260,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       pcmMseSupported: false,
       resolvedVideoCodec: pd?.codec ?? 'unknown',
       resolvedVideoMode: resolvedMode,
+      indexMode: bootstrap.indexMode,
     });
 
     if (resolvedMode === 'webcodecs' && pendingVideoInit) {
@@ -276,17 +291,35 @@ async function drainFetchQueue(): Promise<void> {
   try {
     while (fetchQueue.length > 0) {
       const job = fetchQueue.shift()!;
-      await handleFetchSegment(job.startFrame, job.frameCount, job.seqBase, job.gen, job.stretchToFrames);
+      await handleFetchSegment(job.startFrame, job.frameCount, job.seqBase, job.gen, job.stretchToFrames, job.previewSeq);
     }
   } finally {
     fetchBusy = false;
   }
 }
 
-async function handleFetchSegment(startFrame: number, frameCount: number, seqBase: number, gen: number, stretchToFrames = 0): Promise<void> {
-  if (!loader || !mxfFile || !fragmenter) { postError('Not initialized'); return; }
+async function handleFetchSegment(
+  startFrame: number,
+  frameCount: number,
+  seqBase: number,
+  gen: number,
+  stretchToFrames = 0,
+  previewSeq?: number,
+): Promise<void> {
+  // A scrub preview is a throwaway single-frame decode that must always answer with previewDone
+  // (so the player's single-flight pump never deadlocks) and must skip audio.
+  const isScrubPreview = previewSeq !== undefined;
+  if (!loader || !mxfFile || !fragmenter) {
+    postError('Not initialized');
+    if (isScrubPreview) post({ type: 'previewDone', seq: previewSeq! });
+    return;
+  }
   const bootstrap = mxfFile.getBootstrap();
-  if (!bootstrap) { postError('Bootstrap not complete'); return; }
+  if (!bootstrap) {
+    postError('Bootstrap not complete');
+    if (isScrubPreview) post({ type: 'previewDone', seq: previewSeq! });
+    return;
+  }
 
   try {
     const extractor = new EssenceExtractor(loader, bootstrap);
@@ -322,6 +355,11 @@ async function handleFetchSegment(startFrame: number, frameCount: number, seqBas
         const decodeT0 = performance.now();
         const counterBefore = mpeg2EditUnitCounter;
         for (const vf of videoFrames) {
+          // Bail the moment a seek/scrub supersedes this fetch. The decode loop is synchronous over
+          // the whole (up to ~50-frame) chunk, so without this a scrub preview can't start until the
+          // entire in-flight buffer-ahead chunk finishes decoding+encoding — the dominant cause of
+          // sluggish first scrub feedback. flush() below still runs and drains the encoder clean.
+          if (gen !== seekGeneration) break;
           decoder.write(vf.data);
           while (decoder.decode()) { /* onFrame fires inside decode(), driving the encoder */ }
         }
@@ -337,7 +375,9 @@ async function handleFetchSegment(startFrame: number, frameCount: number, seqBas
         // intra picture that would otherwise stay held and never be emitted.
         const keyframePreview = stretchToFrames > 0;
         const atEndOfStream = videoFrames.length < frameCount;
-        if (atEndOfStream || keyframePreview) decoder.flush();
+        // Scrub previews are throwaway and must emit every decoded frame now (no next segment will
+        // pick up a held anchor), so flush them too.
+        if (atEndOfStream || keyframePreview || isScrubPreview) decoder.flush();
 
         // flush() always runs (even if superseded) so the shared encoder queue is drained
         // clean for the next fetch — but a seek during the flush await means these frames are
@@ -366,6 +406,15 @@ async function handleFetchSegment(startFrame: number, frameCount: number, seqBas
           chunks,
           keyframePreview ? { totalDurationFrames: stretchToFrames } : undefined,
         );
+        if (seg && isScrubPreview) {
+          // Cache a copy keyed by the GOP-head keyframe (= startFrame here) so future scrub
+          // visits to this GOP skip the decode/encode entirely (see scrubSegmentCache).
+          if (scrubSegmentCache.size >= SCRUB_CACHE_MAX) {
+            const oldest = scrubSegmentCache.keys().next().value as number | undefined;
+            if (oldest !== undefined) scrubSegmentCache.delete(oldest);
+          }
+          scrubSegmentCache.set(startFrame, seg.slice());
+        }
         if (seg) {
           console.log('[worker] videoSegment', seg.length, 'bytes,', chunks.length, 'chunks, first chunk keyframe:', chunks[0]?.isKeyframe, 'first chunk editUnit:', chunks[0] ? Number(chunks[0].editUnit) : -1, keyframePreview ? `(keyframe preview, stretch ${stretchToFrames}f)` : '');
           post(
@@ -394,6 +443,15 @@ async function handleFetchSegment(startFrame: number, frameCount: number, seqBas
         } else {
           const seg = fragmenter.buildVideoSegment(videoFrames);
           if (seg) {
+            if (isScrubPreview) {
+              // Cache the (all-intra) preview segment so revisiting this frame avoids the disk read
+              // + remux. Keyed by startFrame (= the requested keyframe). See scrubSegmentCache.
+              if (scrubSegmentCache.size >= SCRUB_CACHE_MAX) {
+                const oldest = scrubSegmentCache.keys().next().value as number | undefined;
+                if (oldest !== undefined) scrubSegmentCache.delete(oldest);
+              }
+              scrubSegmentCache.set(startFrame, seg.slice());
+            }
             post(
               { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: startFrame },
               [seg.buffer],
@@ -404,9 +462,9 @@ async function handleFetchSegment(startFrame: number, frameCount: number, seqBas
     }
 
     // -----------------------------------------------------------------------
-    // Audio
+    // Audio (skipped for throwaway scrub previews — video-only)
     // -----------------------------------------------------------------------
-    if (audioFrames.length > 0) {
+    if (!isScrubPreview && audioFrames.length > 0) {
       const sd = bootstrap.metadata.soundDescriptor;
       if (sd?.codec === 'pcm') {
         const rawPCM = audioFrames.reduce((acc, f) => acc + f.data.byteLength, 0);
@@ -434,10 +492,14 @@ async function handleFetchSegment(startFrame: number, frameCount: number, seqBas
       }
     }
 
-    post({ type: 'segmentDone' });
+    if (!isScrubPreview) post({ type: 'segmentDone' });
 
   } catch (e) {
     postError(`Failed to fetch segment: ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    // Always answer a scrub preview, even when superseded (gen mismatch returns above) or errored,
+    // so the player's single-flight pump can fire the next preview at the latest dragged position.
+    if (isScrubPreview) post({ type: 'previewDone', seq: previewSeq! });
   }
 }
 
@@ -454,6 +516,7 @@ function handleSeek(targetFrame: number): void {
     bootstrap.indexSegments,
     BigInt(targetFrame),
     bootstrap.essenceStart,
+    bootstrap.essenceBodySID,
   );
   // Supersede any queued/in-flight fetch from the old position: bump the generation and
   // drop pending fetches. An in-flight fetch checks this generation after its awaits and
@@ -468,6 +531,68 @@ function handleSeek(targetFrame: number): void {
 
   const gopFrameCount = gopLengthFromKeyframe(bootstrap.indexSegments, BigInt(nearestKeyframe));
   post({ type: 'seeked', nearestKeyframeEditUnit: nearestKeyframe, gopFrameCount });
+}
+
+/**
+ * Fast-drag scrub preview in a single round-trip: resolve the GOP-head keyframe for `targetFrame`,
+ * reset the decoder there (superseding any in-flight work), then enqueue a one-frame decode whose
+ * sample is stretched to span the GOP. Replies with `previewDone{seq}` (always — see the finally in
+ * handleFetchSegment) so the player's single-flight pump can advance to the latest dragged position.
+ * Folding the seek + fetch into one command halves message latency versus seek→seeked→fetch, which
+ * matters while dragging.
+ */
+function handleScrubPreview(targetFrame: number, seq: number): void {
+  if (!mxfFile) { post({ type: 'previewDone', seq }); return; }
+  const bootstrap = mxfFile.getBootstrap();
+  if (!bootstrap) { post({ type: 'previewDone', seq }); return; }
+
+  const resolved = resolveFrameOffset(
+    bootstrap.indexSegments,
+    BigInt(targetFrame),
+    bootstrap.essenceStart,
+    bootstrap.essenceBodySID,
+  );
+  const keyframe = resolved ? Number(resolved.nearestKeyframeEditUnit) : targetFrame;
+
+  // Cache hit: this GOP head was already decoded+encoded this session — re-serve its segment
+  // verbatim with no decode/encode (and without disturbing the decoder state). Dragging within a
+  // GOP, or back over a visited region, becomes instant. Post a fresh copy since the buffer is
+  // transferred to the main thread.
+  const cached = scrubSegmentCache.get(keyframe);
+  if (cached) {
+    const copy = cached.slice();
+    post({ type: 'videoSegment', data: copy.buffer as ArrayBuffer, seq: scrubSeqBase, editUnit: keyframe }, [copy.buffer]);
+    scrubSeqBase += 2;
+    post({ type: 'previewDone', seq });
+    return;
+  }
+
+  const gop = gopLengthFromKeyframe(bootstrap.indexSegments, BigInt(keyframe));
+  // Fetch a small CONTIGUOUS run of real frames (keyframe → past the target + ~0.5 s lookahead),
+  // NOT a single stretched I-frame. A paused <video> paints a seek into a contiguous multi-frame
+  // region (exactly why scrubbing the already-buffered area works) but will not settle on a lone
+  // stretched sample. Covering the whole GOP keeps the run consistent per keyframe (cacheable) and
+  // ensures the dragged target frame is inside it.
+  const fps = storedEditRateNumerator / storedEditRateDenominator;
+  const lookahead = Math.max(1, Math.round(fps * 0.5));
+  // GOP + ~0.5 s lookahead so the dragged target is inside a contiguous run with enough future data
+  // for the element to settle and paint; capped at ~1.5 s so a long-GOP MPEG-2 preview can't blow up
+  // into a huge decode that re-saturates the worker during a drag.
+  const runFrames = Math.min(gop + lookahead, Math.max(1, Math.round(fps * 1.5)));
+
+  // Seek part (mirrors handleSeek): supersede in-flight work and reset the decoder to the keyframe.
+  seekGeneration++;
+  fetchQueue.length = 0;
+  mpeg2EditUnitCounter = BigInt(keyframe);
+  mpeg2FirstFrameOfSegment = true;
+  mpeg2Decoder?.reset();
+
+  // Enqueue the throwaway decode (serialized via fetchBusy so it can't race a normal fetch).
+  // stretchToFrames stays 0 — these are real consecutive frames, so the segment is naturally
+  // contiguous and the element can paint a paused seek into it.
+  fetchQueue.push({ startFrame: keyframe, frameCount: runFrames, seqBase: scrubSeqBase, stretchToFrames: 0, gen: seekGeneration, previewSeq: seq });
+  scrubSeqBase += 2;
+  void drainFetchQueue();
 }
 
 self.addEventListener('message', (event: MessageEvent<WorkerCommand>) => {
@@ -486,6 +611,9 @@ self.addEventListener('message', (event: MessageEvent<WorkerCommand>) => {
       break;
     case 'seek':
       handleSeek(cmd.targetFrame);
+      break;
+    case 'scrubPreview':
+      handleScrubPreview(cmd.targetFrame, cmd.seq);
       break;
   }
 });

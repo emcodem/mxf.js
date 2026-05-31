@@ -1,5 +1,6 @@
 import { MxfTrack } from '../parser/metadata.js';
 import { PictureDescriptor, SoundDescriptor } from '../parser/descriptor.js';
+import type { IndexMode } from '../mxf-file.js';
 
 // Commands sent from main thread to worker
 export type WorkerCommand =
@@ -19,7 +20,15 @@ export type WorkerCommand =
        */
       stretchToFrames?: number;
     }
-  | { type: 'seek'; targetFrame: number };
+  | { type: 'seek'; targetFrame: number }
+  | {
+      /** Fast-drag scrub: resolve the GOP-head keyframe for targetFrame, decode just that I-frame
+       *  stretched across its GOP, and reply with previewDone{seq}. One round-trip (vs seek→seeked
+       *  →fetch). `seq` lets the player's single-flight pump match the reply to its request. */
+      type: 'scrubPreview';
+      targetFrame: number;
+      seq: number;
+    };
 
 // Events sent from worker to main thread
 export type WorkerEvent =
@@ -37,11 +46,20 @@ export type WorkerEvent =
       resolvedVideoCodec: string;
       /** Whether the worker will use MSE segments or WebCodecs chunks for video. */
       resolvedVideoMode: 'mse' | 'webcodecs';
+      /** Seeking strategy this file supports: 'cbg' | 'vbe' | 'none'. */
+      indexMode: IndexMode;
     }
   | { type: 'initSegment'; data: ArrayBuffer }
   | { type: 'videoInit'; codec: string; description: ArrayBuffer; width: number; height: number }
   | { type: 'videoChunk'; data: ArrayBuffer; timestamp: number; duration: number; keyframe: boolean }
   | { type: 'segmentDone' }
+  | {
+      /** A keyframe-only scrub preview fetch has finished (segment posted, or nothing to post —
+       *  including when superseded). Drives the player's single-flight scrub pump so it fires the
+       *  next preview at the latest dragged position. Always emitted so the pump can't deadlock. */
+      type: 'previewDone';
+      seq: number;
+    }
   | { type: 'videoSegment'; data: ArrayBuffer; seq: number; editUnit: number }
   | { type: 'audioSegment'; data: ArrayBuffer; seq: number; editUnit: number }
   | { type: 'pcmSamples'; samples: Float32Array; editUnit: number; sampleRate: number; channelCount: number }

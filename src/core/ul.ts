@@ -64,7 +64,10 @@ export const UL_FOOTER_PARTITION_CLOSED = ul(0x06,0x0e,0x2b,0x34,0x02,0x05,0x01,
 // context (position in file) is the only reliable disambiguator.
 export const UL_PRIMER_PACK      = ul(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x02,0x01,0x01,0x05,0x01,0x00); // spec-conformant
 export const UL_PRIMER_PACK_ALT  = ul(0x06,0x0e,0x2b,0x34,0x02,0x05,0x01,0x01,0x0d,0x01,0x02,0x01,0x01,0x05,0x01,0x00); // non-conformant (same bytes as footer open)
-export const UL_RANDOM_INDEX_PACK = ul(0x06,0x0e,0x2b,0x34,0x02,0x05,0x01,0x01,0x0d,0x01,0x02,0x01,0x11,0x01,0x00,0x00);
+// SMPTE ST 377-1 Random Index Pack key: 06 0E 2B 34 02 05 01 01 0D 01 02 01 01 11 01 00.
+// (The previous value dropped the byte-12 `01`, shifting the tail, so the RIP — and with it the
+// body-partition offsets used to locate essence — was never found in conformant files.)
+export const UL_RANDOM_INDEX_PACK = ul(0x06,0x0e,0x2b,0x34,0x02,0x05,0x01,0x01,0x0d,0x01,0x02,0x01,0x01,0x11,0x01,0x00);
 
 // Index Table Segment — two common variants
 export const UL_INDEX_TABLE_SEGMENT_V1 = ul(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x02,0x01,0x01,0x10,0x01,0x00);
@@ -124,6 +127,18 @@ export function isEssenceElement(key: Uint8Array): boolean {
   return ulStartsWith(key, UL_GC_PICTURE_ITEM_PREFIX) ||
          ulStartsWith(key, UL_GC_SOUND_ITEM_PREFIX) ||
          ulStartsWith(key, UL_GC_DATA_ITEM_PREFIX);
+}
+
+/**
+ * True for any MXF Generic Container content-package element: System item (0x04), GC Picture
+ * (0x15), Sound (0x16), Data (0x17) or D-10 (0x18). All share bytes [8..11] = 0D 01 03 01
+ * ("MXF Generic Container essence"), which uniquely distinguishes a content-package KLV from
+ * header metadata (0D 01 01 01), index segments / primer / partition packs (0D 01 02 01 …).
+ * Used to find where the essence container actually starts when byte-count math is unreliable.
+ */
+export function isGenericContainerElement(key: Uint8Array): boolean {
+  return key.length >= 12 &&
+    key[8] === 0x0d && key[9] === 0x01 && key[10] === 0x03 && key[11] === 0x01;
 }
 
 export function isPictureEssence(key: Uint8Array): boolean {

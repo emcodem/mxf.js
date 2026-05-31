@@ -1,6 +1,24 @@
 import { describe, it, expect } from 'vitest';
-import { parseIndexTableSegment, resolveFrameOffset, gopLengthFromKeyframe } from '../src/parser/index-table.js';
+import {
+  parseIndexTableSegment, resolveFrameOffset, resolveExactFrameOffset, gopLengthFromKeyframe,
+  findCbgSegment, resolveCbgFrameOffset, classifyIndexMode,
+} from '../src/parser/index-table.js';
 import type { IndexTableSegment } from '../src/parser/index-table.js';
+
+/** Build an IndexTableSegment with sensible defaults; override per-test. */
+function makeSegment(opts: Partial<IndexTableSegment> = {}): IndexTableSegment {
+  return {
+    indexStartPosition: 0n,
+    indexDuration: 0n,
+    editUnitByteCount: 0,
+    indexSID: 0,
+    bodySID: 0,
+    sliceCount: 0,
+    posTableCount: 0,
+    entries: [],
+    ...opts,
+  };
+}
 import { readKLV } from '../src/core/klv.js';
 import { UL_INDEX_TABLE_SEGMENT_V1 } from '../src/core/ul.js';
 import { encodeBerLength } from '../src/core/ber.js';
@@ -173,5 +191,81 @@ describe('gopLengthFromKeyframe', () => {
   it('honours a non-zero indexStartPosition', () => {
     const seg = vbeSegment([true, false, true], 100n);
     expect(gopLengthFromKeyframe([seg], 100n)).toBe(2);
+  });
+});
+
+describe('CBG (constant byte count) seeking', () => {
+  // A minimal header-partition CBG segment: declares editUnitByteCount, no entries, indexDuration 0.
+  const cbg = makeSegment({ editUnitByteCount: 150000, indexDuration: 0n, bodySID: 1 });
+
+  it('resolveFrameOffset uses the byte-count math beyond indexDuration', () => {
+    const essenceStart = 1000n;
+    const r = resolveFrameOffset([cbg], 1000n, essenceStart, 1);
+    expect(r).not.toBeNull();
+    expect(r!.byteOffset).toBe(essenceStart + 150000n * 1000n);
+    expect(r!.isKeyframe).toBe(true);
+    expect(r!.nearestKeyframeEditUnit).toBe(1000n);
+  });
+
+  it('resolveExactFrameOffset agrees with resolveFrameOffset for CBG', () => {
+    const r1 = resolveFrameOffset([cbg], 42n, 0n, 1);
+    const r2 = resolveExactFrameOffset([cbg], 42n, 0n, 1);
+    expect(r2!.byteOffset).toBe(r1!.byteOffset);
+    expect(r2!.byteOffset).toBe(150000n * 42n);
+  });
+
+  it('resolveCbgFrameOffset honours a non-zero indexStartPosition', () => {
+    const seg = makeSegment({ editUnitByteCount: 1000, indexStartPosition: 100n });
+    expect(resolveCbgFrameOffset(seg, 150n, 0n).byteOffset).toBe(1000n * 50n);
+    // Frames before the segment start clamp to offset 0 rather than going negative.
+    expect(resolveCbgFrameOffset(seg, 50n, 0n).byteOffset).toBe(0n);
+  });
+
+  it('findCbgSegment respects BodySID matching', () => {
+    expect(findCbgSegment([cbg], 1)).toBe(cbg);       // exact match
+    expect(findCbgSegment([cbg], 0)).toBe(cbg);        // unknown video SID matches anything
+    expect(findCbgSegment([cbg], 2)).toBeNull();       // wrong SID is not selected
+    const agnostic = makeSegment({ editUnitByteCount: 200, bodySID: 0 });
+    expect(findCbgSegment([agnostic], 7)).toBe(agnostic); // segment SID 0 = unspecified, accepted
+  });
+
+  it('does NOT use a CBG segment that belongs to a different essence stream', () => {
+    // Audio (or other) CBG segment with bodySID 2 must not be used to seek the video (SID 1).
+    const r = resolveFrameOffset([cbg], 1000n, 0n, 2);
+    expect(r).toBeNull(); // no entries, no matching CBG → unresolved
+  });
+});
+
+describe('classifyIndexMode', () => {
+  const cbg = makeSegment({ editUnitByteCount: 150000, bodySID: 1 });
+  const vbe = makeSegment({
+    bodySID: 1,
+    indexDuration: 2n,
+    entries: [
+      { temporalOffset: 0, keyFrameOffset: 0, flags: 0x00, streamOffset: 0n },
+      { temporalOffset: 0, keyFrameOffset: 0, flags: 0x80, streamOffset: 500n },
+    ],
+  });
+
+  it('detects cbg / vbe / none', () => {
+    expect(classifyIndexMode([cbg], 1)).toBe('cbg');
+    expect(classifyIndexMode([vbe], 1)).toBe('vbe');
+    expect(classifyIndexMode([], 1)).toBe('none');
+    expect(classifyIndexMode([makeSegment({ bodySID: 1 })], 1)).toBe('none'); // empty segment
+  });
+
+  it('prefers cbg when both a CBG and a VBE segment are present', () => {
+    expect(classifyIndexMode([vbe, cbg], 1)).toBe('cbg');
+    expect(classifyIndexMode([cbg, vbe], 1)).toBe('cbg');
+  });
+
+  it('matches BodySID-agnostically when the video SID is unknown (0)', () => {
+    expect(classifyIndexMode([vbe], 0)).toBe('vbe');
+    expect(classifyIndexMode([cbg], 0)).toBe('cbg');
+  });
+
+  it('ignores a VBE segment for a different essence stream', () => {
+    const audioVbe = makeSegment({ ...vbe, bodySID: 2 });
+    expect(classifyIndexMode([audioVbe], 1)).toBe('none');
   });
 });

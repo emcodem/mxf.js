@@ -137,20 +137,21 @@
     }
     seekBar.addEventListener('mousedown', startScrub);
     seekBar.addEventListener('touchstart', startScrub);
-    // Live drag: fast keyframe preview at each position (thumb stays under the finger).
+    // Live drag: report the position to the scrub pump. The thumb (the native slider value)
+    // follows the finger; the <video> playhead is moved onto each preview frame only once it's
+    // buffered (inside the player), so the picture keeps updating instead of stalling.
     seekBar.addEventListener('input', () => {
       const t = parseFloat(seekBar.value);
       timeCur.textContent = fmt(t);
-      if (player && seeking) player.seek(t);
+      if (player && seeking) player.scrubTo(t);
     });
-    // Release: settle on the exact frame and resume normal playback.
+    // Release: settle on the exact released position and resume playback if it was running.
     seekBar.addEventListener('change', () => {
       if (!player) return;
       const t = parseFloat(seekBar.value);
       if (seeking) {
         seeking = false;
-        player.seek(t);      // make sure currentTime is at the final position
-        player.endScrub();   // accurate settle + resume
+        player.endScrub(t);  // accurate settle at the released position + resume
       } else {
         player.seek(t);      // keyboard/click seek without a drag
       }

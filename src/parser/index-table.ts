@@ -123,14 +123,79 @@ export interface ResolvedOffset {
 }
 
 /**
+ * Find an index segment that declares a constant edit-unit byte count (CBG / Constant Byte Group)
+ * applicable to the given video BodySID. Standard OP1a CBG files put a minimal IndexTableSegment in
+ * the header partition that only declares `editUnitByteCount` (often with `indexDuration === 0` and
+ * no entry array), so this must NOT depend on the segment covering the requested edit unit.
+ *
+ * BodySID matching is permissive: `videoBodySID === 0` (unknown) matches anything, and a segment
+ * with `bodySID === 0` (unspecified) is accepted too. Passing 0 preserves legacy call sites.
+ */
+export function findCbgSegment(
+  segments: IndexTableSegment[],
+  videoBodySID = 0
+): IndexTableSegment | null {
+  for (const seg of segments) {
+    if (seg.editUnitByteCount <= 0) continue;
+    if (videoBodySID === 0 || seg.bodySID === videoBodySID || seg.bodySID === 0) return seg;
+  }
+  return null;
+}
+
+/**
+ * Classify the seeking strategy a set of index segments supports, for the given video BodySID:
+ * - 'cbg'  if a constant-byte-count segment applies (see {@link findCbgSegment}),
+ * - 'vbe'  if a (BodySID-matching) segment carries a per-frame entry array,
+ * - 'none' otherwise (no usable index — caller must scan / seek by offset).
+ * Permissive BodySID matching: `videoBodySID === 0` matches anything; a segment `bodySID === 0` is
+ * treated as unspecified and accepted.
+ */
+export function classifyIndexMode(
+  segments: IndexTableSegment[],
+  videoBodySID = 0
+): 'cbg' | 'vbe' | 'none' {
+  if (findCbgSegment(segments, videoBodySID)) return 'cbg';
+  const hasVbe = segments.some(s =>
+    s.entries.length > 0 &&
+    (videoBodySID === 0 || s.bodySID === videoBodySID || s.bodySID === 0)
+  );
+  return hasVbe ? 'vbe' : 'none';
+}
+
+/**
+ * Resolve a frame's byte offset purely from the constant edit-unit byte count, ignoring the
+ * segment's `indexDuration` bound: `offset = essenceStart + editUnitByteCount * (editUnit - indexStartPosition)`.
+ * Every CBG edit unit is a random-access point, so `isKeyframe` is always true.
+ */
+export function resolveCbgFrameOffset(
+  seg: IndexTableSegment,
+  editUnit: bigint,
+  essenceContainerStart: bigint
+): ResolvedOffset {
+  const rel = editUnit - seg.indexStartPosition;
+  const offset = BigInt(seg.editUnitByteCount) * (rel < 0n ? 0n : rel);
+  return {
+    byteOffset: essenceContainerStart + offset,
+    isKeyframe: true,
+    nearestKeyframeEditUnit: editUnit,
+  };
+}
+
+/**
  * Resolve the byte offset (relative to the essence container start) for a given edit unit.
  * essenceContainerStart: absolute file offset of first essence byte in the container.
  */
 export function resolveFrameOffset(
   segments: IndexTableSegment[],
   editUnit: bigint,
-  essenceContainerStart: bigint
+  essenceContainerStart: bigint,
+  videoBodySID = 0
 ): ResolvedOffset | null {
+  // CBG (constant byte count) takes precedence: the math applies to every frame regardless of
+  // whether a declaring segment's indexDuration covers it.
+  const cbg = findCbgSegment(segments, videoBodySID);
+  if (cbg) return resolveCbgFrameOffset(cbg, editUnit, essenceContainerStart);
+
   for (const seg of segments) {
     const segEnd = seg.indexStartPosition + seg.indexDuration;
     if (editUnit < seg.indexStartPosition || editUnit >= segEnd) continue;
@@ -205,8 +270,13 @@ export function gopLengthFromKeyframe(
 export function resolveExactFrameOffset(
   segments: IndexTableSegment[],
   editUnit: bigint,
-  essenceContainerStart: bigint
+  essenceContainerStart: bigint,
+  videoBodySID = 0
 ): ResolvedOffset | null {
+  // CBG: exact and snapped resolutions coincide (every frame is its own random-access point).
+  const cbg = findCbgSegment(segments, videoBodySID);
+  if (cbg) return resolveCbgFrameOffset(cbg, editUnit, essenceContainerStart);
+
   for (const seg of segments) {
     const segEnd = seg.indexStartPosition + seg.indexDuration;
     if (editUnit < seg.indexStartPosition || editUnit >= segEnd) continue;

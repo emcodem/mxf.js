@@ -1,18 +1,23 @@
 export type TrackType = 'video' | 'audio';
 
-interface AppendTask {
-  trackType: TrackType;
-  data: ArrayBuffer;
-}
+type QueueOp =
+  | { kind: 'append'; data: ArrayBuffer }
+  | { kind: 'remove'; start: number; end: number };
+
+/** Seconds of already-played media to keep behind the playhead before evicting. */
+const BACK_BUFFER_SECONDS = 6;
 
 export class MseController {
   private readonly video: HTMLVideoElement;
   private mediaSource: MediaSource | null = null;
   private objectURL: string | null = null;
   private sourceBuffers = new Map<TrackType, SourceBuffer>();
-  private appendQueues = new Map<TrackType, AppendTask[]>();
+  private queues = new Map<TrackType, QueueOp[]>();
   private processing = new Map<TrackType, boolean>();
   onError: ((type: TrackType, message: string) => void) | null = null;
+  /** Called when an append fails with QuotaExceededError and no behind-playhead data can be freed,
+   *  i.e. the forward buffer is full — the player should stop fetching until the playhead advances. */
+  onBufferFull: (() => void) | null = null;
 
   constructor(video: HTMLVideoElement) {
     this.video = video;
@@ -46,7 +51,7 @@ export class MseController {
     console.log(`[mse] addSourceBuffer ${type} "${mimeType}"`);
     const sb = this.mediaSource!.addSourceBuffer(mimeType);
     this.sourceBuffers.set(type, sb);
-    this.appendQueues.set(type, []);
+    this.queues.set(type, []);
     this.processing.set(type, false);
 
     sb.addEventListener('updateend', () => {
@@ -61,28 +66,91 @@ export class MseController {
   }
 
   appendSegment(trackType: TrackType, data: ArrayBuffer): void {
-    const queue = this.appendQueues.get(trackType);
+    const queue = this.queues.get(trackType);
     if (!queue) return; // SourceBuffer not created (codec not supported)
-    const u8 = new Uint8Array(data, 0, Math.min(12, data.byteLength));
-    console.log(`[mse] appendSegment ${trackType} ${data.byteLength}b first bytes:`, Array.from(u8).map(b=>b.toString(16).padStart(2,'0')).join(' '));
-    queue.push({ trackType, data });
+    queue.push({ kind: 'append', data });
     this.drainQueue(trackType);
+  }
+
+  /** Queue a removal of buffered media in [start, end) for a track (used to cap buffer growth). */
+  evict(trackType: TrackType, start: number, end: number): void {
+    const queue = this.queues.get(trackType);
+    if (!queue || end <= start) return;
+    queue.push({ kind: 'remove', start, end });
+    this.drainQueue(trackType);
+  }
+
+  /**
+   * Evict already-played media older than `BACK_BUFFER_SECONDS` behind `currentTime` on every track,
+   * keeping the resident buffer bounded. Called as playback advances. No-op if there's nothing old
+   * enough to remove.
+   */
+  trimBackBuffer(currentTime: number): void {
+    const cutoff = currentTime - BACK_BUFFER_SECONDS;
+    if (cutoff <= 0) return;
+    for (const [type, sb] of this.sourceBuffers) {
+      if (sb.buffered.length === 0) continue;
+      const start = sb.buffered.start(0);
+      if (cutoff > start + 0.5) this.evict(type, start, cutoff);
+    }
   }
 
   private drainQueue(type: TrackType): void {
     if (this.processing.get(type)) return;
-    const queue = this.appendQueues.get(type);
+    const queue = this.queues.get(type);
     const sb = this.sourceBuffers.get(type);
     if (!queue || !sb || queue.length === 0) return;
     if (sb.updating) return;
 
-    const task = queue.shift()!;
+    const op = queue[0];
     this.processing.set(type, true);
     try {
-      sb.appendBuffer(task.data);
+      if (op.kind === 'append') {
+        queue.shift();
+        sb.appendBuffer(op.data);
+      } else {
+        queue.shift();
+        // Clamp to the actual buffered extent so remove() never throws on an empty/short range.
+        const bufStart = sb.buffered.length ? sb.buffered.start(0) : op.start;
+        const bufEnd = sb.buffered.length ? sb.buffered.end(sb.buffered.length - 1) : op.end;
+        const s = Math.max(op.start, bufStart);
+        const e = Math.min(op.end, bufEnd);
+        if (e > s) { sb.remove(s, e); } else { this.processing.set(type, false); this.drainQueue(type); }
+      }
     } catch (e) {
       this.processing.set(type, false);
-      console.error(`appendBuffer error (${type}):`, e);
+      if (op.kind === 'append' && (e as DOMException)?.name === 'QuotaExceededError') {
+        this.handleQuota(type, op.data);
+      } else {
+        console.error(`appendBuffer error (${type}):`, e);
+      }
+    }
+  }
+
+  /**
+   * The SourceBuffer is full. Free space by evicting media behind the playhead and retry the append.
+   * If there's nothing behind to evict (the forward buffer alone is over quota — common for
+   * high-bitrate all-intra like AVC-Intra), the segment can't be appended now: re-queue it at the
+   * front and tell the player to stop fetching until the playhead advances and frees room.
+   */
+  private handleQuota(type: TrackType, data: ArrayBuffer): void {
+    const sb = this.sourceBuffers.get(type);
+    const queue = this.queues.get(type);
+    if (!sb || !queue) return;
+    queue.unshift({ kind: 'append', data }); // retry this append after we make room
+
+    const ct = this.video.currentTime;
+    const cutoff = ct - 2; // keep a little behind the playhead; drop the rest
+    const start = sb.buffered.length ? sb.buffered.start(0) : 0;
+    if (sb.buffered.length > 0 && cutoff > start + 0.5) {
+      // There is removable behind-playhead data — evict it, then the retry append runs on updateend.
+      queue.unshift({ kind: 'remove', start, end: cutoff });
+      this.drainQueue(type);
+    } else {
+      // Forward buffer is full and nothing behind to drop. Hold the append; the player must pause
+      // fetching. trimBackBuffer() (as currentTime advances) will free room and drain the held op.
+      console.warn(`[mse] ${type} buffer full — pausing fetch until playhead advances`);
+      this.onBufferFull?.();
     }
   }
 
@@ -195,6 +263,6 @@ export class MseController {
     this.video.src = '';
     this.mediaSource = null;
     this.sourceBuffers.clear();
-    this.appendQueues.clear();
+    this.queues.clear();
   }
 }

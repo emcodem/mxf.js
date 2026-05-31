@@ -94,6 +94,95 @@ export function buildAVCDecoderConfigRecord(spsNALU: Uint8Array, ppsNALU: Uint8A
   return out;
 }
 
+/**
+ * Parse the coded (macroblock-aligned, pre-crop) luma dimensions from an SPS NALU.
+ * Returns null if parsing fails. These are the dimensions Chrome's MSE stream parser derives from
+ * the SPS, so the avc1/VisualSampleEntry box must declare the SAME values or the init segment is
+ * rejected. In particular interlaced AVC-Intra (frame_mbs_only_flag = 0) codes the full frame
+ * height (e.g. 1088) even though the MXF descriptor stores the per-field height (e.g. 544).
+ */
+export function parseSPSCodedDimensions(spsNALU: Uint8Array): { width: number; height: number } | null {
+  try {
+    // Strip the NAL header byte, then remove emulation-prevention bytes (00 00 03 → 00 00).
+    const rbsp: number[] = [];
+    for (let i = 1; i < spsNALU.length; i++) {
+      if (i >= 3 && spsNALU[i] === 0x03 && spsNALU[i - 1] === 0x00 && spsNALU[i - 2] === 0x00 && rbsp.length >= 2 &&
+          rbsp[rbsp.length - 1] === 0x00 && rbsp[rbsp.length - 2] === 0x00) {
+        continue; // skip emulation-prevention byte
+      }
+      rbsp.push(spsNALU[i]);
+    }
+
+    let bitPos = 0;
+    const u1 = (): number => {
+      const byte = rbsp[bitPos >> 3];
+      const bit = (byte >> (7 - (bitPos & 7))) & 1;
+      bitPos++;
+      return bit;
+    };
+    const u = (n: number): number => { let v = 0; for (let i = 0; i < n; i++) v = (v << 1) | u1(); return v; };
+    const ue = (): number => {
+      let zeros = 0;
+      while (u1() === 0 && zeros < 32) zeros++;
+      let v = 0;
+      for (let i = 0; i < zeros; i++) v = (v << 1) | u1();
+      return v + (1 << zeros) - 1;
+    };
+    const se = (): number => { const k = ue(); return (k & 1) ? (k + 1) >> 1 : -(k >> 1); };
+
+    const profileIdc = u(8);
+    u(8);        // constraint flags + reserved
+    u(8);        // level_idc
+    ue();        // seq_parameter_set_id
+
+    if ([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].includes(profileIdc)) {
+      const chromaFormatIdc = ue();
+      if (chromaFormatIdc === 3) u1(); // separate_colour_plane_flag
+      ue();      // bit_depth_luma_minus8
+      ue();      // bit_depth_chroma_minus8
+      u1();      // qpprime_y_zero_transform_bypass_flag
+      if (u1()) { // seq_scaling_matrix_present_flag
+        const count = chromaFormatIdc !== 3 ? 8 : 12;
+        for (let i = 0; i < count; i++) {
+          if (u1()) { // scaling list present
+            let lastScale = 8, nextScale = 8;
+            const size = i < 6 ? 16 : 64;
+            for (let j = 0; j < size; j++) {
+              if (nextScale !== 0) { const delta = se(); nextScale = (lastScale + delta + 256) % 256; }
+              lastScale = nextScale === 0 ? lastScale : nextScale;
+            }
+          }
+        }
+      }
+    }
+
+    ue();        // log2_max_frame_num_minus4
+    const picOrderCntType = ue();
+    if (picOrderCntType === 0) {
+      ue();      // log2_max_pic_order_cnt_lsb_minus4
+    } else if (picOrderCntType === 1) {
+      u1();      // delta_pic_order_always_zero_flag
+      se();      // offset_for_non_ref_pic
+      se();      // offset_for_top_to_bottom_field
+      const n = ue();
+      for (let i = 0; i < n; i++) se();
+    }
+
+    ue();        // max_num_ref_frames
+    u1();        // gaps_in_frame_num_value_allowed_flag
+    const picWidthInMbsMinus1 = ue();
+    const picHeightInMapUnitsMinus1 = ue();
+    const frameMbsOnlyFlag = u1();
+
+    const width = (picWidthInMbsMinus1 + 1) * 16;
+    const height = (2 - frameMbsOnlyFlag) * (picHeightInMapUnitsMinus1 + 1) * 16;
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384) return null;
+    return { width, height };
+  } catch {
+    return null;
+  }
+}
+
 /** Check if buffer starts with Annex B start code */
 export function isAnnexB(buffer: ArrayBuffer): boolean {
   const u8 = new Uint8Array(buffer, 0, Math.min(4, buffer.byteLength));

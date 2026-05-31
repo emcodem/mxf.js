@@ -52,6 +52,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private nextFetchFrame = 0;
   private framesPerChunk = 50;   // fetch ~2 seconds at 25fps
   private fetchPending = false;
+  // Set when the SourceBuffer is full and nothing behind the playhead can be evicted (the forward
+  // buffer alone is over quota — e.g. high-bitrate AVC-Intra). Blocks fetching until the playhead
+  // advances and trimBackBuffer() frees room; cleared in onTimeUpdate.
+  private bufferFull = false;
   private editRateNumerator = 25;
   private editRateDenominator = 1;
   private seqBase = 0;
@@ -66,6 +70,29 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   // True between beginScrub()/endScrub(): every seek uses fast I-frame-only mode and normal
   // forward fetching is suspended so it can't compete with preview decodes.
   private scrubbing = false;
+  // Single-flight scrub pump (decoupled from pendingSeeks, which never drains during a fast drag).
+  // latestScrubFrame holds the newest dragged position; while a preview is in flight we just update
+  // it, and fire the next preview at that freshest position when the current one completes.
+  private latestScrubFrame: number | null = null;
+  private scrubSeq = 0;
+  // One scrub "cycle" = decode preview → append → seek playhead onto it → wait for 'seeked' (the
+  // frame actually painted). A cycle is gated end-to-end: we do NOT move the playhead again until
+  // the previous seek COMPLETES, because re-setting currentTime mid-seek aborts it and the frame
+  // never renders (the root cause of "stops playing frames" — currentTime advanced but nothing
+  // painted). scrubCycleActive spans a whole cycle; the newest drag position waits in
+  // latestScrubFrame and starts the next cycle when this one finishes.
+  private scrubCycleActive = false;
+  // Frame the active cycle is rendering (the dragged target); set as the playhead once buffered.
+  private scrubRenderFrame: number | null = null;
+  // True after we move the playhead for a render and are waiting for the frame to actually paint.
+  private scrubRenderPending = false;
+  // Watchdog so a missing paint can't wedge the cycle permanently.
+  private renderSeekWatchdog: ReturnType<typeof setTimeout> | null = null;
+  // True while we set video.currentTime ourselves (to render a preview, or to settle on endScrub),
+  // so the resulting 'seeking' event isn't mistaken for a user drag/seek.
+  private ignoreNextSeeking = false;
+  // Whether playback was running when scrubbing began, so endScrub() can resume it.
+  private scrubWasPlaying = false;
   // Mode the in-flight seek was issued with — read when its 'seeked' reply arrives, since the
   // scrubbing flag may have changed (e.g. endScrub) between issuing and the reply.
   private activeSeekMode: 'keyframe' | 'accurate' = 'accurate';
@@ -81,6 +108,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.config = { ...DEFAULT_CONFIG, ...config };
 
     this.video.addEventListener('seeking', () => this.onVideoSeeking());
+    this.video.addEventListener('seeked', () => this.onVideoSeeked());
     this.video.addEventListener('timeupdate', () => this.onTimeUpdate());
   }
 
@@ -94,6 +122,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
   get paused(): boolean {
     return this.video.paused;
+  }
+
+  /**
+   * Which seeking strategy the loaded file supports, or null before the manifest arrives:
+   * 'cbg' (constant-byte-count math), 'vbe' (per-frame index entries), or 'none' (growing/live —
+   * approximate offset-percentage seeking). Useful for tailoring UI (e.g. exact vs approximate seek).
+   */
+  get indexMode(): 'cbg' | 'vbe' | 'none' | null {
+    return this.manifest?.indexMode ?? null;
   }
 
   play(): void {
@@ -118,28 +155,53 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   }
 
   /**
-   * Enter scrub mode: subsequent seeks (e.g. from dragging a timeline slider) decode only the
-   * GOP-head I-frame and show it instantly, instead of decoding up to the exact target. Wire a
-   * slider's live `input` events to seek() between beginScrub() and endScrub() for smooth, cheap
-   * preview while dragging. The timeline thumb is never snapped — the preview frame covers its
-   * whole GOP, so the picture is the keyframe at-or-before the dragged position.
+   * Enter scrub mode. While scrubbing, feed the live drag position to `scrubTo()` (e.g. from a
+   * slider's `input` event); each position triggers a fast GOP-head preview. Crucially, the drag
+   * does NOT move the <video> playhead — that only happens once a preview is buffered, so the
+   * picture keeps updating instead of stalling on positions whose frame hasn't arrived yet. The
+   * video is paused for the duration (scrub renders by seeking the paused element onto each ready
+   * preview frame); endScrub() resumes playback if it was running.
    */
   beginScrub(): void {
+    if (this.scrubbing) return;
     this.scrubbing = true;
+    this.scrubWasPlaying = !this.video.paused;
+    this.video.pause();
   }
 
   /**
-   * Leave scrub mode and settle on an accurate frame at the current position: decodes the
-   * preceding keyframe up to the exact target so the final picture is precise, then resumes
-   * normal forward fetching. Call this when the user releases the slider (its `change` event).
+   * Report a live drag position (seconds) during scrubbing. Records it as the newest target and
+   * kicks the single-flight preview pump; does NOT touch video.currentTime (see beginScrub()).
    */
-  endScrub(): void {
+  scrubTo(timeSeconds: number): void {
+    if (!this.manifest || !this.scrubbing) return;
+    const clamped = Math.max(0, Math.min(timeSeconds, this.manifest.duration));
+    this.latestScrubFrame = Math.round(clamped * this.editRateNumerator / this.editRateDenominator);
+    this.pumpScrubPreview();
+  }
+
+  /**
+   * Leave scrub mode and settle on an accurate frame at `timeSeconds` (the released position):
+   * decodes the preceding keyframe up to the exact target so the final picture is precise, then
+   * resumes normal forward fetching (and playback, if it was running). Call on the slider's
+   * `change` event. If `timeSeconds` is omitted the current playhead is used.
+   */
+  endScrub(timeSeconds?: number): void {
     if (!this.scrubbing) return;
     this.scrubbing = false;
+    this.latestScrubFrame = null; // stop the pump; an in-flight preview closes its cycle via previewDone
+    this.scrubRenderFrame = null;
+    this.scrubCycleActive = false;
+    this.scrubRenderPending = false;
+    if (this.renderSeekWatchdog !== null) { clearTimeout(this.renderSeekWatchdog); this.renderSeekWatchdog = null; }
     if (!this.manifest) return;
-    // currentTime is already at the released position (no 'seeking' event will fire), so kick
-    // off an accurate seek explicitly to refine the picture and re-establish a clean decode.
-    this.initiateSeek(this.video.currentTime, 'accurate');
+    const settle = Math.max(0, Math.min(timeSeconds ?? this.video.currentTime, this.manifest.duration));
+    // Move the playhead to the released position ourselves and suppress the resulting 'seeking'
+    // event so it isn't double-handled — we drive the accurate settle explicitly below.
+    this.ignoreNextSeeking = settle !== this.video.currentTime;
+    this.video.currentTime = settle;
+    this.initiateSeek(settle, 'accurate');
+    if (this.scrubWasPlaying) this.video.play().catch(() => {});
   }
 
   loadUrl(url: string): void {
@@ -158,13 +220,28 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.destroyInternal();
     this.worker = this.createWorker();
     this.worker.addEventListener('message', (e: MessageEvent<WorkerEvent>) => this.onWorkerMessage(e.data));
-    this.worker.addEventListener('error', (e) => {
-      this.emit('error', { message: e.message ?? 'Worker error', fatal: true });
+    this.worker.addEventListener('error', (e: ErrorEvent) => {
+      // A bare ErrorEvent with no message usually means the worker MODULE failed to load/evaluate
+      // (e.g. the dev server restarted — Vite restarts on vite.config.ts changes — and an already
+      // open tab's worker died; reload the page). Surface filename/line and the underlying error
+      // so it's diagnosable instead of an opaque "Worker error".
+      const detail = [e.message, e.filename && `${e.filename}:${e.lineno ?? '?'}:${e.colno ?? '?'}`,
+        (e.error as Error | undefined)?.stack].filter(Boolean).join(' — ');
+      console.error('[jsmxf] worker error:', e, e.error);
+      this.emit('error', {
+        message: detail || 'Worker failed to load — reload the page (the dev server may have restarted)',
+        fatal: true,
+      });
+    });
+    this.worker.addEventListener('messageerror', (e) => {
+      this.emit('error', { message: `Worker message error: ${String(e)}`, fatal: true });
     });
     this.mseController = new MseController(this.video);
     this.mseController.onError = (type, message) => {
       this.emit('error', { message: `MSE ${type}: ${message}`, fatal: false });
     };
+    // Back-pressure: the forward buffer is over quota — stop fetching until the playhead advances.
+    this.mseController.onBufferFull = () => { this.bufferFull = true; this.fetchPending = false; };
   }
 
   private createWorker(): Worker {
@@ -248,6 +325,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
         break;
       }
 
+      case 'previewDone':
+        this.onPreviewDone();
+        break;
+
       case 'codecUnsupported':
         this.emit('codec-unsupported', { codec: event.codec, reason: event.reason });
         break;
@@ -275,6 +356,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       tracks: event.tracks,
       pictureDescriptor: pd,
       soundDescriptor: sd,
+      indexMode: event.indexMode,
     };
 
     // Use the resolved output codec for the MIME type (e.g. 'h264' for transcoded MPEG-2).
@@ -342,15 +424,19 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     if (this.scrubbing) return;
     // Parked on a fast preview: don't auto-advance. A seek (play()/endScrub()/new seek) un-parks.
     if (this.previewParked) return;
+    // SourceBuffer is full and can't be trimmed yet — wait for the playhead to advance.
+    if (this.bufferFull) return;
     if (this.fetchPending || !this.manifest) return;
 
-    // Range-aware: how much is buffered *from the current position*, not the end of some
-    // unrelated later range. Returns 0 when currentTime sits in an unbuffered gap, so a seek
-    // there always fetches instead of mistaking a far-ahead range for "buffered enough".
     const currentTime = this.video.currentTime;
-    const aheadSeconds = this.mseController?.getBufferedAhead('video', currentTime) ?? 0;
+    const fps = this.editRateNumerator / this.editRateDenominator;
 
-    if (aheadSeconds >= this.config.maxBufferSeconds) return;
+    // Cap by REQUESTED-ahead, not buffered-ahead. nextFetchFrame is exactly how far ahead we've
+    // already asked for, so this bounds prefetch to maxBufferSeconds regardless of how the decoded
+    // timeline lands in `buffered` (a transcode timeline that lags, or fragmented ranges, made the
+    // old buffered-ahead check undercount and prefetch the WHOLE file → worker saturation + quota).
+    const requestedAheadSeconds = this.nextFetchFrame / fps - currentTime;
+    if (requestedAheadSeconds >= this.config.maxBufferSeconds) return;
 
     const totalFrames = Math.round(
       this.manifest.duration * this.editRateNumerator / this.editRateDenominator
@@ -374,10 +460,75 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
   private onVideoSeeking(): void {
     if (!this.manifest) return;
+    // Ignore 'seeking' events we caused ourselves (rendering a preview frame, or the endScrub
+    // settle) — otherwise they'd be mistaken for a user drag/seek and re-trigger work.
+    if (this.ignoreNextSeeking) { this.ignoreNextSeeking = false; return; }
     const targetTime = this.video.currentTime;
     this.emit('seeking', { targetTime });
-    // While scrubbing every seek is a fast I-frame-only preview; otherwise honour the config.
-    this.initiateSeek(targetTime, this.scrubbing ? 'keyframe' : this.config.seekMode);
+    // During scrubbing the drag is reported via scrubTo() (which does not move the playhead), so a
+    // genuine 'seeking' here is unusual — route it to the pump for safety rather than a full seek.
+    if (this.scrubbing) {
+      this.scrubTo(targetTime);
+      return;
+    }
+    this.initiateSeek(targetTime, this.config.seekMode);
+  }
+
+  /**
+   * Start a scrub cycle iff one isn't already running. A cycle decodes the latest dragged position,
+   * appends it, seeks the playhead onto it, and waits for the frame to paint ('seeked') before the
+   * next cycle. So the update rate self-paces to decode+render throughput and every cycle actually
+   * renders a frame; very fast drags just skip intermediate positions instead of freezing.
+   */
+  private pumpScrubPreview(): void {
+    if (!this.scrubbing || this.scrubCycleActive || this.latestScrubFrame === null) return;
+    const target = this.latestScrubFrame;
+    this.latestScrubFrame = null;
+    this.scrubCycleActive = true;
+    this.scrubRenderFrame = target; // rendered once its preview is buffered (previewDone)
+    this.scrubSeq++;
+    const cmd: WorkerCommand = { type: 'scrubPreview', targetFrame: target, seq: this.scrubSeq };
+    this.worker!.postMessage(cmd);
+  }
+
+  private onVideoSeeked(): void {
+    // A seek completing is one signal a frame painted — complete the render cycle if waiting.
+    if (this.scrubbing && this.scrubRenderPending) this.completeScrubRender();
+  }
+
+  /**
+   * A scrub preview's segment has been posted (and queued for append). Move the playhead onto that
+   * frame, wait for the seek to complete ('seeked' = paint) before starting the next cycle, then
+   * advance to the freshest dragged position. A watchdog bounds a stalled seek.
+   *
+   * NOTE: a paused <video> reliably paints the requested frame only when the drag pauses/slows; under
+   * a fast continuous drag the per-cycle decode+append+seek-paint can't keep up, so the picture
+   * trails the thumb and effectively only refreshes when you stop. This is an MSE limitation for
+   * sparse transcoded preview frames — smooth live scrub needs a canvas/WebCodecs preview surface.
+   */
+  private onPreviewDone(): void {
+    if (!this.scrubbing || this.scrubRenderFrame === null || !this.manifest) {
+      this.scrubCycleActive = false;
+      this.scrubRenderFrame = null;
+      return;
+    }
+    const t = Math.max(0, Math.min(this.scrubRenderFrame * this.editRateDenominator / this.editRateNumerator, this.manifest.duration));
+    this.scrubRenderFrame = null;
+    if (Math.abs(t - this.video.currentTime) < 1e-3) { this.completeScrubRender(); return; }
+    this.scrubRenderPending = true;
+    this.ignoreNextSeeking = true;
+    this.video.currentTime = t;
+    if (this.renderSeekWatchdog !== null) clearTimeout(this.renderSeekWatchdog);
+    this.renderSeekWatchdog = setTimeout(() => this.completeScrubRender(), 400);
+  }
+
+  /** Seek completed (or watchdog) — advance to the freshest dragged position. */
+  private completeScrubRender(): void {
+    this.scrubRenderPending = false;
+    if (this.renderSeekWatchdog !== null) { clearTimeout(this.renderSeekWatchdog); this.renderSeekWatchdog = null; }
+    this.scrubCycleActive = false;
+    this.scrubRenderFrame = null;
+    this.pumpScrubPreview();
   }
 
   private initiateSeek(targetTime: number, mode: 'keyframe' | 'accurate'): void {
@@ -386,6 +537,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.activeSeekMode = mode;
     // A new seek supersedes any parked preview; this seek will define the next decode start.
     this.previewParked = false;
+    // A seek targets a (likely unbuffered) new region, so prior buffer-full back-pressure no longer
+    // applies — clear it so the post-seek fetch isn't blocked (otherwise a seek can stall forever).
+    this.bufferFull = false;
 
     this.seekTargetFrame = Math.round(
       targetTime * this.editRateNumerator / this.editRateDenominator
@@ -399,6 +553,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private onTimeUpdate(): void {
     if (!this.manifest) return;
     const currentTime = this.video.currentTime;
+    // While scrubbing the playhead hops to far-apart preview positions; trimming relative to it
+    // would evict the very preview/settle frames we need. Only manage the forward-playback buffer
+    // when not scrubbing.
+    if (!this.scrubbing) {
+      // Evict already-played media so the resident buffer stays bounded, and release the buffer-full
+      // back-pressure now the playhead has advanced (trimming may have freed room).
+      this.mseController?.trimBackBuffer(currentTime);
+      this.bufferFull = false;
+    }
     const aheadSeconds = this.mseController?.getBufferedAhead('video', currentTime) ?? 0;
 
     if (aheadSeconds < this.config.startBufferSeconds) {
@@ -465,6 +628,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.manifest = null;
     this.nextFetchFrame = 0;
     this.fetchPending = false;
+    this.bufferFull = false;
     this.seqBase = 0;
     this.pendingInitSegment = null;
     this.pendingSeeks = 0;
@@ -472,6 +636,14 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.scrubbing = false;
     this.activeSeekMode = 'accurate';
     this.previewParked = false;
+    this.latestScrubFrame = null;
+    this.scrubCycleActive = false;
+    this.scrubRenderPending = false;
+    if (this.renderSeekWatchdog !== null) { clearTimeout(this.renderSeekWatchdog); this.renderSeekWatchdog = null; }
+    this.scrubSeq = 0;
+    this.scrubRenderFrame = null;
+    this.ignoreNextSeeking = false;
+    this.scrubWasPlaying = false;
   }
 
   destroy(): void {

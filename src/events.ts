@@ -1,5 +1,6 @@
 import { MxfTrack } from './parser/metadata.js';
 import { PictureDescriptor, SoundDescriptor } from './parser/descriptor.js';
+import type { IndexMode } from './mxf-file.js';
 
 export interface ManifestData {
   duration: number;
@@ -8,6 +9,8 @@ export interface ManifestData {
   tracks: MxfTrack[];
   pictureDescriptor: PictureDescriptor | null;
   soundDescriptor: SoundDescriptor | null;
+  /** Seeking strategy this file supports: 'cbg' | 'vbe' | 'none'. */
+  indexMode: IndexMode;
 }
 
 export interface MxfPlayerEvents {

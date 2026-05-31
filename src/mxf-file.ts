@@ -1,14 +1,14 @@
 import { ILoader } from './loader/loader.js';
 import { KLVIterator, readKLV } from './core/klv.js';
-import { decodeBerLength } from './core/ber.js';
 import { parsePartitionPack, PartitionPack } from './parser/partition.js';
 import { parsePrimerPack, PrimerPack } from './parser/primer.js';
 import { parseHeaderMetadata, MxfMetadata } from './parser/metadata.js';
-import { parseIndexTableSegment, IndexTableSegment } from './parser/index-table.js';
+import { parseIndexTableSegment, IndexTableSegment, classifyIndexMode } from './parser/index-table.js';
 import {
   isPartitionPack,
   isPrimerPack,
   isIndexTableSegment,
+  isGenericContainerElement,
   ulEquals,
   UL_RANDOM_INDEX_PACK,
   isFill,
@@ -23,13 +23,26 @@ export interface RandomIndexPackEntry {
   byteOffset: bigint;
 }
 
+/**
+ * Which seeking strategy applies to this file:
+ * - 'cbg'  — Constant Byte Group: an index segment declares editUnitByteCount > 0, so any frame's
+ *            byte offset is `essenceStart + frame * editUnitByteCount` (no per-frame entries needed).
+ * - 'vbe'  — Variable Byte Extent: a normal index entry array maps each frame to a byte offset.
+ * - 'none' — No usable index (e.g. still-growing / live files); seek by offset percentage + scan.
+ */
+export type IndexMode = 'cbg' | 'vbe' | 'none';
+
 export interface MxfBootstrap {
   headerPartition: PartitionPack;
   metadata: MxfMetadata;
   indexSegments: IndexTableSegment[];
   ripEntries: RandomIndexPackEntry[];
-  /** Absolute file offset where the first body partition pack starts */
+  /** Absolute file offset of the first essence KLV in the body partition */
   essenceStart: bigint;
+  /** BodySID of the body partition holding the video essence (0 = unknown / match any) */
+  essenceBodySID: number;
+  /** Seeking strategy this file supports — see {@link IndexMode} */
+  indexMode: IndexMode;
 }
 
 export class MxfFile {
@@ -94,11 +107,28 @@ export class MxfFile {
       console.log(`[jsmxf] indexSegments: ${indexSegments.length} (${headerIndexSegments.length} header, ${footerIndexSegments.length} footer)`);
     }
 
-    // ── Step 5: Locate first body partition ───────────────────────────────────
-    const essenceStart = await this.findEssenceStart(ripEntries, headerPartition, afterPP + metaSize, fileSize);
-    if (this.debug) console.log(`[jsmxf] essenceStart=${essenceStart}`);
+    // ── Step 5: Locate the essence container start + any in-partition index ───
+    // KLV-walks the essence-bearing partition to the first Generic Container element, collecting
+    // index table segments that live in that partition's pre-essence (index) region — which the
+    // header-metadata scan above misses (it only covers headerByteCount bytes, and some encoders,
+    // e.g. XAVC, place a CBG index segment in the index region that follows).
+    const { essenceStart, bodySID: essenceBodySID, indexSegments: essencePartitionIndex } =
+      await this.locateEssence(ripEntries, headerPartition, afterPP + metaSize, fileSize);
+    for (const seg of essencePartitionIndex) {
+      const dup = indexSegments.some(s =>
+        s.bodySID === seg.bodySID && s.indexSID === seg.indexSID &&
+        s.indexStartPosition === seg.indexStartPosition &&
+        s.editUnitByteCount === seg.editUnitByteCount &&
+        s.entries.length === seg.entries.length);
+      if (!dup) indexSegments.push(seg);
+    }
+    if (this.debug) console.log(`[jsmxf] essenceStart=${essenceStart}, essenceBodySID=${essenceBodySID}, +${essencePartitionIndex.length} in-partition index segs`);
 
-    this.bootstrap = { headerPartition, metadata, indexSegments, ripEntries, essenceStart };
+    // ── Step 6: Determine the seeking strategy ────────────────────────────────
+    const indexMode: IndexMode = classifyIndexMode(indexSegments, essenceBodySID);
+    if (this.debug) console.log(`[jsmxf] indexMode=${indexMode}`);
+
+    this.bootstrap = { headerPartition, metadata, indexSegments, ripEntries, essenceStart, essenceBodySID, indexMode };
     return this.bootstrap;
   }
 
@@ -182,57 +212,65 @@ export class MxfFile {
     return footer?.byteOffset ?? header.footerPartition;
   }
 
-  private async findEssenceStart(
+  /**
+   * Locate the essence container start by KLV-walking the essence-bearing partition. Returns the
+   * byte offset of the first Generic Container content-package element (the point index streamOffset
+   * 0 / CBG frame 0 is measured from), the partition's BodySID, and any Index Table Segments found
+   * in the partition's pre-essence region.
+   *
+   * Why walk rather than trust byte counts: some encoders (e.g. XAVC) understate headerByteCount and
+   * tuck a CBG index segment into the index region between metadata and essence, so neither
+   * "skip headerByteCount+indexByteCount" nor "first non-fill KLV after the partition pack" lands
+   * correctly. Walking whole KLVs and stopping at the first 0D 01 03 01 element is robust to both
+   * essence-in-header-partition (XAVC) and essence-in-body-partition (D-10/OP1a) layouts.
+   */
+  private async locateEssence(
     rip: RandomIndexPackEntry[],
     _header: PartitionPack,
     fallback: number,
     fileSize: number
-  ): Promise<bigint> {
+  ): Promise<{ essenceStart: bigint; bodySID: number; indexSegments: IndexTableSegment[] }> {
     const body = rip.find(e => e.bodySID > 0);
-    const bodyPPStart = body?.byteOffset ?? BigInt(fallback);
+    const partOffset = Number(body?.byteOffset ?? BigInt(fallback));
+    const indexSegments: IndexTableSegment[] = [];
 
-    // Skip over the body partition pack, then over any trailing fill/padding to reach
-    // the first essence KLV.  StreamOffset values in the index are measured from that KLV.
+    // Essence usually begins within a few hundred KB of its partition pack (metadata + index +
+    // fill). A 1 MB window covers every real-world case; if it doesn't, fall back to the partition
+    // offset itself (sequential reading still works, just without the index).
+    const window = Math.min(1024 * 1024, fileSize - partOffset);
+    if (window <= 0) return { essenceStart: BigInt(partOffset), bodySID: 0, indexSegments };
+
     try {
-      const ppBuf = await this.loader.fetchRange(Number(bodyPPStart), Math.min(Number(bodyPPStart) + 256, fileSize) - 1, 'bootstrap: body partition pack');
-      const ppView = new DataView(ppBuf);
-      const { length: ppValueLen, bytesRead: berBytes } = decodeBerLength(ppView, 16);
-      const afterBodyPP = Number(bodyPPStart) + 16 + berBytes + ppValueLen;
+      const buf = await this.loader.fetchRange(partOffset, partOffset + window - 1, 'bootstrap: essence partition scan');
 
-      // Scan forward from afterBodyPP to find the first non-fill, non-zero KLV.
-      // Some encoders write raw zero padding (sector alignment) rather than KLV fill,
-      // so we search for the next 06 0E 2B 34 sync rather than relying on the fill key.
-      const SCAN_WINDOW = Math.min(65536, fileSize - afterBodyPP);
-      if (SCAN_WINDOW <= 0) return BigInt(afterBodyPP);
+      // Parse + skip the partition pack at the window start (best-effort: a fallback offset that
+      // isn't a partition pack just means we walk from the window start with bodySID unknown).
+      let bodySID = 0;
+      let walkStart = 0;
+      try {
+        const ppStart = KLVIterator.skipRunIn(buf);
+        bodySID = parsePartitionPack(buf, partOffset).bodySID;
+        walkStart = ppStart + readKLV(buf, ppStart).totalLength;
+      } catch { walkStart = 0; }
 
-      const scanBuf = await this.loader.fetchRange(afterBodyPP, afterBodyPP + SCAN_WINDOW - 1, 'bootstrap: essence-start scan');
-      const scanU8 = new Uint8Array(scanBuf);
-      const scanDV = new DataView(scanBuf);
-      let pos = 0;
-
-      while (pos <= SCAN_WINDOW - 16) {
-        // Find next 06 0E 2B 34 sync
-        if (scanU8[pos] !== 0x06 || scanU8[pos+1] !== 0x0e ||
-            scanU8[pos+2] !== 0x2b || scanU8[pos+3] !== 0x34) {
-          pos++;
+      const iter = new KLVIterator(buf, walkStart);
+      while (iter.hasMore()) {
+        const off = iter.offset;
+        const pkt = iter.next();
+        if (!pkt) break; // incomplete KLV at window end — essence lies beyond it
+        if (isIndexTableSegment(pkt.key)) {
+          try { indexSegments.push(parseIndexTableSegment(buf, pkt)); } catch { /* skip malformed */ }
           continue;
         }
-        // If it's KLV fill, jump over it and keep scanning
-        const key16 = scanU8.subarray(pos, pos + 16);
-        if (isFill(key16) && pos + 16 < SCAN_WINDOW) {
-          try {
-            const { length: fLen, bytesRead: fBer } = decodeBerLength(scanDV, pos + 16);
-            pos += 16 + fBer + fLen;
-            continue;
-          } catch { break; }
+        // First content-package element (system / picture / sound / data / D-10) → essence start.
+        if (isGenericContainerElement(pkt.key)) {
+          return { essenceStart: BigInt(partOffset + off), bodySID, indexSegments };
         }
-        // Non-fill KLV found — this is the start of the essence container
-        return BigInt(afterBodyPP + pos);
+        // Primer / fill / header metadata / partition packs are skipped by KLV length.
       }
-
-      return BigInt(afterBodyPP);
+      return { essenceStart: BigInt(partOffset), bodySID, indexSegments };
     } catch {
-      return bodyPPStart;
+      return { essenceStart: BigInt(partOffset), bodySID: 0, indexSegments };
     }
   }
 
