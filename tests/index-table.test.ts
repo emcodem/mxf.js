@@ -1,0 +1,124 @@
+import { describe, it, expect } from 'vitest';
+import { parseIndexTableSegment, resolveFrameOffset } from '../src/parser/index-table.js';
+import { readKLV } from '../src/core/klv.js';
+import { UL_INDEX_TABLE_SEGMENT_V1 } from '../src/core/ul.js';
+import { encodeBerLength } from '../src/core/ber.js';
+
+function buildIndexTableSegmentBuffer(entries: { streamOffset: bigint; isKeyframe: boolean }[]): ArrayBuffer {
+  function tag16(tag: number, ...bytes: number[]): Uint8Array {
+    const data = new Uint8Array(bytes);
+    const out = new Uint8Array(4 + data.length);
+    const v = new DataView(out.buffer);
+    v.setUint16(0, tag, false);
+    v.setUint16(2, data.length, false);
+    out.set(data, 4);
+    return out;
+  }
+  function tag64(tag: number, val: bigint): Uint8Array {
+    const out = new Uint8Array(12);
+    const v = new DataView(out.buffer);
+    v.setUint16(0, tag, false);
+    v.setUint16(2, 8, false);
+    v.setUint32(4, Number(val >> 32n) >>> 0, false);
+    v.setUint32(8, Number(val & 0xffffffffn) >>> 0, false);
+    return out;
+  }
+  function tag32(tag: number, val: number): Uint8Array {
+    const out = new Uint8Array(8);
+    const v = new DataView(out.buffer);
+    v.setUint16(0, tag, false);
+    v.setUint16(2, 4, false);
+    v.setUint32(4, val, false);
+    return out;
+  }
+
+  const entryItemLen = 11;
+  const count = entries.length;
+  const entryArrayData = new Uint8Array(8 + count * entryItemLen);
+  const eav = new DataView(entryArrayData.buffer);
+  eav.setUint32(0, count, false);
+  eav.setUint32(4, entryItemLen, false);
+  for (let i = 0; i < count; i++) {
+    const base = 8 + i * entryItemLen;
+    eav.setInt8(base, 0);
+    eav.setInt8(base + 1, 0);
+    const flags = entries[i].isKeyframe ? 0x00 : 0x01;
+    eav.setUint8(base + 2, flags);
+    const off = entries[i].streamOffset;
+    eav.setUint32(base + 3, Number(off >> 32n) >>> 0, false);
+    eav.setUint32(base + 7, Number(off & 0xffffffffn) >>> 0, false);
+  }
+
+  const entryTag = new Uint8Array(4 + entryArrayData.length);
+  const etv = new DataView(entryTag.buffer);
+  etv.setUint16(0, 0x3f0a, false);
+  etv.setUint16(2, entryArrayData.length, false);
+  entryTag.set(entryArrayData, 4);
+
+  const parts: Uint8Array[] = [
+    tag64(0x3f0c, 0n),
+    tag64(0x3f0d, BigInt(count)),
+    tag32(0x3f05, 0),
+    tag32(0x3f06, 1),
+    tag32(0x3f07, 1),
+    tag16(0x3f08, 0),
+    tag16(0x3f0b, 0),
+    entryTag,
+  ];
+
+  const totalValueLen = parts.reduce((s, p) => s + p.length, 0);
+  const berLen = encodeBerLength(totalValueLen);
+  const totalBufLen = 16 + berLen.length + totalValueLen;
+  const buf = new Uint8Array(totalBufLen);
+  buf.set(UL_INDEX_TABLE_SEGMENT_V1, 0);
+  buf.set(berLen, 16);
+  let offset = 16 + berLen.length;
+  for (const p of parts) { buf.set(p, offset); offset += p.length; }
+  return buf.buffer;
+}
+
+describe('parseIndexTableSegment', () => {
+  it('parses variable-length index with 3 entries', () => {
+    const buffer = buildIndexTableSegmentBuffer([
+      { streamOffset: 0n,      isKeyframe: true  },
+      { streamOffset: 100000n, isKeyframe: false },
+      { streamOffset: 200000n, isKeyframe: false },
+    ]);
+    const klv = readKLV(buffer, 0);
+    const seg = parseIndexTableSegment(buffer, klv);
+
+    expect(seg.indexStartPosition).toBe(0n);
+    expect(seg.indexDuration).toBe(3n);
+    expect(seg.editUnitByteCount).toBe(0);
+    expect(seg.entries).toHaveLength(3);
+    expect(seg.entries[0].streamOffset).toBe(0n);
+    expect(seg.entries[1].streamOffset).toBe(100000n);
+    expect(seg.entries[2].streamOffset).toBe(200000n);
+  });
+});
+
+describe('resolveFrameOffset', () => {
+  it('resolves frame offset using stream offsets', () => {
+    const buffer = buildIndexTableSegmentBuffer([
+      { streamOffset: 0n,   isKeyframe: true  },
+      { streamOffset: 100n, isKeyframe: false },
+      { streamOffset: 250n, isKeyframe: true  },
+    ]);
+    const klv = readKLV(buffer, 0);
+    const seg = parseIndexTableSegment(buffer, klv);
+
+    const essenceStart = 1000n;
+    const resolved = resolveFrameOffset([seg], 1n, essenceStart);
+    expect(resolved).not.toBeNull();
+    expect(resolved!.byteOffset).toBe(essenceStart + 100n);
+  });
+
+  it('returns null for out-of-range frame', () => {
+    const buffer = buildIndexTableSegmentBuffer([
+      { streamOffset: 0n, isKeyframe: true },
+    ]);
+    const klv = readKLV(buffer, 0);
+    const seg = parseIndexTableSegment(buffer, klv);
+    expect(resolveFrameOffset([seg], 99n, 0n)).toBeNull();
+  });
+});

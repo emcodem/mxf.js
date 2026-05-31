@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>jsmxf — MXF Player Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #111; color: #eee; padding: 24px; }
+    h1 { margin-bottom: 16px; font-size: 1.4rem; color: #4af; }
+    .controls { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+    button { padding: 8px 16px; border: none; border-radius: 6px; background: #4af; color: #000; cursor: pointer; font-weight: 600; }
+    button:hover { background: #6cf; }
+    button:disabled { background: #444; color: #888; cursor: default; }
+    input[type="file"] { color: #eee; }
+    input[type="text"] { padding: 8px; border-radius: 6px; border: 1px solid #444; background: #222; color: #eee; width: 360px; }
+    video { width: 100%; max-width: 960px; background: #000; display: block; border-radius: 8px; margin-bottom: 0; }
+    .playback { display: none; align-items: center; gap: 10px; max-width: 960px; margin-bottom: 16px; margin-top: 8px; }
+    .playback button { padding: 6px 14px; min-width: 44px; font-size: 1rem; }
+    #seekBar { flex: 1; accent-color: #4af; cursor: pointer; height: 4px; }
+    .time { font-family: monospace; font-size: 13px; color: #aaa; min-width: 42px; text-align: center; user-select: none; }
+    #log { font-family: monospace; font-size: 12px; background: #000; padding: 12px; border-radius: 6px; max-height: 200px; overflow-y: auto; line-height: 1.6; }
+    .info { color: #8af; }
+    .warn { color: #fa8; }
+    .err  { color: #f44; }
+    #meta { font-family: monospace; font-size: 12px; color: #aaa; margin-bottom: 12px; min-height: 20px; }
+  </style>
+</head>
+<body>
+  <h1>jsmxf — MXF Demuxer Demo</h1>
+
+  <div class="controls">
+    <input type="file" id="fileInput" accept=".mxf,.MXF">
+    <span style="color:#666">or</span>
+    <input type="text" id="urlInput" placeholder="https://example.com/clip.mxf">
+    <button id="loadUrl">Load URL</button>
+  </div>
+
+  <div id="meta"></div>
+  <video id="video" autoplay muted></video>
+
+  <div class="playback" id="playback">
+    <button id="playBtn" disabled>&#9654;</button>
+    <span class="time" id="timeCurrent">0:00</span>
+    <input type="range" id="seekBar" min="0" max="100" step="0.1" value="0">
+    <span class="time" id="timeDuration">0:00</span>
+  </div>
+
+  <div id="log"></div>
+
+  <script type="module">
+    import { MxfPlayer } from '/src/index.ts';
+
+    const video    = document.getElementById('video');
+    const logEl    = document.getElementById('log');
+    const metaEl   = document.getElementById('meta');
+    const playback = document.getElementById('playback');
+    const playBtn  = document.getElementById('playBtn');
+    const seekBar  = document.getElementById('seekBar');
+    const timeCur  = document.getElementById('timeCurrent');
+    const timeDur  = document.getElementById('timeDuration');
+    let player = null;
+    let seeking = false;
+
+    function fmt(s) {
+      if (!isFinite(s) || s < 0) return '0:00';
+      const m = Math.floor(s / 60);
+      return `${m}:${Math.floor(s % 60).toString().padStart(2, '0')}`;
+    }
+
+    function log(msg, cls = 'info') {
+      const line = document.createElement('div');
+      line.className = cls;
+      line.textContent = `[${new Date().toISOString().slice(11,23)}] ${msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function syncPlayBtn() {
+      if (!player) return;
+      playBtn.textContent = player.paused ? '▶' : '⏸';
+    }
+
+    function initPlayer() {
+      player?.destroy();
+      playback.style.display = 'none';
+      playBtn.disabled = true;
+      seekBar.value = 0;
+      timeCur.textContent = '0:00';
+      timeDur.textContent = '0:00';
+
+      player = new MxfPlayer(video, { debug: true, startBufferSeconds: 5, maxBufferSeconds: 30 });
+
+      player.on('manifest', (data) => {
+        const fps = (data.editRateNumerator / data.editRateDenominator).toFixed(2);
+        const pd = data.pictureDescriptor;
+        const sd = data.soundDescriptor;
+        metaEl.textContent =
+          `Duration: ${data.duration.toFixed(2)}s | ` +
+          `FPS: ${fps} | ` +
+          `Video: ${pd?.codec ?? 'unknown'} ${pd?.width}×${pd?.height} | ` +
+          `Audio: ${sd?.codec ?? 'unknown'} ${sd?.sampleRate}Hz ${sd?.channelCount}ch`;
+        log(`Manifest loaded: ${data.duration.toFixed(2)}s, ${data.tracks.length} tracks`);
+        seekBar.max = data.duration;
+        timeDur.textContent = fmt(data.duration);
+        playback.style.display = 'flex';
+        playBtn.disabled = false;
+        syncPlayBtn();
+      });
+
+      player.on('timeupdate', ({ currentTime, duration }) => {
+        timeCur.textContent = fmt(currentTime);
+        timeDur.textContent = fmt(duration);
+        if (!seeking) seekBar.value = currentTime;
+        syncPlayBtn();
+      });
+
+      player.on('error', ({ message, fatal }) => {
+        log(`${fatal ? 'FATAL' : 'Error'}: ${message}`, fatal ? 'err' : 'warn');
+      });
+
+      player.on('codec-unsupported', ({ codec, reason }) => {
+        log(`Codec unsupported: ${codec} — ${reason}`, 'warn');
+      });
+    }
+
+    playBtn.addEventListener('click', () => {
+      if (!player) return;
+      if (player.paused) { player.play(); } else { player.pause(); }
+      syncPlayBtn();
+    });
+
+    seekBar.addEventListener('mousedown', () => { seeking = true; });
+    seekBar.addEventListener('touchstart', () => { seeking = true; });
+    seekBar.addEventListener('input', () => {
+      timeCur.textContent = fmt(parseFloat(seekBar.value));
+    });
+    seekBar.addEventListener('change', () => {
+      seeking = false;
+      // seeking not yet implemented for WebCodecs path
+    });
+
+    document.getElementById('fileInput').addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      log(`Loading file: ${file.name} (${(file.size / 1e6).toFixed(1)} MB)`);
+      initPlayer();
+      player.loadFile(file);
+    });
+
+    document.getElementById('loadUrl').addEventListener('click', () => {
+      const url = document.getElementById('urlInput').value.trim();
+      if (!url) return;
+      log(`Loading URL: ${url}`);
+      initPlayer();
+      player.loadUrl(url);
+    });
+  </script>
+</body>
+</html>

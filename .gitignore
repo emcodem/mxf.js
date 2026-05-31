@@ -1,0 +1,15 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# generated debug artifacts (demo/debug.html + yuv-debug.test.ts)
+debug-*.png
+
+# large, regenerable test references (ffmpeg yuv422p dumps)
+# e.g. frames.yuv: `ffmpeg -i in.mxf -frames:v 12 -pix_fmt yuv422p frames.yuv`
+*.yuv
+
+# local Claude Code config / state
+.claude/

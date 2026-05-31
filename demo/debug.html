@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MPEG-2 YUV Debug</title>
+  <style>
+    body { font-family: monospace; background: #111; color: #eee; padding: 16px; }
+    h2 { color: #4af; margin-bottom: 12px; }
+    #status { color: #fa0; margin: 8px 0; min-height: 20px; }
+    #info { background: #000; padding: 10px; border-radius: 4px; white-space: pre;
+            font-size: 12px; color: #8af; margin-bottom: 12px; min-height: 20px; }
+    canvas { display: block; max-width: 100%; border: 1px solid #333; }
+  </style>
+</head>
+<body>
+  <h2>MPEG-2 YUV Decoder Debug</h2>
+  <input type="file" id="fileInput" accept=".mxf,.MXF">
+  <label style="margin-left:16px">reference .yuv (yuv422p): <input type="file" id="refInput"></label>
+  <div id="status">Pick an MXF file.</div>
+  <pre id="info"></pre>
+  <canvas id="yuv"></canvas>
+  <h3 style="color:#4af;margin-top:16px">Frame montage (decode order → display order)</h3>
+  <canvas id="montage"></canvas>
+
+  <script type="module">
+    import { Mpeg2Decoder }    from '/src/codec/mpeg2-decoder.ts';
+    import { FileLoader }      from '/src/loader/file-loader.ts';
+    import { MxfFile }         from '/src/mxf-file.ts';
+    import { EssenceExtractor } from '/src/essence/essence-extractor.ts';
+
+    const status = document.getElementById('status');
+    const info   = document.getElementById('info');
+    const canvas = document.getElementById('yuv');
+    let lastYuv = null;
+
+    document.getElementById('fileInput').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      status.textContent = 'Parsing MXF…';
+      info.textContent = '';
+
+      try {
+        const loader    = new FileLoader(file);
+        const mxf       = new MxfFile(loader, false);
+        const bootstrap = await mxf.open();
+        const pd        = bootstrap.metadata.pictureDescriptor;
+        status.textContent = `Codec: ${pd?.codec ?? '?'}  ${pd?.width}×${pd?.height}  — fetching first video frame…`;
+
+        const extractor = new EssenceExtractor(loader, bootstrap);
+        const NFRAMES = 12;
+        const vframes = [];
+        for await (const frame of extractor.fetchFrames(0n, NFRAMES * 4)) {
+          if (frame.trackType === 'video') { vframes.push(frame); if (vframes.length >= NFRAMES) break; }
+        }
+        if (!vframes.length) { status.textContent = 'No video frames found.'; return; }
+        const firstVideo = vframes[0];
+
+        status.textContent = `Got ${vframes.length} video frames. Decoding…`;
+
+        // Decode the whole run so the motion-compensation path (P/B frames) is exercised.
+        const emitted = [];
+        const dec = new Mpeg2Decoder((frame) => {
+          emitted.push({
+            y: frame.y.slice(), cb: frame.cb.slice(), cr: frame.cr.slice(),
+            codedWidth: frame.codedWidth, codedHeight: frame.codedHeight,
+            chromaFormat: frame.chromaFormat, isKeyframe: frame.isKeyframe,
+          });
+        });
+        for (const f of vframes) { dec.write(f.data); while (dec.decode()) { /* onFrame */ } }
+        dec.flush();
+
+        const dbg = dec.debugInfo();
+        console.log('[mc] motion types:', JSON.stringify(dbg.dbgMotionType), 'concealMV:', dbg.concealmentMotionVectors);
+        console.log('[mc] framePredFrameDct?', dbg.framePredFrameDct, 'pictureStructure?', dbg.pictureStructure);
+        console.log('[pictrace]\n' + (dbg.dbgPicTrace || []).join('\n'));
+        console.log('[deadends]\n' + (dbg.dbgDeadLog || []).join('\n'));
+
+        if (!emitted.length) { status.textContent = `Decoder produced no frames (pictureType=${dbg.pictureType})`; return; }
+        const yuv = emitted[0];
+        const perFrameZeros = emitted.map(f => (countZeros(f.y)/f.y.length*100).toFixed(1));
+        console.log('[mc] per-frame Y zeros%:', perFrameZeros.join(' '));
+        renderMontage(emitted);
+
+        // Multi-frame reference diff: auto-load /frames.yuv (yuv422p, 1920x1080) and, for
+        // each emitted frame, find the best-matching reference frame. This reveals the
+        // emit↔display mapping (which emitted index is the I-frame) and per-frame quality.
+        try {
+          const resp = await fetch('/frames.yuv');
+          if (resp.ok) {
+            const refBuf = new Uint8Array(await resp.arrayBuffer());
+            const W = emitted[0].codedWidth;          // 1920
+            const refH = 1080, cW = W >> 1;
+            const frameBytes = W * refH + 2 * (cW * refH);
+            const nRef = Math.floor(refBuf.length / frameBytes);
+            console.log(`[refdiff] /frames.yuv: ${refBuf.length} bytes, ${nRef} frames of ${W}x${refH} yuv422p`);
+            const meanYDiff = (frame, j) => {
+              const yOff = j * frameBytes;
+              let s = 0, n = 0;
+              for (let y = 0; y < refH; y += 4) {
+                const orow = y * W, rrow = yOff + y * W;
+                for (let x = 0; x < W; x += 4) { s += Math.abs(frame.y[orow + x] - refBuf[rrow + x]); n++; }
+              }
+              return s / n;
+            };
+            // Per-frame CHROMA diff (Cb+Cr) for the SAME ref frame. The whole-frame metric
+            // above is luma-only, so a chroma-specific deviation (e.g. the c59 band) was
+            // invisible. This tells us whether chroma is bad only on leading open-GOP B
+            // frames (#0/#1, expected — absent forward anchor) or also on the I-frame (#2)
+            // and P/B frames (which would mean a real chroma decode bug). yuv422p layout:
+            // Y[W*refH], Cb[cW*refH], Cr[cW*refH]; our planes share the cW row stride.
+            const meanCDiff = (frame, j) => {
+              const cbOff = j * frameBytes + W * refH, crOff = cbOff + cW * refH;
+              let s = 0, n = 0;
+              for (let y = 0; y < refH; y += 4) {
+                const orow = y * cW;
+                for (let x = 0; x < cW; x += 4) {
+                  s += Math.abs(frame.cb[orow + x] - refBuf[cbOff + y * cW + x]);
+                  s += Math.abs(frame.cr[orow + x] - refBuf[crOff + y * cW + x]);
+                  n += 2;
+                }
+              }
+              return s / n;
+            };
+            for (let e = 0; e < emitted.length; e++) {
+              let best = -1, bestD = 1e9;
+              for (let j = 0; j < nRef; j++) { const d = meanYDiff(emitted[e], j); if (d < bestD) { bestD = d; best = j; } }
+              const c = meanCDiff(emitted[e], best);
+              console.log(`[refdiff] emitted #${e}: best match ref#${best} meanY=${bestD.toFixed(2)} meanC=${c.toFixed(2)}  (vs ref#${e}: Y ${meanYDiff(emitted[e], Math.min(e,nRef-1)).toFixed(2)})`);
+            }
+          } else {
+            console.log('[refdiff] /frames.yuv not found (status', resp.status, ') — put frames.yuv in project root');
+          }
+        } catch (err) { console.log('[refdiff] error:', err.message); }
+
+        const ySt  = planeStats(yuv.y);
+        const cbSt = planeStats(yuv.cb);
+        const crSt = planeStats(yuv.cr);
+        const yZeros  = countZeros(yuv.y);
+        const cbZeros = countZeros(yuv.cb);
+        const gridY   = sampleGrid(yuv.y, yuv.codedWidth, yuv.codedHeight, 5, 5);
+
+        const raw     = new Uint8Array(firstVideo.data, 0, Math.min(32, firstVideo.data.byteLength));
+        const hexDump = Array.from(raw).map(b => b.toString(16).padStart(2,'0')).join(' ');
+
+        const PT = ['?', 'I (Intra)', 'P (Predictive)', 'B'];
+
+        info.textContent = [
+          `=== Frames decoded: ${emitted.length} from ${vframes.length} input pictures ===`,
+          `per-frame Y zeros%: ${perFrameZeros.join(' ')}`,
+          `keyframe flags: ${emitted.map(f=>f.isKeyframe?'I':'.').join('')}`,
+          ``,
+          `=== Frame 0 ===`,
+          `isKeyframe: ${yuv.isKeyframe}   pictureType: ${PT[dbg.pictureType] ?? dbg.pictureType}`,
+          `coded: ${yuv.codedWidth}×${yuv.codedHeight}   chromaFormat: ${yuv.chromaFormat} (${yuv.chromaFormat===2?'4:2:2':'4:2:0'})`,
+          `ES frame bytes: ${firstVideo.data.byteLength}`,
+          ``,
+          `=== Decoder state ===`,
+          `isMPEG2: ${dbg.isMPEG2}   intraDcPrecision: ${dbg.intraDcPrecision}`,
+          `intraVlcFormat: ${dbg.intraVlcFormat}   qScaleType: ${dbg.qScaleType}   alternateScan: ${dbg.alternateScan}`,
+          `intraQuantMatrix[0..7]: ${dbg.intraQuantMatrix_0_7.join(', ')}`,
+          `chromaIntraQuant[0..7]: ${(dbg.chromaIntraQuantMatrix_0_7 || []).join(', ')}`,
+          `  (MPEG-2 default:      8, 16, 19, 22, 26, 27, 29, 34)`,
+          `extensions seen: ${(dbg.dbgExtIds || []).join(' ')}`,
+          ``,
+          `=== Plane stats ===`,
+          `Y   min/mean/max: ${ySt.min} / ${ySt.mean.toFixed(1)} / ${ySt.max}   zeros: ${(yZeros/yuv.y.length*100).toFixed(1)}%`,
+          `Cb  min/mean/max: ${cbSt.min} / ${cbSt.mean.toFixed(1)} / ${cbSt.max}   zeros: ${(cbZeros/yuv.cb.length*100).toFixed(1)}%   (neutral=128)`,
+          `Cr  min/mean/max: ${crSt.min} / ${crSt.mean.toFixed(1)} / ${crSt.max}`,
+          ``,
+          `=== Y 5×5 sample grid ===`,
+          gridY,
+          ``,
+          `=== Slice/MB decode ===`,
+          `mbWidth: ${dbg.mbWidth}  mbHeight: ${dbg.mbHeight}  mbSize: ${dbg.mbSize}`,
+          `slices decoded: ${dbg.dbgSlices}   total MBs: ${dbg.dbgMbTotal}  (expected ${dbg.mbSize})`,
+          `dct_type read: ${dbg.dbgDctTypeRead}   field-DCT (dctType=1): ${dbg.dbgDctTypeOne}`,
+          `field-DCT MBs: ${(dbg.dbgDctOneList || []).join(' ')}`,
+          `motion types: ${JSON.stringify(dbg.dbgMotionType)}   concealMV: ${dbg.concealmentMotionVectors}`,
+          ...(dbg.dbgLog || []),
+          ``,
+          `=== First 32 bytes of ES frame ===`,
+          hexDump,
+        ].join('\n');
+
+        drawYUV(canvas, yuv);
+        lastYuv = yuv;
+        status.textContent = 'Decoded. Canvas rendered below.';
+
+      } catch (err) {
+        status.textContent = 'Error: ' + err.message;
+        console.error(err);
+      }
+    });
+
+    // Reference diff: load an ffmpeg yuv422p raw frame and compare per-macroblock
+    // against our decode to localise where the decoder deviates from ground truth.
+    document.getElementById('refInput').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file || !lastYuv) { console.log('[diff] no ref file or no decoded frame'); return; }
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const W = lastYuv.codedWidth, cW = W >> 1;
+      // 4:2:2 = 2 bytes/pixel; derive the reference height from the file size.
+      const refH = Math.round(buf.length / (W * 2));
+      const ySize = W * refH, cSize = cW * refH;
+      const refY = buf.subarray(0, ySize);
+      const refCb = buf.subarray(ySize, ySize + cSize);
+      const refCr = buf.subarray(ySize + cSize, ySize + 2 * cSize);
+      const H = Math.min(refH, lastYuv.codedHeight);
+      console.log(`[diff] ref ${W}x${refH}, ours ${W}x${lastYuv.codedHeight}, comparing ${H} rows`);
+
+      const mbW = W >> 4, mbH = H >> 4;
+      const worstY = [], worstC = [];
+      let yOver4 = 0, cOver4 = 0;
+      for (let mr = 0; mr < mbH; mr++) {
+        for (let mc = 0; mc < mbW; mc++) {
+          let myd = 0, mcd = 0;
+          for (let r = 0; r < 16; r++) {
+            for (let c = 0; c < 16; c++) {
+              const yi = (mr*16+r)*W + (mc*16+c);
+              const d = Math.abs(lastYuv.y[yi] - refY[yi]); if (d > myd) myd = d;
+            }
+            for (let c = 0; c < 8; c++) {            // 4:2:2 chroma: 8 wide, 16 tall
+              const ci = (mr*16+r)*cW + (mc*8+c);
+              const dcb = Math.abs(lastYuv.cb[ci] - refCb[ci]); if (dcb > mcd) mcd = dcb;
+              const dcr = Math.abs(lastYuv.cr[ci] - refCr[ci]); if (dcr > mcd) mcd = dcr;
+            }
+          }
+          if (myd > 4) { yOver4++; worstY.push({mr, mc, d: myd}); }
+          if (mcd > 4) { cOver4++; worstC.push({mr, mc, d: mcd}); }
+        }
+      }
+      worstY.sort((a,b) => b.d - a.d);
+      worstC.sort((a,b) => b.d - a.d);
+      console.log(`[diff] Y: ${yOver4}/${mbW*mbH} MBs differ >4. worst: ${worstY.slice(0,25).map(w=>`(r${w.mr},c${w.mc}):${w.d}`).join(' ')}`);
+      console.log(`[diff] C: ${cOver4}/${mbW*mbH} MBs differ >4. worst: ${worstC.slice(0,25).map(w=>`(r${w.mr},c${w.mc}):${w.d}`).join(' ')}`);
+
+      // Shift test: total Y abs-diff (sampled) at small offsets. A near-zero result
+      // at a non-(0,0) offset means our decode is spatially shifted vs the reference.
+      function totalDiff(dx, dy) {
+        let s = 0, n = 0;
+        for (let y = 16; y < H - 16; y += 3) {
+          for (let x = 16; x < W - 16; x += 3) {
+            const oy = lastYuv.y[y*W + x];
+            const ry = refY[(y+dy)*W + (x+dx)];
+            s += Math.abs(oy - ry); n++;
+          }
+        }
+        return (s / n).toFixed(2);
+      }
+      const offs = [[0,0],[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[8,0],[0,8]];
+      console.log('[diff] mean |Y| by offset (dx,dy): ' +
+        offs.map(([dx,dy]) => `(${dx},${dy})=${totalDiff(dx,dy)}`).join(' '));
+
+      // Dump the single worst Y MB: our row vs ref row (16 luma samples) at its mid-line.
+      if (worstY.length) {
+        const w = worstY[0];
+        const rowY = w.mr*16 + 8, colX = w.mc*16;
+        const ours = [], theirs = [];
+        for (let c = 0; c < 16; c++) {
+          ours.push(lastYuv.y[rowY*W + colX + c]);
+          theirs.push(refY[rowY*W + colX + c]);
+        }
+        console.log(`[diff] worst Y MB (r${w.mr},c${w.mc}) row ${rowY}:`);
+        console.log('[diff]   ours: ' + ours.join(','));
+        console.log('[diff]   ref:  ' + theirs.join(','));
+      }
+      window.__diffDone = true;
+    });
+
+    function renderMontage(frames) {
+      const m = document.getElementById('montage');
+      const cols = 4, cellW = 320;
+      const cellH = Math.round(cellW * frames[0].codedHeight / frames[0].codedWidth);
+      const rows = Math.ceil(frames.length / cols);
+      m.width = cols * cellW; m.height = rows * cellH;
+      const ctx = m.getContext('2d');
+      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, m.width, m.height);
+      const tmp = document.createElement('canvas');
+      for (let i = 0; i < frames.length; i++) {
+        drawYUV(tmp, frames[i]);
+        const cx = (i % cols) * cellW, cy = Math.floor(i / cols) * cellH;
+        ctx.drawImage(tmp, cx, cy, cellW, cellH);
+        const z = (countZeros(frames[i].y) / frames[i].y.length * 100).toFixed(1);
+        ctx.font = '14px monospace';
+        ctx.fillStyle = '#000'; ctx.fillText(`#${i} ${frames[i].isKeyframe?'I':'P/B'} z${z}%`, cx+5, cy+17);
+        ctx.fillStyle = '#ff0'; ctx.fillText(`#${i} ${frames[i].isKeyframe?'I':'P/B'} z${z}%`, cx+4, cy+16);
+      }
+    }
+
+    function planeStats(arr) {
+      let min = 255, max = 0, sum = 0;
+      for (let i = 0; i < arr.length; i++) {
+        const v = arr[i];
+        if (v < min) min = v;
+        if (v > max) max = v;
+        sum += v;
+      }
+      return { min, max, mean: sum / arr.length };
+    }
+
+    function countZeros(arr) {
+      let n = 0;
+      for (let i = 0; i < arr.length; i++) if (arr[i] === 0) n++;
+      return n;
+    }
+
+    function sampleGrid(arr, width, height, cols, rows) {
+      const lines = [];
+      for (let r = 0; r < rows; r++) {
+        const row = [];
+        for (let c = 0; c < cols; c++) {
+          const px = Math.floor(c * (width-1)  / (cols-1));
+          const py = Math.floor(r * (height-1) / (rows-1));
+          row.push(String(arr[py * width + px]).padStart(3));
+        }
+        lines.push('  ' + row.join('  '));
+      }
+      return lines.join('\n');
+    }
+
+    function drawYUV(canvas, { y, cb, cr, codedWidth, codedHeight, chromaFormat }) {
+      canvas.width  = codedWidth;
+      canvas.height = codedHeight;
+      const ctx = canvas.getContext('2d');
+      const img = ctx.createImageData(codedWidth, codedHeight);
+      const d   = img.data;
+      const uvW = codedWidth >> 1;
+
+      for (let row = 0; row < codedHeight; row++) {
+        const uvRow = chromaFormat === 2 ? row : (row >> 1);
+        const yOff  = row * codedWidth;
+        const uvOff = uvRow * uvW;
+        for (let col = 0; col < codedWidth; col++) {
+          const yv = y[yOff + col];
+          const u  = cb[uvOff + (col >> 1)] - 128;
+          const v  = cr[uvOff + (col >> 1)] - 128;
+          // BT.709 full-range
+          const r = yv + 1.5748 * v;
+          const g = yv - 0.1873 * u - 0.4681 * v;
+          const b = yv + 1.8556 * u;
+          const i = (yOff + col) * 4;
+          d[i]   = r < 0 ? 0 : r > 255 ? 255 : r;
+          d[i+1] = g < 0 ? 0 : g > 255 ? 255 : g;
+          d[i+2] = b < 0 ? 0 : b > 255 ? 255 : b;
+          d[i+3] = 255;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+    }
+  </script>
+</body>
+</html>
