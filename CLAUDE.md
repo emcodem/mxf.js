@@ -8,7 +8,7 @@ MXF demuxer browser plugin. HTTP Range / File API → Web Worker → fMP4 remux 
 npm run dev        # Vite dev server at localhost:5173
 npm test           # vitest unit tests (31 tests)
 npm run test:e2e   # Puppeteer E2E — requires TEST_MXF_FILE
-$env:TEST_MXF_FILE="C:/temptemp/vistek.mxf"; npm run test:e2e
+$env:TEST_MXF_FILE="C:/temp/jsmxf/vistek.mxf"; npm run test:e2e
 npm run typecheck  # tsc --noEmit
 ```
 
@@ -45,7 +45,7 @@ NOTE: `vistek.mxf` turned out to use **only frame-based MC** (no dual-prime, no 
 Chroma was verified clean: `test/e2e/debug.html` reports a per-frame chroma diff (`meanC`), and all frames are rounding-level (0.06–0.14) with the I-frame lowest. The `(r18,c59):130` worst-MB in the single-frame `[diff]` is a max-single-sample metric on a leading open-GOP B-frame (half-pel rounding at the test card's center color edges) — benign, not a decode error.
 
 ### Debug tooling (keep — needed for the motion-comp work)
-- `test/e2e/debug.html` + `test/e2e/yuv-debug.test.ts`: decodes N frames, renders a **montage** (`debug-montage.png`) to spot per-frame desync, and a single frame (`debug-yuv.png`). Auto-loads a reference frame from `C:/temptemp/ref.yuv` (`ffmpeg -i in.mxf -frames:v 1 -pix_fmt yuv422p ref.yuv`) and prints a **per-MB diff** vs ground truth, an offset/shift test, and a worst-MB pixel dump. `Mpeg2Decoder.debugInfo()` exposes slice/MB counts, dct_type stats, extension ids, and a `dbgLog` of slice/MB/coefficient traces. VLC/DC trees self-test at load (Kraft sum, round-trip).
+- `test/e2e/debug.html` + `test/e2e/yuv-debug.test.ts`: decodes N frames, renders a **montage** (`debug-montage.png`) to spot per-frame desync, and a single frame (`debug-yuv.png`). Auto-loads a reference frame from `C:/temp/jsmxf/ref.yuv` (`ffmpeg -i in.mxf -frames:v 1 -pix_fmt yuv422p ref.yuv`) and prints a **per-MB diff** vs ground truth, an offset/shift test, and a worst-MB pixel dump. `Mpeg2Decoder.debugInfo()` exposes slice/MB counts, dct_type stats, extension ids, and a `dbgLog` of slice/MB/coefficient traces. VLC/DC trees self-test at load (Kraft sum, round-trip).
 
 ## MPEG-2 transcode pipeline
 

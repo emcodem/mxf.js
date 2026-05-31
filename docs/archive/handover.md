@@ -124,7 +124,7 @@ The SourceBuffer error in the **user's real Chrome** (reported in the original i
 
 ```
 npm run test:e2e                                      # smoke only (no H.264 support needed)
-TEST_MXF_FILE=C:/temptemp/vistek.mxf npm run test:e2e  # with file, VERBOSE=1 for full log
+TEST_MXF_FILE=C:/temp/jsmxf/vistek.mxf npm run test:e2e  # with file, VERBOSE=1 for full log
 ```
 
 ### Setup

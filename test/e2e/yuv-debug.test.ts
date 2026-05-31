@@ -2,7 +2,7 @@
  * Puppeteer test: loads test/e2e/debug.html, decodes the first MPEG-2 video frame,
  * saves the YUV canvas as a PNG, and asserts the frame looks non-trivial.
  *
- * Run: $env:TEST_MXF_FILE="C:/temptemp/vistek.mxf"; npm run test:e2e
+ * Run: $env:TEST_MXF_FILE="C:/temp/jsmxf/vistek.mxf"; npm run test:e2e
  */
 import { describe, test, expect, beforeAll, afterAll } from 'vitest';
 import puppeteer, { type Browser } from 'puppeteer';
@@ -14,7 +14,7 @@ import fs from 'fs';
 const __dirname   = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '../..');
 const PORT        = 5198;
-const TEST_FILE   = process.env.TEST_MXF_FILE ?? 'C:/temptemp/vistek.mxf';
+const TEST_FILE   = process.env.TEST_MXF_FILE ?? 'C:/temp/jsmxf/vistek.mxf';
 
 let vite:    ViteDevServer;
 let browser: Browser;
@@ -64,7 +64,7 @@ describe('MPEG-2 YUV decoder debug', () => {
     }, { timeout: 60_000 });
 
     // If a reference YUV is present, upload it to trigger the per-MB diff.
-    const REF_FILE = process.env.TEST_REF_YUV ?? 'C:/temptemp/ref.yuv';
+    const REF_FILE = process.env.TEST_REF_YUV ?? 'C:/temp/jsmxf/ref.yuv';
     if (fs.existsSync(REF_FILE)) {
       const refInput = await page.$('#refInput');
       if (refInput) {

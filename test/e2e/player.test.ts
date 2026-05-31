@@ -2,7 +2,7 @@
  * E2E test: load an MXF file in a real Chrome browser via Puppeteer and assert
  * that the player initialises without MSE SourceBuffer errors.
  *
- * Defaults to C:/temptemp/vistek.mxf. Override with TEST_MXF_FILE env var.
+ * Defaults to C:/temp/jsmxf/vistek.mxf. Override with TEST_MXF_FILE env var.
  * Set VERBOSE=1 for full console/log output.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'vitest';
@@ -16,7 +16,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '../..');
 const PORT = 5199;
 
-const TEST_FILE = process.env.TEST_MXF_FILE ?? 'C:/temptemp/vistek.mxf';
+const TEST_FILE = process.env.TEST_MXF_FILE ?? 'C:/temp/jsmxf/vistek.mxf';
 
 let vite: ViteDevServer;
 let browser: Browser;
