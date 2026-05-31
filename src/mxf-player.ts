@@ -1,5 +1,7 @@
 import { EventEmitter, MxfPlayerEvents, ManifestData } from './events.js';
 import { MseController } from './mse/mse-controller.js';
+import { WebAudioController } from './audio/web-audio-controller.js';
+import { ScrubController } from './scrub-controller.js';
 import { WorkerCommand, WorkerEvent } from './worker/worker-messages.js';
 import { CHUNK_DURATION_SECONDS } from './core/constants.js';
 
@@ -49,7 +51,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private worker: Worker | null = null;
   private mseController: MseController | null = null;
   private manifest: ManifestData | null = null;
-  private audioCxt: AudioContext | null = null;
+  private readonly audio: WebAudioController;
   private nextFetchFrame = 0;
   private framesPerChunk = 50;   // fetch ~2 seconds at 25fps
   private fetchPending = false;
@@ -61,54 +63,16 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private editRateDenominator = 1;
   private seqBase = 0;
   private pendingInitSegment: ArrayBuffer | null = null;
-  // Anchor mapping presentation time 0 → AudioContext time, for Web Audio PCM scheduling.
-  private audioStartTime: number | null = null;
-  // Total PCM channels in the file (0 until the first pcmSamples chunk arrives).
-  private audioChannelCount = 0;
-  // Source channels (0-based) currently routed to the stereo output. Default: first pair (1+2).
-  // Selection-order parity maps them to L/R (1st→L, 2nd→R, 3rd→L…); a single channel plays centre.
-  private activeAudioChannels: number[] = [0, 1];
-  // Scheduled (playing/future) PCM chunks, retained with their raw interleaved samples so a channel
-  // re-selection can re-mix and reschedule the not-yet-heard audio immediately (near-instant switch).
-  private scheduledAudio: Array<{
-    source: AudioBufferSourceNode | null;
-    bufStartContextTime: number; // AudioContext time this chunk's first sample should sound
-    duration: number;            // seconds
-    samples: Float32Array;       // interleaved source samples (all channels)
-    channelCount: number;
-    sampleRate: number;
-  }> = [];
   // Seek coalescing: while scrubbing, many 'seeking' events fire. We post a worker seek for
   // each (so the decoder always tracks the latest position) but only fetch once all have been
   // acknowledged, so we don't transcode for stale intermediate positions.
   private pendingSeeks = 0;
   private seekTargetFrame = 0;
-  // True between beginScrub()/endScrub(): every seek uses fast I-frame-only mode and normal
-  // forward fetching is suspended so it can't compete with preview decodes.
-  private scrubbing = false;
-  // Single-flight scrub pump (decoupled from pendingSeeks, which never drains during a fast drag).
-  // latestScrubFrame holds the newest dragged position; while a preview is in flight we just update
-  // it, and fire the next preview at that freshest position when the current one completes.
-  private latestScrubFrame: number | null = null;
-  private scrubSeq = 0;
-  // One scrub "cycle" = decode preview → append → seek playhead onto it → wait for 'seeked' (the
-  // frame actually painted). A cycle is gated end-to-end: we do NOT move the playhead again until
-  // the previous seek COMPLETES, because re-setting currentTime mid-seek aborts it and the frame
-  // never renders (the root cause of "stops playing frames" — currentTime advanced but nothing
-  // painted). scrubCycleActive spans a whole cycle; the newest drag position waits in
-  // latestScrubFrame and starts the next cycle when this one finishes.
-  private scrubCycleActive = false;
-  // True after we move the playhead for a render and are waiting for the frame to actually paint.
-  private scrubRenderPending = false;
-  // Watchdog so a missing paint can't wedge the cycle permanently.
-  private renderSeekWatchdog: ReturnType<typeof setTimeout> | null = null;
-  // True while we set video.currentTime ourselves (to render a preview, or to settle on endScrub),
-  // so the resulting 'seeking' event isn't mistaken for a user drag/seek.
-  private ignoreNextSeeking = false;
-  // Whether playback was running when scrubbing began, so endScrub() can resume it.
-  private scrubWasPlaying = false;
+  // The fast-drag scrub state machine (single-flight preview pump + gated render cycle). See
+  // ScrubController. While it isActive, normal forward fetching is suspended.
+  private readonly scrub: ScrubController;
   // Mode the in-flight seek was issued with — read when its 'seeked' reply arrives, since the
-  // scrubbing flag may have changed (e.g. endScrub) between issuing and the reply.
+  // scrub state may have changed (e.g. endScrub) between issuing and the reply.
   private activeSeekMode: 'keyframe' | 'accurate' = 'accurate';
   // True after a fast keyframe preview: playback is "parked" on a stretched I-frame. The decoder
   // counter has advanced past the keyframe, so forward playback must NOT resume by fetching from
@@ -120,6 +84,12 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     super();
     this.video = video;
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.audio = new WebAudioController(this.video, (info) => this.emit('audio-info', info));
+    this.scrub = new ScrubController(
+      this.video,
+      (targetFrame, seq) => this.worker?.postMessage({ type: 'scrubPreview', targetFrame, seq } as WorkerCommand),
+      (timeSeconds) => this.initiateSeek(timeSeconds, 'accurate'),
+    );
 
     this.video.addEventListener('seeking', () => this.onVideoSeeking());
     this.video.addEventListener('seeked', () => this.onVideoSeeked());
@@ -153,12 +123,12 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     if (this.previewParked && this.manifest) this.initiateSeek(this.video.currentTime, 'accurate');
     this.video.play().catch(() => {});
     // PCM audio plays via Web Audio; resume the context on user gesture.
-    this.audioCxt?.resume().catch(() => {});
+    this.audio.resume();
   }
 
   pause(): void {
     this.video.pause();
-    this.audioCxt?.suspend().catch(() => {});
+    this.audio.suspend();
   }
 
   /** Seek to a time in seconds. The <video> 'seeking' event drives the worker fetch. */
@@ -177,10 +147,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    * preview frame); endScrub() resumes playback if it was running.
    */
   beginScrub(): void {
-    if (this.scrubbing) return;
-    this.scrubbing = true;
-    this.scrubWasPlaying = !this.video.paused;
-    this.video.pause();
+    this.scrub.beginScrub();
   }
 
   /**
@@ -188,10 +155,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    * kicks the single-flight preview pump; does NOT touch video.currentTime (see beginScrub()).
    */
   scrubTo(timeSeconds: number): void {
-    if (!this.manifest || !this.scrubbing) return;
-    const clamped = Math.max(0, Math.min(timeSeconds, this.manifest.duration));
-    this.latestScrubFrame = Math.round(clamped * this.editRateNumerator / this.editRateDenominator);
-    this.pumpScrubPreview();
+    this.scrub.scrubTo(timeSeconds);
   }
 
   /**
@@ -201,30 +165,17 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    * `change` event. If `timeSeconds` is omitted the current playhead is used.
    */
   endScrub(timeSeconds?: number): void {
-    if (!this.scrubbing) return;
-    this.scrubbing = false;
-    this.latestScrubFrame = null; // stop the pump; an in-flight preview closes its cycle via previewDone
-    this.scrubCycleActive = false;
-    this.scrubRenderPending = false;
-    if (this.renderSeekWatchdog !== null) { clearTimeout(this.renderSeekWatchdog); this.renderSeekWatchdog = null; }
-    if (!this.manifest) return;
-    const settle = Math.max(0, Math.min(timeSeconds ?? this.video.currentTime, this.manifest.duration));
-    // Move the playhead to the released position ourselves and suppress the resulting 'seeking'
-    // event so it isn't double-handled — we drive the accurate settle explicitly below.
-    this.ignoreNextSeeking = settle !== this.video.currentTime;
-    this.video.currentTime = settle;
-    this.initiateSeek(settle, 'accurate');
-    if (this.scrubWasPlaying) this.video.play().catch(() => {});
+    this.scrub.endScrub(timeSeconds);
   }
 
   /** Total number of PCM audio channels in the loaded file (0 until audio starts arriving). */
   get audioChannels(): number {
-    return this.audioChannelCount;
+    return this.audio.channels;
   }
 
   /** Source channels (0-based) currently routed to the stereo output. */
   get activeChannels(): number[] {
-    return this.activeAudioChannels.slice();
+    return this.audio.activeChannels;
   }
 
   /**
@@ -234,9 +185,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    * audio buffer-ahead). Passing an empty array mutes audio.
    */
   setAudioChannels(channels: number[]): void {
-    this.activeAudioChannels = [...new Set(channels.filter(c => Number.isInteger(c) && c >= 0))]
-      .sort((a, b) => a - b);
-    this.rescheduleActiveAudio(); // apply to already-buffered audio so the change is near-instant
+    this.audio.setActiveChannels(channels); // applies to already-buffered audio (near-instant)
   }
 
   loadUrl(url: string): void {
@@ -272,11 +221,11 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       this.emit('error', { message: `Worker message error: ${String(e)}`, fatal: true });
     });
     this.mseController = new MseController(this.video, !!this.config.debug);
-    this.mseController.onError = (type, message) => {
-      this.emit('error', { message: `MSE ${type}: ${message}`, fatal: false });
-    };
+    this.mseController.on('error', ({ track, message }) => {
+      this.emit('error', { message: `MSE ${track}: ${message}`, fatal: false });
+    });
     // Back-pressure: the forward buffer is over quota — stop fetching until the playhead advances.
-    this.mseController.onBufferFull = () => { this.bufferFull = true; this.fetchPending = false; };
+    this.mseController.on('bufferfull', () => { this.bufferFull = true; this.fetchPending = false; });
   }
 
   private createWorker(): Worker {
@@ -319,7 +268,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
           channelCount: event.channelCount,
           editUnit: event.editUnit,
         });
-        this.schedulePCMAudio(event.samples, event.sampleRate, event.channelCount, event.editUnit);
+        this.audio.schedule(event.samples, event.sampleRate, event.channelCount, event.editUnit);
         break;
 
       case 'segmentDone':
@@ -361,7 +310,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       }
 
       case 'previewDone':
-        this.onPreviewDone(event.editUnit);
+        this.scrub.onPreviewDone(event.editUnit);
         break;
 
       case 'codecUnsupported':
@@ -380,6 +329,8 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
     this.editRateNumerator = event.editRateNumerator;
     this.editRateDenominator = event.editRateDenominator;
+    this.audio.setEditRate(event.editRateNumerator, event.editRateDenominator);
+    this.scrub.setStream(event.duration, event.editRateNumerator, event.editRateDenominator);
 
     const fps = event.editRateNumerator / event.editRateDenominator;
     this.framesPerChunk = Math.ceil(fps * CHUNK_DURATION_SECONDS);
@@ -405,21 +356,14 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       if (this.config.pcmAudioMode === 'webaudio' || !audioMime) {
         // PCM that MSE can't play is decoded in the worker and scheduled via Web Audio.
         audioMime = null;
-        this.audioCxt = new AudioContext({ sampleRate: sd.sampleRate });
+        this.audio.createContext(sd.sampleRate);
       }
     }
 
     // Announce the audio channel count at load time (the worker decoded the first audio to get the
-    // true count) so the UI can build a channel selector before playback starts. schedulePCMAudio
-    // will re-announce only if the running count somehow differs.
-    if (event.audioChannelCount > 0) {
-      this.audioChannelCount = event.audioChannelCount;
-      this.activeAudioChannels = this.activeAudioChannels.filter(c => c < event.audioChannelCount);
-      if (this.activeAudioChannels.length === 0) {
-        this.activeAudioChannels = event.audioChannelCount >= 2 ? [0, 1] : [0];
-      }
-      this.emit('audio-info', { channelCount: event.audioChannelCount, activeChannels: this.activeAudioChannels.slice() });
-    }
+    // true count) so the UI can build a channel selector before playback starts. The controller
+    // re-announces only if a decoded chunk's running count differs.
+    this.audio.applyChannelCount(event.audioChannelCount);
 
     try {
       await this.mseController!.open(videoMime, audioMime);
@@ -468,7 +412,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private fetchNextChunk(frameCount = this.framesPerChunk): void {
     // Suspend normal forward fetching while scrubbing — previews drive the buffer instead, and a
     // normal fetch from nextFetchFrame would compete with them on the shared decoder/encoder.
-    if (this.scrubbing) return;
+    if (this.scrub.isActive) return;
     // Parked on a fast preview: don't auto-advance. A seek (play()/endScrub()/new seek) un-parks.
     if (this.previewParked) return;
     // SourceBuffer is full and can't be trimmed yet — wait for the playhead to advance.
@@ -509,68 +453,21 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     if (!this.manifest) return;
     // Ignore 'seeking' events we caused ourselves (rendering a preview frame, or the endScrub
     // settle) — otherwise they'd be mistaken for a user drag/seek and re-trigger work.
-    if (this.ignoreNextSeeking) { this.ignoreNextSeeking = false; return; }
+    if (this.scrub.consumeSuppressedSeeking()) return;
     const targetTime = this.video.currentTime;
     this.emit('seeking', { targetTime });
     // During scrubbing the drag is reported via scrubTo() (which does not move the playhead), so a
     // genuine 'seeking' here is unusual — route it to the pump for safety rather than a full seek.
-    if (this.scrubbing) {
-      this.scrubTo(targetTime);
+    if (this.scrub.isActive) {
+      this.scrub.scrubTo(targetTime);
       return;
     }
     this.initiateSeek(targetTime, this.config.seekMode);
   }
 
-  /**
-   * Start a scrub cycle iff one isn't already running. A cycle decodes the latest dragged position,
-   * appends it, seeks the playhead onto it, and waits for the frame to paint ('seeked') before the
-   * next cycle. So the update rate self-paces to decode+render throughput and every cycle actually
-   * renders a frame; very fast drags just skip intermediate positions instead of freezing.
-   */
-  private pumpScrubPreview(): void {
-    if (!this.scrubbing || this.scrubCycleActive || this.latestScrubFrame === null) return;
-    const target = this.latestScrubFrame;
-    this.latestScrubFrame = null;
-    this.scrubCycleActive = true;
-    this.scrubSeq++;
-    const cmd: WorkerCommand = { type: 'scrubPreview', targetFrame: target, seq: this.scrubSeq };
-    this.worker!.postMessage(cmd);
-  }
-
   private onVideoSeeked(): void {
-    // A seek completing is one signal a frame painted — complete the render cycle if waiting.
-    if (this.scrubbing && this.scrubRenderPending) this.completeScrubRender();
-  }
-
-  /**
-   * A scrub preview's segment has been posted (and queued for append). Move the playhead onto that
-   * frame, wait for the seek to complete ('seeked' = paint) before starting the next cycle, then
-   * advance to the freshest dragged position. A watchdog bounds a stalled seek.
-   *
-   * `renderEditUnit` is the keyframe the preview actually represents (from the worker) — we seek
-   * THERE, into the contiguous run we just appended, not to the mid-GOP dragged target (which may
-   * be outside the short preview run). The contiguous run is what lets a paused <video> paint.
-   */
-  private onPreviewDone(renderEditUnit: number): void {
-    if (!this.scrubbing || !this.scrubCycleActive || !this.manifest) {
-      this.scrubCycleActive = false;
-      return;
-    }
-    const t = Math.max(0, Math.min(renderEditUnit * this.editRateDenominator / this.editRateNumerator, this.manifest.duration));
-    if (Math.abs(t - this.video.currentTime) < 1e-3) { this.completeScrubRender(); return; }
-    this.scrubRenderPending = true;
-    this.ignoreNextSeeking = true;
-    this.video.currentTime = t;
-    if (this.renderSeekWatchdog !== null) clearTimeout(this.renderSeekWatchdog);
-    this.renderSeekWatchdog = setTimeout(() => this.completeScrubRender(), 400);
-  }
-
-  /** Seek completed (or watchdog) — advance to the freshest dragged position. */
-  private completeScrubRender(): void {
-    this.scrubRenderPending = false;
-    if (this.renderSeekWatchdog !== null) { clearTimeout(this.renderSeekWatchdog); this.renderSeekWatchdog = null; }
-    this.scrubCycleActive = false;
-    this.pumpScrubPreview();
+    // A seek completing is one signal a frame painted — let the scrub controller complete its cycle.
+    this.scrub.onVideoSeeked();
   }
 
   private initiateSeek(targetTime: number, mode: 'keyframe' | 'accurate'): void {
@@ -590,8 +487,8 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
     // Stop audio scheduled for the old position and drop the anchor so the next chunk re-locks to
     // the new playhead — otherwise audio keeps playing at the pre-seek offset.
-    this.flushScheduledAudio();
-    this.audioStartTime = null;
+    this.audio.flush();
+    this.audio.resetAnchor();
 
     const cmd: WorkerCommand = { type: 'seek', targetFrame: this.seekTargetFrame };
     this.worker!.postMessage(cmd);
@@ -603,7 +500,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // While scrubbing the playhead hops to far-apart preview positions; trimming relative to it
     // would evict the very preview/settle frames we need. Only manage the forward-playback buffer
     // when not scrubbing.
-    if (!this.scrubbing) {
+    if (!this.scrub.isActive) {
       // Evict already-played media so the resident buffer stays bounded, and release the buffer-full
       // back-pressure now the playhead has advanced (trimming may have freed room).
       this.mseController?.trimBackBuffer(currentTime);
@@ -612,7 +509,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     const aheadSeconds = this.mseController?.getBufferedAhead('video', currentTime) ?? 0;
 
     if (aheadSeconds < this.config.startBufferSeconds) {
-      if (this.previewParked && !this.video.paused && !this.scrubbing) {
+      if (this.previewParked && !this.video.paused && !this.scrub.isActive) {
         // Playing forward off a parked preview (e.g. global keyframe mode): re-seek accurately at
         // the current position to get a clean decode, then normal fetching resumes from there.
         this.initiateSeek(currentTime, 'accurate');
@@ -625,119 +522,6 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.emit('timeupdate', { currentTime, duration: this.duration });
   }
 
-  private schedulePCMAudio(
-    samples: Float32Array,
-    sampleRate: number,
-    channelCount: number,
-    editUnit: number
-  ): void {
-    if (!this.audioCxt) return;
-    const cxt = this.audioCxt;
-
-    // Announce the channel count the first time (or if it changes) so a UI can build a selector.
-    // Clamp the active selection to what's available; default to the first stereo pair.
-    if (channelCount !== this.audioChannelCount) {
-      this.audioChannelCount = channelCount;
-      this.activeAudioChannels = this.activeAudioChannels.filter(c => c < channelCount);
-      if (this.activeAudioChannels.length === 0) {
-        this.activeAudioChannels = channelCount >= 2 ? [0, 1] : [0];
-      }
-      this.emit('audio-info', { channelCount, activeChannels: this.activeAudioChannels.slice() });
-    }
-
-    const samplesPerChannel = Math.floor(samples.length / channelCount);
-    const presTime = editUnit * this.editRateDenominator / this.editRateNumerator;
-    const duration = samplesPerChannel / sampleRate;
-
-    // Anchor the audio timeline to the VIDEO playhead, not to a fixed t=0. audioStartTime maps a
-    // presentation time → AudioContext time; re-anchoring on (re)start keeps audio locked to the
-    // frame the <video> is actually showing. The anchor is reset on every seek (see initiateSeek),
-    // so after a seek the next chunk re-anchors at the new playhead instead of playing at the old
-    // offset. `bufStartContextTime` is when this chunk's first sample should sound.
-    if (this.audioStartTime === null) this.audioStartTime = cxt.currentTime - this.video.currentTime;
-
-    const entry = {
-      source: null as AudioBufferSourceNode | null,
-      bufStartContextTime: this.audioStartTime + presTime,
-      duration, samples, channelCount, sampleRate,
-    };
-    if (this.scheduleAudioEntry(entry)) this.scheduledAudio.push(entry);
-  }
-
-  /**
-   * Mix an interleaved PCM buffer's currently-active source channels down to stereo and start it at
-   * the right point on the AudioContext clock. Audio whose time window lies entirely before the
-   * current playhead is dropped (this is what skips the keyframe→target frames an accurate seek
-   * decodes for the picture but which precede the displayed frame); a chunk straddling the playhead
-   * starts partway in. Returns false if nothing was scheduled.
-   *
-   * Selection-order parity routes selected channels to L/R (1st→L, 2nd→R, 3rd→L…); a single channel
-   * plays centre. Mixing explicitly to a stereo buffer is more reliable than relying on Web Audio's
-   * implicit down-mix (undefined for >6/non-standard channel counts).
-   */
-  private scheduleAudioEntry(entry: {
-    source: AudioBufferSourceNode | null; bufStartContextTime: number; duration: number;
-    samples: Float32Array; channelCount: number; sampleRate: number;
-  }): boolean {
-    const cxt = this.audioCxt!;
-    const now = cxt.currentTime;
-    const into = now - entry.bufStartContextTime; // seconds already elapsed into this chunk
-    if (into >= entry.duration - 0.001) return false; // entirely before the playhead — drop it
-
-    const { samples, channelCount, sampleRate } = entry;
-    const samplesPerChannel = Math.floor(samples.length / channelCount);
-    const sel = this.activeAudioChannels.filter(c => c < channelCount);
-    const left: number[] = [], right: number[] = [];
-    sel.forEach((c, i) => (i % 2 === 0 ? left : right).push(c));
-    if (sel.length === 1) { right.length = 0; right.push(sel[0]); } // single channel → centre
-
-    const buffer = cxt.createBuffer(2, samplesPerChannel, sampleRate);
-    const mixInto = (out: Float32Array, chans: number[]): void => {
-      if (chans.length === 0) return;
-      const gain = 1 / chans.length;
-      for (let i = 0; i < samplesPerChannel; i++) {
-        let acc = 0;
-        const base = i * channelCount;
-        for (const c of chans) acc += samples[base + c];
-        out[i] = acc * gain;
-      }
-    };
-    mixInto(buffer.getChannelData(0), left);
-    mixInto(buffer.getChannelData(1), right);
-
-    const source = cxt.createBufferSource();
-    source.buffer = buffer;
-    source.connect(cxt.destination);
-    if (into <= 0) source.start(entry.bufStartContextTime);   // future chunk: start at its time
-    else source.start(now, into);                              // live chunk: start now, offset in
-    source.onended = () => { const i = this.scheduledAudio.indexOf(entry); if (i >= 0) this.scheduledAudio.splice(i, 1); };
-    entry.source = source;
-    return true;
-  }
-
-  /**
-   * Re-mix and reschedule all still-playing / future audio with the current channel selection, so a
-   * change takes effect (near-)immediately instead of only on the next decoded chunk.
-   */
-  private rescheduleActiveAudio(): void {
-    if (!this.audioCxt) return;
-    const keep: typeof this.scheduledAudio = [];
-    for (const e of this.scheduledAudio) {
-      try { if (e.source) { e.source.onended = null; e.source.stop(); } } catch { /* already stopped */ }
-      e.source = null;
-      if (this.scheduleAudioEntry(e)) keep.push(e);
-    }
-    this.scheduledAudio = keep;
-  }
-
-  /** Stop and clear all scheduled audio (e.g. on seek, so nothing keeps playing at the old offset). */
-  private flushScheduledAudio(): void {
-    for (const e of this.scheduledAudio) {
-      try { if (e.source) { e.source.onended = null; e.source.stop(); } } catch { /* already stopped */ }
-    }
-    this.scheduledAudio = [];
-  }
-
   private log(msg: string): void {
     if (this.config.debug) console.log('[jsmxf]', msg);
   }
@@ -747,11 +531,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.worker = null;
     this.mseController?.destroy();
     this.mseController = null;
-    this.flushScheduledAudio();
-    this.audioCxt?.close().catch(() => {});
-    this.audioCxt = null;
-    this.audioStartTime = null;
-    this.audioChannelCount = 0; // re-announced on the next file's first pcmSamples
+    this.audio.destroy();
     this.manifest = null;
     this.nextFetchFrame = 0;
     this.fetchPending = false;
@@ -760,16 +540,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.pendingInitSegment = null;
     this.pendingSeeks = 0;
     this.seekTargetFrame = 0;
-    this.scrubbing = false;
     this.activeSeekMode = 'accurate';
     this.previewParked = false;
-    this.latestScrubFrame = null;
-    this.scrubCycleActive = false;
-    this.scrubRenderPending = false;
-    if (this.renderSeekWatchdog !== null) { clearTimeout(this.renderSeekWatchdog); this.renderSeekWatchdog = null; }
-    this.scrubSeq = 0;
-    this.ignoreNextSeeking = false;
-    this.scrubWasPlaying = false;
+    this.scrub.reset();
   }
 
   destroy(): void {

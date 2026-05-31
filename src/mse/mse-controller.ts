@@ -1,25 +1,31 @@
 import { BACK_BUFFER_SECONDS } from '../core/constants.js';
+import { EventEmitter } from '../events.js';
 
 export type TrackType = 'video' | 'audio';
+
+export interface MseControllerEvents {
+  /** A SourceBuffer error on a track — codec may be unsupported or the data malformed. */
+  error: { track: TrackType; message: string };
+  /** An append failed with QuotaExceededError and no behind-playhead data can be freed, i.e. the
+   *  forward buffer is full — the player should stop fetching until the playhead advances. */
+  bufferfull: void;
+}
 
 type QueueOp =
   | { kind: 'append'; data: ArrayBuffer }
   | { kind: 'remove'; start: number; end: number };
 
-export class MseController {
+export class MseController extends EventEmitter<MseControllerEvents> {
   private readonly video: HTMLVideoElement;
   private mediaSource: MediaSource | null = null;
   private objectURL: string | null = null;
   private sourceBuffers = new Map<TrackType, SourceBuffer>();
   private queues = new Map<TrackType, QueueOp[]>();
   private processing = new Map<TrackType, boolean>();
-  onError: ((type: TrackType, message: string) => void) | null = null;
-  /** Called when an append fails with QuotaExceededError and no behind-playhead data can be freed,
-   *  i.e. the forward buffer is full — the player should stop fetching until the playhead advances. */
-  onBufferFull: (() => void) | null = null;
   private readonly debug: boolean;
 
   constructor(video: HTMLVideoElement, debug = false) {
+    super();
     this.video = video;
     this.debug = debug;
   }
@@ -62,7 +68,7 @@ export class MseController {
     sb.addEventListener('error', () => {
       const msg = `SourceBuffer error on ${type} track — codec may be unsupported or data is malformed`;
       console.error(`[jsmxf] ${msg}`);
-      this.onError?.(type, msg);
+      this.emit('error', { track: type, message: msg });
     });
   }
 
@@ -151,7 +157,7 @@ export class MseController {
       // Forward buffer is full and nothing behind to drop. Hold the append; the player must pause
       // fetching. trimBackBuffer() (as currentTime advances) will free room and drain the held op.
       if (this.debug) console.warn(`[mse] ${type} buffer full — pausing fetch until playhead advances`);
-      this.onBufferFull?.();
+      this.emit('bufferfull', undefined as unknown as void);
     }
   }
 
@@ -265,5 +271,6 @@ export class MseController {
     this.mediaSource = null;
     this.sourceBuffers.clear();
     this.queues.clear();
+    this.removeAllListeners();
   }
 }
