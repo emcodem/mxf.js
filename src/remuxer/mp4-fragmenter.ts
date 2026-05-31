@@ -248,6 +248,12 @@ export class Mp4Fragmenter {
    */
   buildTranscodedVideoSegment(
     chunks: Array<{ data: ArrayBuffer; isKeyframe: boolean; editUnit: bigint }>,
+    opts?: {
+      /** Make the whole segment occupy this many frame periods on the timeline by extending the
+       *  final sample's duration (used for I-frame-only previews so a single keyframe covers its
+       *  whole GOP). Ignored if it would not lengthen the last sample. */
+      totalDurationFrames?: number;
+    },
   ): Uint8Array | null {
     if (!this.config || chunks.length === 0) return null;
     const config = this.config;
@@ -263,6 +269,13 @@ export class Mp4Fragmenter {
         flags: chunk.isKeyframe ? SAMPLE_FLAG_SYNC : SAMPLE_FLAG_NON_SYNC,
         compositionTimeOffset: 0,
       });
+    }
+
+    // Stretch the final sample so the segment spans `totalDurationFrames` frame periods. With a
+    // single-keyframe preview this makes that I-frame the displayed picture for its entire GOP.
+    if (opts?.totalDurationFrames && opts.totalDurationFrames > samples.length) {
+      const extraFrames = opts.totalDurationFrames - samples.length;
+      samples[samples.length - 1].duration += extraFrames * config.frameDurationTicks;
     }
 
     const allData = concatU8(dataParts);

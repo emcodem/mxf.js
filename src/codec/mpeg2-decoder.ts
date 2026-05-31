@@ -39,6 +39,18 @@ class BitBuffer {
   }
 
   write(buffer: Uint8Array): void {
+    // Drop fully-consumed bytes before appending. Without this the buffer only ever grows:
+    // feeding a decoder a long continuous stream (e.g. transcoding a whole programme through
+    // one persistent decoder) would balloon memory and, past ~256 MB, overflow the 32-bit
+    // shifts used for the bit index (`byteLength << 3`, `i << 3`). Compacting on each write
+    // keeps the working set to roughly the unparsed tail. `index & 7` preserves the sub-byte
+    // read position within the first retained byte.
+    const consumedBytes = this.index >> 3;
+    if (consumedBytes > 0) {
+      this.bytes.copyWithin(0, consumedBytes, this.byteLength);
+      this.byteLength -= consumedBytes;
+      this.index &= 7;
+    }
     const avail = this.bytes.length - this.byteLength;
     if (buffer.length > avail) {
       this.resize(Math.max(this.bytes.length * 2, this.byteLength + buffer.length));
@@ -677,10 +689,17 @@ export class Mpeg2Decoder {
     };
   }
 
-  /** Reset decoder state — call before feeding data from a new seek position. */
+  /**
+   * Reset for a new seek position: drop the buffered bitstream and the held anchor, but KEEP
+   * the parsed sequence header (dimensions, frame rate, quant matrices, chroma format). Those
+   * are constant for the whole clip, so retaining them lets the decoder restart at any keyframe
+   * even when that keyframe's access unit does not re-transmit a sequence header — otherwise
+   * decode() would bail (hasSequenceHeader=false) and the seeked frame would never appear.
+   * Stale reference frames are harmless: the keyframe is intra-coded, and following P/B frames
+   * reference freshly-decoded anchors.
+   */
   reset(): void {
     this.bits.reset();
-    this.hasSequenceHeader = false;
     this.hasHeldAnchor = false;
     this.pictureType = 0;
   }

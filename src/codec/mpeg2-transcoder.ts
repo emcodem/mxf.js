@@ -4,6 +4,8 @@ export interface TranscodedChunk {
   data: ArrayBuffer;   // H.264 AVCC format
   isKeyframe: boolean;
   editUnit: bigint;
+  /** Presentation timestamp (microseconds) as supplied to encode(); the encoder preserves it. */
+  timestampUs: number;
 }
 
 export interface SpsppsPair {
@@ -84,6 +86,7 @@ export class Mpeg2Transcoder {
           data: avccBuf,
           isKeyframe: chunk.type === 'key',
           editUnit: 0n,
+          timestampUs: chunk.timestamp,
         });
       },
       error: (e) => { this.encoderError = e; },
@@ -98,6 +101,18 @@ export class Mpeg2Transcoder {
       bitrate: targetBitrate,
       framerate: frameRate,
       bitrateMode: 'variable',
+      // 'realtime' tells the encoder not to reorder frames, i.e. emit no B-frames.
+      // Output then arrives in display order, so decode order == presentation order
+      // and each chunk's timestamp is monotonic. This lets the worker derive a sample's
+      // edit unit directly from its timestamp and use compositionTimeOffset 0, instead
+      // of having to reconstruct a PTS/DTS reorder map (which the previous positional
+      // editUnit assignment got wrong, scrambling playback after the first GOP).
+      latencyMode: 'realtime',
+      // Prefer the GPU H.264 encoder — typically several times faster than the software
+      // (openh264) encoder Chrome falls back to under 'no-preference'. It's a hint: if no
+      // hardware encoder is available Chrome silently uses software. We sanitize SPS[2]
+      // regardless, so either encoder's parameter sets are accepted by MSE.
+      hardwareAcceleration: 'prefer-hardware',
       avc: { format: 'avc' },           // AVCC output; SPS/PPS via decoderConfig.description
     });
   }

@@ -164,3 +164,70 @@ export function resolveFrameOffset(
   }
   return null;
 }
+
+/**
+ * Number of frames in the GOP that begins at `keyframeEditUnit` — i.e. the distance forward
+ * to the next keyframe (or to the end of the index if none follows). Returns at least 1.
+ *
+ * For CBE / all-intra files (editUnitByteCount > 0) every frame is a random-access point, so
+ * the GOP length is 1. For VBE Long-GOP it scans the index entry flags forward for the next
+ * keyframe. Used to stretch an I-frame-only preview sample so it covers its whole GOP on the
+ * MSE timeline; a wrong value only degrades how far a scrub preview holds, it cannot corrupt
+ * playback (the accurate settle re-decodes exact frames over the same range).
+ */
+export function gopLengthFromKeyframe(
+  segments: IndexTableSegment[],
+  keyframeEditUnit: bigint
+): number {
+  for (const seg of segments) {
+    const segEnd = seg.indexStartPosition + seg.indexDuration;
+    if (keyframeEditUnit < seg.indexStartPosition || keyframeEditUnit >= segEnd) continue;
+
+    if (seg.editUnitByteCount > 0) return 1; // CBE: every edit unit is a keyframe
+
+    const startIdx = Number(keyframeEditUnit - seg.indexStartPosition);
+    for (let i = startIdx + 1; i < seg.entries.length; i++) {
+      const isKeyframe = (seg.entries[i].flags & 0x80) === 0;
+      if (isKeyframe) return i - startIdx;
+    }
+    // No further keyframe in this segment: hold to the end of the segment.
+    return Math.max(1, seg.entries.length - startIdx);
+  }
+  return 1;
+}
+
+/**
+ * Resolve the byte offset of an edit unit WITHOUT snapping back to its nearest keyframe.
+ * resolveFrameOffset() deliberately returns the preceding keyframe's offset (so a seek lands
+ * on a random-access point), but a decoder that is fed a continuous stream needs the exact,
+ * consecutive bytes of each requested frame — snapping would re-feed already-decoded pictures.
+ */
+export function resolveExactFrameOffset(
+  segments: IndexTableSegment[],
+  editUnit: bigint,
+  essenceContainerStart: bigint
+): ResolvedOffset | null {
+  for (const seg of segments) {
+    const segEnd = seg.indexStartPosition + seg.indexDuration;
+    if (editUnit < seg.indexStartPosition || editUnit >= segEnd) continue;
+
+    if (seg.editUnitByteCount > 0) {
+      const offset = BigInt(seg.editUnitByteCount) * (editUnit - seg.indexStartPosition);
+      return {
+        byteOffset: essenceContainerStart + offset,
+        isKeyframe: true,
+        nearestKeyframeEditUnit: editUnit,
+      };
+    }
+
+    const entryIdx = Number(editUnit - seg.indexStartPosition);
+    if (entryIdx >= seg.entries.length) return null;
+    const entry = seg.entries[entryIdx];
+    return {
+      byteOffset: essenceContainerStart + entry.streamOffset,
+      isKeyframe: (entry.flags & 0x80) === 0,
+      nearestKeyframeEditUnit: editUnit,
+    };
+  }
+  return null;
+}

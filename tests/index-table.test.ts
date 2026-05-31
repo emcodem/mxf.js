@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { parseIndexTableSegment, resolveFrameOffset } from '../src/parser/index-table.js';
+import { parseIndexTableSegment, resolveFrameOffset, gopLengthFromKeyframe } from '../src/parser/index-table.js';
+import type { IndexTableSegment } from '../src/parser/index-table.js';
 import { readKLV } from '../src/core/klv.js';
 import { UL_INDEX_TABLE_SEGMENT_V1 } from '../src/core/ul.js';
 import { encodeBerLength } from '../src/core/ber.js';
@@ -120,5 +121,57 @@ describe('resolveFrameOffset', () => {
     const klv = readKLV(buffer, 0);
     const seg = parseIndexTableSegment(buffer, klv);
     expect(resolveFrameOffset([seg], 99n, 0n)).toBeNull();
+  });
+});
+
+describe('gopLengthFromKeyframe', () => {
+  // Build a minimal VBE segment directly. Keyframes carry flags bit 7 = 0 (the same convention
+  // resolveFrameOffset uses); other frames set bit 7. `kf` is the keyframe pattern per frame.
+  function vbeSegment(kf: boolean[], start = 0n): IndexTableSegment {
+    return {
+      indexStartPosition: start,
+      indexDuration: BigInt(kf.length),
+      editUnitByteCount: 0,
+      indexSID: 1,
+      bodySID: 1,
+      sliceCount: 0,
+      posTableCount: 0,
+      entries: kf.map((isKf, i) => ({
+        temporalOffset: 0,
+        keyFrameOffset: 0,
+        flags: isKf ? 0x00 : 0x80,
+        streamOffset: BigInt(i * 1000),
+      })),
+    };
+  }
+
+  it('returns the distance to the next keyframe (GOP length)', () => {
+    // I P P I P  → GOP at frame 0 is 3 frames long, GOP at frame 3 runs to the end (2 frames).
+    const seg = vbeSegment([true, false, false, true, false]);
+    expect(gopLengthFromKeyframe([seg], 0n)).toBe(3);
+    expect(gopLengthFromKeyframe([seg], 3n)).toBe(2);
+  });
+
+  it('holds to the end of the segment when no further keyframe follows', () => {
+    const seg = vbeSegment([true, false, false, false]);
+    expect(gopLengthFromKeyframe([seg], 0n)).toBe(4);
+  });
+
+  it('returns 1 for constant-byte-extent (all-intra) segments', () => {
+    const seg: IndexTableSegment = {
+      indexStartPosition: 0n, indexDuration: 100n, editUnitByteCount: 150000,
+      indexSID: 1, bodySID: 1, sliceCount: 0, posTableCount: 0, entries: [],
+    };
+    expect(gopLengthFromKeyframe([seg], 10n)).toBe(1);
+  });
+
+  it('returns 1 when the edit unit is not covered by any segment', () => {
+    const seg = vbeSegment([true, false]);
+    expect(gopLengthFromKeyframe([seg], 99n)).toBe(1);
+  });
+
+  it('honours a non-zero indexStartPosition', () => {
+    const seg = vbeSegment([true, false, true], 100n);
+    expect(gopLengthFromKeyframe([seg], 100n)).toBe(2);
   });
 });

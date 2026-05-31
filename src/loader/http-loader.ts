@@ -1,9 +1,10 @@
-import type { ILoader } from './loader.js';
+import { ILoader, logRead } from './loader.js';
 
 export class HttpLoader implements ILoader {
   private readonly url: string;
   readonly fileSize: Promise<number>;
   private abortController: AbortController | null = null;
+  private readStats = { count: 0, total: 0 };
 
   constructor(url: string) {
     this.url = url;
@@ -18,8 +19,9 @@ export class HttpLoader implements ILoader {
     return parseInt(len, 10);
   }
 
-  async fetchRange(start: number, end: number): Promise<ArrayBuffer> {
+  async fetchRange(start: number, end: number, reason = ''): Promise<ArrayBuffer> {
     this.abortController = new AbortController();
+    const t0 = performance.now();
     const res = await fetch(this.url, {
       headers: { Range: `bytes=${start}-${end}` },
       signal: this.abortController.signal,
@@ -27,7 +29,9 @@ export class HttpLoader implements ILoader {
     if (!res.ok && res.status !== 206) {
       throw new Error(`fetchRange ${start}-${end} failed: ${res.status}`);
     }
-    return res.arrayBuffer();
+    const buf = await res.arrayBuffer();
+    logRead('HTTP', start, end, reason, performance.now() - t0, this.readStats);
+    return buf;
   }
 
   destroy(): void {

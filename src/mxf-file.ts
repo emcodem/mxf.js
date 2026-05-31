@@ -49,7 +49,7 @@ export class MxfFile {
 
     // ── Step 1: Read just enough to parse the Header Partition Pack ──────────
     // The PP is typically ~120 bytes; 512 is always enough even with run-in.
-    const ppBuf = await this.loader.fetchRange(0, Math.min(PP_READ_SIZE, fileSize) - 1);
+    const ppBuf = await this.loader.fetchRange(0, Math.min(PP_READ_SIZE, fileSize) - 1, 'bootstrap: header partition pack');
     const ppStartOffset = KLVIterator.skipRunIn(ppBuf);
     const headerPartition = parsePartitionPack(ppBuf, 0);
     const ppKlv = readKLV(ppBuf, ppStartOffset);
@@ -62,12 +62,12 @@ export class MxfFile {
     let metaBuf: ArrayBuffer;
 
     if (metaSize > 0) {
-      metaBuf = await this.loader.fetchRange(afterPP, afterPP + metaSize - 1);
+      metaBuf = await this.loader.fetchRange(afterPP, afterPP + metaSize - 1, 'bootstrap: header metadata');
     } else {
       // Non-conformant file: headerByteCount not set. Heuristic: read 2 MB and stop
       // at the next partition pack boundary inside findHeaderMetadata.
       const fallbackSize = Math.min(2 * 1024 * 1024, fileSize - afterPP);
-      metaBuf = await this.loader.fetchRange(afterPP, afterPP + fallbackSize - 1);
+      metaBuf = await this.loader.fetchRange(afterPP, afterPP + fallbackSize - 1, 'bootstrap: header metadata (fallback)');
     }
 
     const { primer, metadataStart, metadataLength } = this.findHeaderMetadata(metaBuf);
@@ -79,7 +79,7 @@ export class MxfFile {
 
     // ── Step 3: Read tail to find Random Index Pack ───────────────────────────
     const tailStart = Math.max(0, fileSize - TAIL_READ_SIZE);
-    const tailBuf = await this.loader.fetchRange(tailStart, fileSize - 1);
+    const tailBuf = await this.loader.fetchRange(tailStart, fileSize - 1, 'bootstrap: tail / random index pack');
     const ripEntries = this.parseRandomIndexPack(tailBuf);
 
     // ── Step 4: Extract Index Table Segments ─────────────────────────────────
@@ -194,7 +194,7 @@ export class MxfFile {
     // Skip over the body partition pack, then over any trailing fill/padding to reach
     // the first essence KLV.  StreamOffset values in the index are measured from that KLV.
     try {
-      const ppBuf = await this.loader.fetchRange(Number(bodyPPStart), Math.min(Number(bodyPPStart) + 256, fileSize) - 1);
+      const ppBuf = await this.loader.fetchRange(Number(bodyPPStart), Math.min(Number(bodyPPStart) + 256, fileSize) - 1, 'bootstrap: body partition pack');
       const ppView = new DataView(ppBuf);
       const { length: ppValueLen, bytesRead: berBytes } = decodeBerLength(ppView, 16);
       const afterBodyPP = Number(bodyPPStart) + 16 + berBytes + ppValueLen;
@@ -205,7 +205,7 @@ export class MxfFile {
       const SCAN_WINDOW = Math.min(65536, fileSize - afterBodyPP);
       if (SCAN_WINDOW <= 0) return BigInt(afterBodyPP);
 
-      const scanBuf = await this.loader.fetchRange(afterBodyPP, afterBodyPP + SCAN_WINDOW - 1);
+      const scanBuf = await this.loader.fetchRange(afterBodyPP, afterBodyPP + SCAN_WINDOW - 1, 'bootstrap: essence-start scan');
       const scanU8 = new Uint8Array(scanBuf);
       const scanDV = new DataView(scanBuf);
       let pos = 0;
@@ -255,7 +255,7 @@ export class MxfFile {
     const footerStart = Number(footerOffset);
     if (footerStart <= 0 || footerStart >= fileSize) return [];
 
-    const footerBuf = await this.loader.fetchRange(footerStart, fileSize - 1);
+    const footerBuf = await this.loader.fetchRange(footerStart, fileSize - 1, 'bootstrap: footer index table');
 
     // Skip the footer partition pack, then scan for index table segments
     const fpKlvOffset = KLVIterator.skipRunIn(footerBuf);

@@ -4,7 +4,7 @@ import { ILoader } from '../loader/loader.js';
 import { MxfFile } from '../mxf-file.js';
 import { EssenceExtractor } from '../essence/essence-extractor.js';
 import { Mp4Fragmenter } from '../remuxer/mp4-fragmenter.js';
-import { resolveFrameOffset } from '../parser/index-table.js';
+import { resolveFrameOffset, gopLengthFromKeyframe } from '../parser/index-table.js';
 import { isAnnexB, annexBtoAVCC, extractSPSPPS, buildAVCDecoderConfigRecord } from '../essence/avc-tools.js';
 import { Mpeg2Decoder } from '../codec/mpeg2-decoder.js';
 import { Mpeg2Transcoder } from '../codec/mpeg2-transcoder.js';
@@ -27,7 +27,27 @@ let storedEditRateDenominator = 1;
 // MPEG-2 transcode state (null when source is not MPEG-2)
 let mpeg2Decoder: Mpeg2Decoder | null = null;
 let mpeg2Transcoder: Mpeg2Transcoder | null = null;
+// Display-order frame counter; the decoder emits in display order and each emitted frame
+// gets timestamp = counter * frameDurUs. Reset to the target frame on seek.
 let mpeg2EditUnitCounter = 0n;
+// Microseconds per frame, set once the edit rate is known in handleInit.
+let mpeg2FrameDurUs = 40_000;
+// Set true at the start of each segment fetch (and after a seek) so the first emitted
+// frame of a segment is encoded as a keyframe — every MSE media segment must begin with
+// a random-access point.
+let mpeg2FirstFrameOfSegment = true;
+
+// fetchSegment must never run concurrently with itself. The decoder and encoder are shared
+// persistent objects; if two fetches interleave (which happens readily while dragging the
+// seek bar, since each drag posts a fetch), their synchronous decode loops are fine but at
+// the `await encoder.flush()` point one yields and the other's decode loop runs into the
+// SAME encoder queue — so a single flush() drains everyone's frames (the "50 in → 200 out"
+// symptom). These serialize fetches and let a seek discard superseded work.
+let fetchBusy = false;
+const fetchQueue: Array<{ startFrame: number; frameCount: number; seqBase: number; stretchToFrames: number; gen: number }> = [];
+// Bumped on every seek. A fetch whose captured generation no longer matches has been
+// superseded and drops its work instead of appending stale frames.
+let seekGeneration = 0;
 
 function post(event: WorkerEvent, transferables: Transferable[] = []): void {
   self.postMessage(event, transferables);
@@ -43,6 +63,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
   mpeg2Decoder = null;
   mpeg2Transcoder = null;
   mpeg2EditUnitCounter = 0n;
+  mpeg2FirstFrameOfSegment = true;
 
   try {
     const bootstrap = await mxfFile.open();
@@ -102,6 +123,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       };
 
       const fps = storedEditRateNumerator / storedEditRateDenominator;
+      mpeg2FrameDurUs = Math.round(storedEditRateDenominator * 1_000_000 / storedEditRateNumerator);
       const transcoder = new Mpeg2Transcoder(
         yuv.codedWidth, yuv.codedHeight,
         yuv.width, yuv.height,
@@ -126,9 +148,20 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       // keeps the container consistent with the SPS.
       fragmenter!.enableTranscodeMode(spspps.sps, spspps.pps, yuv.codedWidth, yuv.codedHeight);
 
-      // Persistent decoder for subsequent segments (preserves reference frames)
-      mpeg2Decoder = new Mpeg2Decoder(() => { /* filled in handleFetchSegment */ });
       mpeg2Transcoder = transcoder;
+
+      // One persistent decoder for the whole stream. Feeding consecutive segments into the
+      // same decoder keeps its reference frames alive across segment boundaries, which is
+      // essential for Long-GOP MPEG-2: a fresh decoder starting mid-GOP never sees a
+      // sequence header and emits nothing, stalling playback after the first segment.
+      // The decoder emits in display order; each emitted frame is timestamped from the
+      // monotonic counter and re-encoded to H.264.
+      mpeg2Decoder = new Mpeg2Decoder((decoded) => {
+        const tsUs = Number(mpeg2EditUnitCounter) * mpeg2FrameDurUs;
+        transcoder.encodeFrame(decoded, tsUs, mpeg2FirstFrameOfSegment);
+        mpeg2FirstFrameOfSegment = false;
+        mpeg2EditUnitCounter++;
+      });
 
       // PCM audio uses Web Audio — skip audio track from moov entirely.
       // Chrome MSE rejects init segments containing unknown codec sample entries
@@ -231,7 +264,26 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
   }
 }
 
-async function handleFetchSegment(startFrame: number, frameCount: number, seqBase: number): Promise<void> {
+/** Queue a fetch and ensure exactly one runs at a time. */
+function scheduleFetch(startFrame: number, frameCount: number, seqBase: number, stretchToFrames = 0): void {
+  fetchQueue.push({ startFrame, frameCount, seqBase, stretchToFrames, gen: seekGeneration });
+  void drainFetchQueue();
+}
+
+async function drainFetchQueue(): Promise<void> {
+  if (fetchBusy) return;
+  fetchBusy = true;
+  try {
+    while (fetchQueue.length > 0) {
+      const job = fetchQueue.shift()!;
+      await handleFetchSegment(job.startFrame, job.frameCount, job.seqBase, job.gen, job.stretchToFrames);
+    }
+  } finally {
+    fetchBusy = false;
+  }
+}
+
+async function handleFetchSegment(startFrame: number, frameCount: number, seqBase: number, gen: number, stretchToFrames = 0): Promise<void> {
   if (!loader || !mxfFile || !fragmenter) { postError('Not initialized'); return; }
   const bootstrap = mxfFile.getBootstrap();
   if (!bootstrap) { postError('Bootstrap not complete'); return; }
@@ -239,9 +291,18 @@ async function handleFetchSegment(startFrame: number, frameCount: number, seqBas
   try {
     const extractor = new EssenceExtractor(loader, bootstrap);
     const frames: EssenceFrame[] = [];
-    for await (const frame of extractor.fetchFrames(BigInt(startFrame), frameCount)) {
+    // The MPEG-2 transcode path feeds one persistent decoder, so it needs the exact
+    // consecutive frame range (no keyframe snapping) to avoid re-feeding pictures it has
+    // already decoded. Seeks land on a keyframe anyway, where exact and snapped agree.
+    const exact = !!(mpeg2Transcoder && mpeg2Decoder);
+    for await (const frame of extractor.fetchFrames(BigInt(startFrame), frameCount, exact)) {
       frames.push(frame);
     }
+
+    // A seek arrived while we were reading bytes: the decoder has been reset to a new
+    // position, so feeding it these (now stale) frames would corrupt the post-seek decode.
+    // Drop this fetch entirely; the player issues a fresh fetch after the 'seeked' event.
+    if (gen !== seekGeneration) return;
 
     const videoFrames = frames.filter(f => f.trackType === 'video');
     const audioFrames = frames.filter(f => f.trackType === 'audio');
@@ -252,34 +313,61 @@ async function handleFetchSegment(startFrame: number, frameCount: number, seqBas
     if (mpeg2Transcoder && mpeg2Decoder) {
       if (videoFrames.length > 0) {
         const transcoder = mpeg2Transcoder;
-        const frameDurUs = Math.round(storedEditRateDenominator * 1_000_000 / storedEditRateNumerator);
-        let isFirstFrameOfSegment = true;
+        const decoder = mpeg2Decoder;
 
-        // Fresh decoder per segment — avoids stale reference frames across seek boundaries.
-        const segDecoder = new Mpeg2Decoder((yuv) => {
-          const tsUs = Number(mpeg2EditUnitCounter) * frameDurUs;
-          const forceKey = isFirstFrameOfSegment;
-          isFirstFrameOfSegment = false;
-          transcoder.encodeFrame(yuv, tsUs, forceKey);
-          mpeg2EditUnitCounter++;
-        });
+        // Force the first emitted frame of this segment to be a keyframe so the resulting
+        // MSE media segment starts with a random-access point.
+        mpeg2FirstFrameOfSegment = true;
 
+        const decodeT0 = performance.now();
+        const counterBefore = mpeg2EditUnitCounter;
         for (const vf of videoFrames) {
-          segDecoder.write(vf.data);
-          while (segDecoder.decode()) { /* onFrame fires inside decode() */ }
+          decoder.write(vf.data);
+          while (decoder.decode()) { /* onFrame fires inside decode(), driving the encoder */ }
         }
-        segDecoder.flush(); // emit any held anchor
+        // Time spent here = MPEG-2 decode + YUV 4:2:2→4:2:0 prep + queuing encode() calls
+        // (the encoder runs asynchronously; its work is drained by flush() below).
+        const decodeMs = performance.now() - decodeT0;
+        const flushT0 = performance.now();
 
+        // The decoder holds the final I/P anchor back for display reordering. During normal
+        // playback we keep it held so the next segment can emit it in order. Only when we
+        // have reached end-of-stream (fewer frames returned than requested) do we flush it.
+        // A keyframe-only preview (stretchToFrames > 0) must also flush: it feeds a single
+        // intra picture that would otherwise stay held and never be emitted.
+        const keyframePreview = stretchToFrames > 0;
+        const atEndOfStream = videoFrames.length < frameCount;
+        if (atEndOfStream || keyframePreview) decoder.flush();
+
+        // flush() always runs (even if superseded) so the shared encoder queue is drained
+        // clean for the next fetch — but a seek during the flush await means these frames are
+        // stale, so we drop them without appending.
         const chunks = await transcoder.flush();
-        // Assign edit units to chunks
-        const firstEu = BigInt(startFrame);
-        for (let i = 0; i < chunks.length; i++) {
-          chunks[i].editUnit = firstEu + BigInt(i);
+        if (gen !== seekGeneration) return;
+        // Derive each chunk's edit unit from its (monotonic, display-order) timestamp rather
+        // than its position in the output array. With reordering disabled the chunks already
+        // arrive in order, but this keeps the timeline correct even across the held-anchor
+        // boundary where the number of frames emitted per segment differs from the input count.
+        for (const chunk of chunks) {
+          chunk.editUnit = BigInt(Math.round(chunk.timestampUs / mpeg2FrameDurUs));
         }
 
-        const seg = fragmenter.buildTranscodedVideoSegment(chunks);
+        const encodeMs = performance.now() - flushT0;
+        const framesEmitted = Number(mpeg2EditUnitCounter - counterBefore);
+        const n = Math.max(1, framesEmitted);
+        console.log(
+          `[transcode] startFrame=${startFrame}: ${videoFrames.length} ES frames → ${framesEmitted} frames | ` +
+          `decode+prep ${decodeMs.toFixed(0)} ms (${(decodeMs / n).toFixed(1)} ms/f) | ` +
+          `encode drain ${encodeMs.toFixed(0)} ms (${(encodeMs / n).toFixed(1)} ms/f) | ` +
+          `total ${(decodeMs + encodeMs).toFixed(0)} ms`,
+        );
+
+        const seg = fragmenter.buildTranscodedVideoSegment(
+          chunks,
+          keyframePreview ? { totalDurationFrames: stretchToFrames } : undefined,
+        );
         if (seg) {
-          console.log('[worker] videoSegment', seg.length, 'bytes,', chunks.length, 'chunks, first chunk keyframe:', chunks[0]?.isKeyframe, 'first chunk size:', chunks[0]?.data.byteLength);
+          console.log('[worker] videoSegment', seg.length, 'bytes,', chunks.length, 'chunks, first chunk keyframe:', chunks[0]?.isKeyframe, 'first chunk editUnit:', chunks[0] ? Number(chunks[0].editUnit) : -1, keyframePreview ? `(keyframe preview, stretch ${stretchToFrames}f)` : '');
           post(
             { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: startFrame },
             [seg.buffer],
@@ -358,16 +446,28 @@ function handleSeek(targetFrame: number): void {
   const bootstrap = mxfFile.getBootstrap();
   if (!bootstrap) { postError('Bootstrap not complete'); return; }
 
-  // Reset MPEG-2 transcode counters on seek
-  mpeg2EditUnitCounter = BigInt(targetFrame);
-
-  const resolved = resolveFrameOffset(
+  // Reset MPEG-2 transcode state on seek. Dropping the decoder's reference frames is
+  // required: the post-seek fetch starts at a keyframe (GOP boundary, carrying a fresh
+  // sequence header), and stale references from the old position would corrupt the
+  // first decoded pictures. The counter is reset so timestamps resume from the seek point.
+  const resolvedSeek = resolveFrameOffset(
     bootstrap.indexSegments,
     BigInt(targetFrame),
     bootstrap.essenceStart,
   );
-  const nearestKeyframe = resolved ? Number(resolved.nearestKeyframeEditUnit) : targetFrame;
-  post({ type: 'seeked', nearestKeyframeEditUnit: nearestKeyframe });
+  // Supersede any queued/in-flight fetch from the old position: bump the generation and
+  // drop pending fetches. An in-flight fetch checks this generation after its awaits and
+  // discards its (now stale) frames rather than appending them.
+  seekGeneration++;
+  fetchQueue.length = 0;
+
+  const nearestKeyframe = resolvedSeek ? Number(resolvedSeek.nearestKeyframeEditUnit) : targetFrame;
+  mpeg2EditUnitCounter = BigInt(nearestKeyframe);
+  mpeg2FirstFrameOfSegment = true;
+  mpeg2Decoder?.reset();
+
+  const gopFrameCount = gopLengthFromKeyframe(bootstrap.indexSegments, BigInt(nearestKeyframe));
+  post({ type: 'seeked', nearestKeyframeEditUnit: nearestKeyframe, gopFrameCount });
 }
 
 self.addEventListener('message', (event: MessageEvent<WorkerCommand>) => {
@@ -382,7 +482,7 @@ self.addEventListener('message', (event: MessageEvent<WorkerCommand>) => {
       handleInit(new FileLoader(cmd.file), cmd.debug).catch(e => postError(String(e), true));
       break;
     case 'fetchSegment':
-      handleFetchSegment(cmd.startFrame, cmd.frameCount, cmd.seqBase).catch(e => postError(String(e)));
+      scheduleFetch(cmd.startFrame, cmd.frameCount, cmd.seqBase, cmd.stretchToFrames ?? 0);
       break;
     case 'seek':
       handleSeek(cmd.targetFrame);

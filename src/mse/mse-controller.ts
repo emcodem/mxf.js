@@ -118,6 +118,25 @@ export class MseController {
     return sb.buffered.end(sb.buffered.length - 1);
   }
 
+  /**
+   * Seconds of media buffered contiguously starting at `time`. Unlike getBufferedEnd this is
+   * range-aware: if `time` is not inside any buffered range it returns 0 (data is needed here
+   * now), and if it is, it returns the end of *that* range — not the end of some unrelated
+   * later range. This is what fetch scheduling must use, otherwise a seek into an unbuffered
+   * gap while a far-ahead range exists looks "buffered" and never fetches → permanent stall.
+   */
+  getBufferedAhead(type: TrackType, time: number): number {
+    const sb = this.sourceBuffers.get(type);
+    if (!sb || sb.buffered.length === 0) return 0;
+    for (let i = 0; i < sb.buffered.length; i++) {
+      const start = sb.buffered.start(i);
+      const end = sb.buffered.end(i);
+      // Small tolerance so a seek that lands a hair before a range start still counts.
+      if (time >= start - 0.25 && time < end) return end - time;
+    }
+    return 0;
+  }
+
   /** Returns the current buffered start time in seconds for a given track */
   getBufferedStart(type: TrackType): number {
     const sb = this.sourceBuffers.get(type);

@@ -77,6 +77,16 @@ Chroma was verified clean: `demo/debug.html` reports a per-frame chroma diff (`m
 - `mpeg2EditUnitCounter` (module-level `bigint`) starts at 0, increments per emitted frame, resets to `BigInt(targetFrame)` on seek.
 - On seek: `handleSeek` sets the counter; the next `handleFetchSegment` picks it up.
 
+## Seek modes — accurate vs keyframe (I-frame-only)
+
+Everything still flows through the single `<video>`/MSE element; there is **no** second canvas surface.
+
+- **`MxfConfig.seekMode: 'accurate' | 'keyframe'`** (default `'accurate'`). Accurate decodes preceding-keyframe→exact-target. Keyframe decodes *only* the GOP-head I-frame.
+- **`player.beginScrub()` / `endScrub()`**: while scrubbing, every seek is forced to keyframe mode regardless of config; `endScrub()` issues one accurate seek to settle on the exact frame and resume forward playback. The demo wires the slider's live `input` → `seek()` (fast preview, thumb stays put) and `change` (release) → `endScrub()`.
+- **I-frame preview mechanics**: the player posts `fetchSegment{ frameCount:1, stretchToFrames:N }`; the worker flushes the single held I-frame and `buildTranscodedVideoSegment` extends that one sample's `duration` to span the whole GOP (`N` = `gopLengthFromKeyframe`, max'd with target−keyframe so the dragged position is always covered). So the `<video>` shows the I-frame for any `currentTime` in its GOP — thumb never snaps, no seek feedback loop.
+- **`previewParked`**: after a keyframe preview the decoder counter has advanced past the keyframe, so forward playback must NOT resume by fetching from there (would double-emit the I-frame with a shifted timestamp). `previewParked` blocks `fetchNextChunk`; `play()`/`endScrub()`/any new seek clears it and re-establishes a clean accurate decode. This only matters for global `seekMode:'keyframe'`; the scrub flow always settles via `endScrub()`.
+- **GOP length / keyframe flag**: `gopLengthFromKeyframe` scans index flags with the *same* `(flags & 0x80) === 0` keyframe test as `resolveFrameOffset` — still the unverified convention (see memory). A wrong value only changes how far a preview holds; it cannot corrupt playback (the accurate settle re-decodes exact frames over the same range).
+
 ## E2E test setup
 
 Puppeteer uses the system Chrome at `C:\Program Files\Google\Chrome\Application\chrome.exe` (headless).

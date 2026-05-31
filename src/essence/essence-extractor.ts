@@ -2,7 +2,7 @@ import { ILoader } from '../loader/loader.js';
 import { MxfBootstrap } from '../mxf-file.js';
 import { KLVIterator } from '../core/klv.js';
 import { isPictureEssence, isSoundEssence, isPartitionPack, isFill } from '../core/ul.js';
-import { resolveFrameOffset, IndexTableSegment } from '../parser/index-table.js';
+import { resolveFrameOffset, resolveExactFrameOffset, IndexTableSegment } from '../parser/index-table.js';
 
 export interface EssenceFrame {
   trackType: 'video' | 'audio';
@@ -27,12 +27,18 @@ export class EssenceExtractor {
   /**
    * Fetch frames starting from startFrame, up to frameCount frames.
    * Yields EssenceFrames for video and audio interleaved as they appear in the file.
+   *
+   * When `exact` is true the byte range begins at startFrame's own offset rather than
+   * snapping back to the nearest keyframe. This is required when feeding a continuous
+   * stream into one persistent decoder (the MPEG-2 transcode path): snapping would re-read
+   * pictures the decoder has already consumed. The default (false) preserves seek-to-keyframe
+   * behaviour for callers that need a random-access point.
    */
-  async *fetchFrames(startFrame: bigint, frameCount: number): AsyncGenerator<EssenceFrame> {
+  async *fetchFrames(startFrame: bigint, frameCount: number, exact = false): AsyncGenerator<EssenceFrame> {
     const { indexSegments, essenceStart } = this.bootstrap;
 
     if (indexSegments.length > 0) {
-      yield* this.fetchFramesViaIndex(startFrame, frameCount, indexSegments, essenceStart);
+      yield* this.fetchFramesViaIndex(startFrame, frameCount, indexSegments, essenceStart, exact);
     } else {
       yield* this.fetchFramesSequential(startFrame, frameCount, essenceStart);
     }
@@ -42,15 +48,17 @@ export class EssenceExtractor {
     startFrame: bigint,
     frameCount: number,
     segments: IndexTableSegment[],
-    essenceContainerStart: bigint
+    essenceContainerStart: bigint,
+    exact: boolean
   ): AsyncGenerator<EssenceFrame> {
-    const resolved = resolveFrameOffset(segments, startFrame, essenceContainerStart);
+    const resolve = exact ? resolveExactFrameOffset : resolveFrameOffset;
+    const resolved = resolve(segments, startFrame, essenceContainerStart);
     if (!resolved) return;
 
     // Determine end byte: resolve the frame AFTER the last wanted frame.
     // Add a 512 KB pad to capture trailing audio KLVs for the last video frame.
     const endFrame = startFrame + BigInt(frameCount);
-    const resolvedEnd = resolveFrameOffset(segments, endFrame, essenceContainerStart);
+    const resolvedEnd = resolve(segments, endFrame, essenceContainerStart);
     const fileSize = await this.loader.fileSize;
 
     const rangeStart = Number(resolved.byteOffset);
@@ -60,7 +68,10 @@ export class EssenceExtractor {
 
     if (rangeStart > rangeEnd) return;
 
-    const chunkBuf = await this.loader.fetchRange(rangeStart, rangeEnd);
+    const kf = resolved.nearestKeyframeEditUnit;
+    const reason = `essence frames ${startFrame}–${endFrame - 1n}` +
+      (exact ? ' (exact)' : ` (snapped to keyframe ${kf})`);
+    const chunkBuf = await this.loader.fetchRange(rangeStart, rangeEnd, reason);
     yield* this.parseEssenceChunk(chunkBuf, startFrame, frameCount);
   }
 
@@ -75,7 +86,7 @@ export class EssenceExtractor {
     // Files that need sequential access beyond 1.5 GB require an index table.
     const MAX_SEQUENTIAL_BYTES = 1.5 * 1024 * 1024 * 1024;
     const rangeEnd = Math.min(fileSize - 1, rangeStart + MAX_SEQUENTIAL_BYTES - 1);
-    const chunkBuf = await this.loader.fetchRange(rangeStart, rangeEnd);
+    const chunkBuf = await this.loader.fetchRange(rangeStart, rangeEnd, `essence sequential from frame ${startFrame} (no index)`);
     yield* this.parseEssenceChunk(chunkBuf, startFrame, frameCount);
   }
 

@@ -89,7 +89,7 @@
       timeCur.textContent = '0:00';
       timeDur.textContent = '0:00';
 
-      player = new MxfPlayer(video, { debug: true, startBufferSeconds: 5, maxBufferSeconds: 30 });
+      player = new MxfPlayer(video, { debug: true, startBufferSeconds: 5, maxBufferSeconds: 30, seekMode: 'accurate' });
 
       player.on('manifest', (data) => {
         const fps = (data.editRateNumerator / data.editRateDenominator).toFixed(2);
@@ -130,14 +130,30 @@
       syncPlayBtn();
     });
 
-    seekBar.addEventListener('mousedown', () => { seeking = true; });
-    seekBar.addEventListener('touchstart', () => { seeking = true; });
+    function startScrub() {
+      if (!player || seeking) return;
+      seeking = true;
+      player.beginScrub();   // subsequent seeks become fast I-frame-only previews
+    }
+    seekBar.addEventListener('mousedown', startScrub);
+    seekBar.addEventListener('touchstart', startScrub);
+    // Live drag: fast keyframe preview at each position (thumb stays under the finger).
     seekBar.addEventListener('input', () => {
-      timeCur.textContent = fmt(parseFloat(seekBar.value));
+      const t = parseFloat(seekBar.value);
+      timeCur.textContent = fmt(t);
+      if (player && seeking) player.seek(t);
     });
+    // Release: settle on the exact frame and resume normal playback.
     seekBar.addEventListener('change', () => {
-      seeking = false;
-      // seeking not yet implemented for WebCodecs path
+      if (!player) return;
+      const t = parseFloat(seekBar.value);
+      if (seeking) {
+        seeking = false;
+        player.seek(t);      // make sure currentTime is at the final position
+        player.endScrub();   // accurate settle + resume
+      } else {
+        player.seek(t);      // keyboard/click seek without a drag
+      }
     });
 
     document.getElementById('fileInput').addEventListener('change', (e) => {
