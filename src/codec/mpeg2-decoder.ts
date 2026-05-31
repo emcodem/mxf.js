@@ -1,6 +1,12 @@
 // Ported from C:\dev\jsmpeg2_git\jsmpeg (buffer.js + mpeg2.js).
 // Stripped to decode-only: no canvas, no TS demuxer, no player infrastructure.
 
+// The VLC/DC tree builders below self-test at module load. Set globalThis.JSMXF_DEBUG_VLC = true
+// to print the per-table self-test summaries (off by default so importing the library is silent).
+// A self-test *failure* still logs unconditionally — it means a table is corrupt, which is a real
+// defect, not noise.
+const DEBUG_VLC = (globalThis as { JSMXF_DEBUG_VLC?: boolean }).JSMXF_DEBUG_VLC === true;
+
 export interface YUVFrame {
   y: Uint8ClampedArray;
   cb: Uint8ClampedArray;  // U plane
@@ -291,7 +297,7 @@ function _buildSimpleTree(codes: number[], bits: number[], label: string): Int32
     do { state = flat[state + (+b[c])]; c++; } while (state >= 0 && flat[state] !== 0 && c < b.length + 4);
     if (flat[state + 2] !== i || c !== bits[i]) { fails++; console.error(`[DC ${label}] entry ${i} code=${b} got=${flat[state+2]} bits=${c}/${bits[i]}`); }
   }
-  console.log(`[DC ${label}] self-test: ${codes.length - fails}/${codes.length} OK`);
+  if (DEBUG_VLC) console.log(`[DC ${label}] self-test: ${codes.length - fails}/${codes.length} OK`);
   return flat;
 }
 
@@ -447,7 +453,7 @@ function _buildVlcTree(
       if (nodes[i][1] === -1) deadChildren++;
     }
   }
-  console.log(`[VLC] tree self-test: ${vlcs.length - fails}/${vlcs.length} codes OK, ${nodes.length} nodes, kraft=${kraft.toFixed(6)} (want 1.0), deadChildren=${deadChildren}`);
+  if (DEBUG_VLC) console.log(`[VLC] tree self-test: ${vlcs.length - fails}/${vlcs.length} codes OK, ${nodes.length} nodes, kraft=${kraft.toFixed(6)} (want 1.0), deadChildren=${deadChildren}`);
   return flat;
 }
 
@@ -485,7 +491,7 @@ function _buildLeafTree(entries: ReadonlyArray<{ code: number; bits: number; val
     if (flat[state + 2] !== value || c !== bits) fails++;
     kraft += Math.pow(2, -bits);
   }
-  console.log(`[${label}] tree self-test: ${entries.length - fails}/${entries.length} codes OK, kraft=${kraft.toFixed(6)} (want 1.0)`);
+  if (DEBUG_VLC) console.log(`[${label}] tree self-test: ${entries.length - fails}/${entries.length} codes OK, kraft=${kraft.toFixed(6)} (want 1.0)`);
   return flat;
 }
 

@@ -4,11 +4,7 @@ import { KLVIterator } from '../core/klv.js';
 import { decodeBerLength } from '../core/ber.js';
 import { isPictureEssence, isSoundEssence, isAes3Sound, isPartitionPack, isFill } from '../core/ul.js';
 import { resolveFrameOffset, resolveExactFrameOffset, IndexTableSegment } from '../parser/index-table.js';
-
-/** Base read window for the no-index sequential reader. */
-const SEQ_WINDOW = 4 * 1024 * 1024;
-/** Hard cap on a single edit unit / accumulated buffer — guards against a corrupt BER length. */
-const SEQ_HARD_CAP = 64 * 1024 * 1024;
+import { SEQ_WINDOW, SEQ_HARD_CAP } from '../core/constants.js';
 
 export interface EssenceFrame {
   trackType: 'video' | 'audio';

@@ -1,8 +1,8 @@
-import { DataViewReader } from '../core/data-view-reader.js';
+import { DataViewReader, u32BE, i32BE, i64BE } from '../core/data-view-reader.js';
 import { KLVIterator } from '../core/klv.js';
 import { PrimerPack } from './primer.js';
-import { PictureDescriptor, SoundDescriptor, VideoCodec } from './descriptor.js';
-import { ulMatchClass } from '../core/ul.js';
+import { PictureDescriptor, SoundDescriptor, identifyVideoCodec } from './descriptor.js';
+import { ulMatchClass, formatUL, bytesEqual } from '../core/ul.js';
 
 export type EssenceKind = 'picture' | 'sound' | 'data' | 'timecode';
 
@@ -69,24 +69,6 @@ const DD_PICTURE  = cls(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x01,0x01,0x03,0x02,0
 const DD_SOUND    = cls(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x01,0x01,0x03,0x02,0x02,0x02,0x00,0x00,0x00);
 const DD_TIMECODE = cls(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x01,0x01,0x03,0x02,0x01,0x01,0x00,0x00,0x00);
 
-// ── AVC / MPEG-2 picture essence coding UL prefixes ──────────────────────────
-const _AVC_PREFIX  = new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x0a,0x04,0x01,0x02,0x02,0x01,0x32]);
-const _AVC_PREFIX2 = new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x09,0x04,0x01,0x02,0x02,0x01,0x32]);
-const _MP2_PREFIX  = new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x03,0x04,0x01,0x02,0x02,0x01]);
-const _MP2B_PREFIX = new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x01,0x04,0x01,0x02,0x02,0x01]);
-
-function _startsWith(u: Uint8Array, p: Uint8Array): boolean {
-  if (u.length < p.length) return false;
-  for (let i = 0; i < p.length; i++) if (u[i] !== p[i]) return false;
-  return true;
-}
-
-function _identifyCodec(ul: Uint8Array): VideoCodec {
-  if (_startsWith(ul, _AVC_PREFIX) || _startsWith(ul, _AVC_PREFIX2)) return 'h264';
-  if (_startsWith(ul, _MP2_PREFIX) || _startsWith(ul, _MP2B_PREFIX)) return 'mpeg2';
-  return 'unknown';
-}
-
 // ── Raw set representation ────────────────────────────────────────────────────
 interface RawSet {
   classUL: Uint8Array;
@@ -105,31 +87,6 @@ function parseLocalTagItems(buffer: ArrayBuffer, valueOffset: number, valueLengt
     items.set(tag, r.readBytesCopy(len));
   }
   return items;
-}
-
-function readI64(data: Uint8Array): bigint {
-  const v = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const hi = v.getInt32(0, false);
-  const lo = v.getUint32(4, false);
-  return (BigInt(hi) << 32n) | BigInt(lo);
-}
-
-function readU32(data: Uint8Array): number {
-  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, false);
-}
-
-function readI32(data: Uint8Array): number {
-  return new DataView(data.buffer, data.byteOffset, data.byteLength).getInt32(0, false);
-}
-
-function hexUL(u: Uint8Array): string {
-  return Array.from(u).map(b => b.toString(16).padStart(2, '0')).join(' ');
-}
-
-function arraysEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
 }
 
 // ── Public parser ─────────────────────────────────────────────────────────────
@@ -172,7 +129,7 @@ export function parseHeaderMetadata(
     console.log(`[jsmxf] parseHeaderMetadata: ${sets.length} sets found`);
     const seen = new Set<string>();
     for (const s of sets) {
-      const h = hexUL(s.classUL);
+      const h = formatUL(s.classUL);
       if (!seen.has(h)) { seen.add(h); console.log(`  class UL: ${h}`); }
     }
   }
@@ -226,7 +183,7 @@ export function parseHeaderMetadata(
     if (ulMatchClass(set.classUL, CLASS_SEQUENCE)) {
       const dur = set.localItems.get(TAG_DURATION);
       if (dur && dur.length >= 8) {
-        const d = readI64(dur);
+        const d = i64BE(dur);
         if (d > maxDuration) maxDuration = d;
       }
     }
@@ -256,17 +213,17 @@ function parsePictureDescriptorFromSet(set: RawSet): PictureDescriptor {
   // Also check for SampleRate stored as rational
   let frameRateNum = 25, frameRateDen = 1;
   if (sr && sr.length >= 8) {
-    frameRateNum = readI32(sr);
+    frameRateNum = i32BE(sr);
     frameRateDen = new DataView(sr.buffer, sr.byteOffset, sr.byteLength).getInt32(4, false);
     if (frameRateDen <= 0) frameRateDen = 1;
   }
 
   return {
-    codec: pec && pec.length >= 16 ? _identifyCodec(pec) : 'unknown',
-    width:        width && width.length >= 4 ? readU32(width) : 0,
-    height:       height && height.length >= 4 ? readU32(height) : 0,
-    storedWidth:  width && width.length >= 4 ? readU32(width) : 0,
-    storedHeight: height && height.length >= 4 ? readU32(height) : 0,
+    codec: pec && pec.length >= 16 ? identifyVideoCodec(pec) : 'unknown',
+    width:        width && width.length >= 4 ? u32BE(width) : 0,
+    height:       height && height.length >= 4 ? u32BE(height) : 0,
+    storedWidth:  width && width.length >= 4 ? u32BE(width) : 0,
+    storedHeight: height && height.length >= 4 ? u32BE(height) : 0,
     frameRateNumerator:   frameRateNum,
     frameRateDenominator: frameRateDen,
     spsNALU: null,
@@ -283,10 +240,10 @@ function parseSoundDescriptorFromSet(set: RawSet): SoundDescriptor {
   // ~144000 "block align" for 24-bit mono, which collapsed PCM decode to zero samples = silence.)
   const ba  = set.localItems.get(0x3d0a);
 
-  const sampleRate    = asr && asr.length >= 4 ? readI32(asr) : 48000;
-  const channelCount  = cc  && cc.length  >= 4 ? readU32(cc)  : 2;
-  const bitDepth      = qb  && qb.length  >= 4 ? readU32(qb)  : 16;
-  const blockAlign    = ba  && ba.length  >= 4 ? readU32(ba)  : channelCount * (bitDepth / 8);
+  const sampleRate    = asr && asr.length >= 4 ? i32BE(asr) : 48000;
+  const channelCount  = cc  && cc.length  >= 4 ? u32BE(cc)  : 2;
+  const bitDepth      = qb  && qb.length  >= 4 ? u32BE(qb)  : 16;
+  const blockAlign    = ba  && ba.length  >= 4 ? u32BE(ba)  : channelCount * (bitDepth / 8);
 
   return { codec: 'pcm', sampleRate, channelCount, bitDepth, blockAlign };
 }
@@ -310,12 +267,12 @@ function parsePackage(classUL: Uint8Array, set: RawSet, allSets: RawSet[], debug
       const refUID = tracksData.slice(8 + i * itemLen, 8 + (i + 1) * itemLen);
       const trackSet = allSets.find(s =>
         (ulMatchClass(s.classUL, CLASS_TRACK) || ulMatchClass(s.classUL, CLASS_STATIC_TRACK)) &&
-        arraysEqual(s.instanceUID, refUID.slice(0, 16))
+        bytesEqual(s.instanceUID, refUID.slice(0, 16))
       );
       if (trackSet) {
         tracks.push(parseTrack(trackSet, allSets));
       } else if (debug) {
-        console.log(`  track ref not found: ${hexUL(refUID.slice(0, 16))}`);
+        console.log(`  track ref not found: ${formatUL(refUID.slice(0, 16))}`);
       }
     }
   }
@@ -335,7 +292,7 @@ function parseTrack(set: RawSet, allSets: RawSet[]): MxfTrack {
   if (seqRef && seqRef.length >= 16) {
     const seqSet = allSets.find(s =>
       ulMatchClass(s.classUL, CLASS_SEQUENCE) &&
-      arraysEqual(s.instanceUID, seqRef.slice(0, 16))
+      bytesEqual(s.instanceUID, seqRef.slice(0, 16))
     );
     if (seqSet) {
       const dd = seqSet.localItems.get(TAG_DATA_DEFINITION);
@@ -351,17 +308,17 @@ function parseTrack(set: RawSet, allSets: RawSet[]): MxfTrack {
 
   let erNum = 25, erDen = 1;
   if (editRate && editRate.length >= 8) {
-    erNum = readI32(editRate);
+    erNum = i32BE(editRate);
     erDen = new DataView(editRate.buffer, editRate.byteOffset, editRate.byteLength).getInt32(4, false);
     if (erDen <= 0) erDen = 1;
   }
 
   return {
-    trackId:   trackId  && trackId.length  >= 4 ? readU32(trackId) : 0,
-    trackNumber: trackNum && trackNum.length >= 4 ? readU32(trackNum) : 0,
+    trackId:   trackId  && trackId.length  >= 4 ? u32BE(trackId) : 0,
+    trackNumber: trackNum && trackNum.length >= 4 ? u32BE(trackNum) : 0,
     essence,
     editRateNumerator: erNum,
     editRateDenominator: erDen,
-    origin: origin && origin.length >= 8 ? readI64(origin) : 0n,
+    origin: origin && origin.length >= 8 ? i64BE(origin) : 0n,
   };
 }

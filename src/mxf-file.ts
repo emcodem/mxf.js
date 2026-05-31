@@ -13,10 +13,13 @@ import {
   UL_RANDOM_INDEX_PACK,
   isFill,
 } from './core/ul.js';
-
-/** Initial read just to get the Partition Pack (small, fixed size ~120 bytes) */
-const PP_READ_SIZE = 512;
-const TAIL_READ_SIZE = 65536;
+import {
+  PARTITION_PACK_READ_SIZE,
+  TAIL_READ_SIZE,
+  HEADER_METADATA_MIN_READ,
+  HEADER_METADATA_FALLBACK_READ,
+  ESSENCE_SCAN_WINDOW,
+} from './core/constants.js';
 
 export interface RandomIndexPackEntry {
   bodySID: number;
@@ -62,7 +65,7 @@ export class MxfFile {
 
     // ── Step 1: Read just enough to parse the Header Partition Pack ──────────
     // The PP is typically ~120 bytes; 512 is always enough even with run-in.
-    const ppBuf = await this.loader.fetchRange(0, Math.min(PP_READ_SIZE, fileSize) - 1, 'bootstrap: header partition pack');
+    const ppBuf = await this.loader.fetchRange(0, Math.min(PARTITION_PACK_READ_SIZE, fileSize) - 1, 'bootstrap: header partition pack');
     const ppStartOffset = KLVIterator.skipRunIn(ppBuf);
     const headerPartition = parsePartitionPack(ppBuf, 0);
     const ppKlv = readKLV(ppBuf, ppStartOffset);
@@ -76,7 +79,7 @@ export class MxfFile {
     // metadata sets — the sound descriptor in particular can sit past it, which previously made the
     // file look like it had no audio. Read at least a comfortable window (or 2 MB when the count is
     // absent) and rely on parseHeaderMetadata stopping at the first non-metadata KLV.
-    const wantBytes = metaSize > 0 ? Math.max(metaSize, 1024 * 1024) : 2 * 1024 * 1024;
+    const wantBytes = metaSize > 0 ? Math.max(metaSize, HEADER_METADATA_MIN_READ) : HEADER_METADATA_FALLBACK_READ;
     const readSize = Math.min(wantBytes, fileSize - afterPP);
     const metaBuf = await this.loader.fetchRange(afterPP, afterPP + readSize - 1, 'bootstrap: header metadata');
 
@@ -273,7 +276,7 @@ export class MxfFile {
     // Essence usually begins within a few hundred KB of its partition pack (metadata + index +
     // fill). A 1 MB window covers every real-world case; if it doesn't, fall back to the partition
     // offset itself (sequential reading still works, just without the index).
-    const window = Math.min(1024 * 1024, fileSize - partOffset);
+    const window = Math.min(ESSENCE_SCAN_WINDOW, fileSize - partOffset);
     if (window <= 0) return { essenceStart: BigInt(partOffset), bodySID: 0, indexSegments };
 
     try {

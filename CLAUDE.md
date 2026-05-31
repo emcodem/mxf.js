@@ -42,10 +42,10 @@ The P/B desync that blocked this for several sessions was **not** missing motion
 
 NOTE: `vistek.mxf` turned out to use **only frame-based MC** (no dual-prime, no field MC) — earlier "dual-prime present" reports were phantoms of the desync. The decoder's `predictField`/dual-prime paths exist but are **unverified on real field-MC/dual-prime content**; a stream that actually uses them may still need work.
 
-Chroma was verified clean: `demo/debug.html` reports a per-frame chroma diff (`meanC`), and all frames are rounding-level (0.06–0.14) with the I-frame lowest. The `(r18,c59):130` worst-MB in the single-frame `[diff]` is a max-single-sample metric on a leading open-GOP B-frame (half-pel rounding at the test card's center color edges) — benign, not a decode error.
+Chroma was verified clean: `test/e2e/debug.html` reports a per-frame chroma diff (`meanC`), and all frames are rounding-level (0.06–0.14) with the I-frame lowest. The `(r18,c59):130` worst-MB in the single-frame `[diff]` is a max-single-sample metric on a leading open-GOP B-frame (half-pel rounding at the test card's center color edges) — benign, not a decode error.
 
 ### Debug tooling (keep — needed for the motion-comp work)
-- `demo/debug.html` + `test/e2e/yuv-debug.test.ts`: decodes N frames, renders a **montage** (`debug-montage.png`) to spot per-frame desync, and a single frame (`debug-yuv.png`). Auto-loads a reference frame from `C:/temptemp/ref.yuv` (`ffmpeg -i in.mxf -frames:v 1 -pix_fmt yuv422p ref.yuv`) and prints a **per-MB diff** vs ground truth, an offset/shift test, and a worst-MB pixel dump. `Mpeg2Decoder.debugInfo()` exposes slice/MB counts, dct_type stats, extension ids, and a `dbgLog` of slice/MB/coefficient traces. VLC/DC trees self-test at load (Kraft sum, round-trip).
+- `test/e2e/debug.html` + `test/e2e/yuv-debug.test.ts`: decodes N frames, renders a **montage** (`debug-montage.png`) to spot per-frame desync, and a single frame (`debug-yuv.png`). Auto-loads a reference frame from `C:/temptemp/ref.yuv` (`ffmpeg -i in.mxf -frames:v 1 -pix_fmt yuv422p ref.yuv`) and prints a **per-MB diff** vs ground truth, an offset/shift test, and a worst-MB pixel dump. `Mpeg2Decoder.debugInfo()` exposes slice/MB counts, dct_type stats, extension ids, and a `dbgLog` of slice/MB/coefficient traces. VLC/DC trees self-test at load (Kraft sum, round-trip).
 
 ## MPEG-2 transcode pipeline
 

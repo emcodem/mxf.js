@@ -8,6 +8,14 @@ export function ulEquals(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+/** Alias of {@link ulEquals} for generic byte-array comparisons (instance UIDs, etc.). */
+export const bytesEqual = ulEquals;
+
+/** Format a UL / byte array as space-separated lowercase hex (e.g. "06 0e 2b 34 …"). */
+export function formatUL(u: Uint8Array): string {
+  return Array.from(u).map(b => b.toString(16).padStart(2, '0')).join(' ');
+}
+
 /**
  * Match two class ULs as metadata Set keys, ignoring the "item designator/version"
  * bytes at positions 5–7 which vary between encoders and spec versions.

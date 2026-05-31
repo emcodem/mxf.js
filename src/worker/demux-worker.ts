@@ -11,6 +11,11 @@ import { Mpeg2Transcoder } from '../codec/mpeg2-transcoder.js';
 import { decodePcmElements } from '../audio/pcm.js';
 import { WorkerCommand, WorkerEvent } from './worker-messages.js';
 import type { EssenceFrame } from '../essence/essence-extractor.js';
+import {
+  SCRUB_CACHE_MAX,
+  SCRUB_PREVIEW_LOOKAHEAD_SECONDS,
+  SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES,
+} from '../core/constants.js';
 
 interface WorkerScope {
   postMessage(message: unknown, transfer?: Transferable[]): void;
@@ -24,6 +29,9 @@ let fragmenter: Mp4Fragmenter | null = null;
 let videoMode: 'webcodecs' | 'mse' = 'mse';
 let storedEditRateNumerator = 25;
 let storedEditRateDenominator = 1;
+// Gates the worker's informational/trace logs (set from cmd.debug in handleInit). Error logs
+// are unconditional; these are progress/diagnostic lines that would otherwise spam every consumer.
+let workerDebug = false;
 
 // MPEG-2 transcode state (null when source is not MPEG-2)
 let mpeg2Decoder: Mpeg2Decoder | null = null;
@@ -60,7 +68,6 @@ let seekGeneration = 0;
 // the picture lags further behind the thumb the faster you drag. With the cache, each GOP head is
 // decoded at most once per session and revisits are instant. Cleared on each new file load.
 const scrubSegmentCache = new Map<number, Uint8Array>();
-const SCRUB_CACHE_MAX = 128;
 
 function post(event: WorkerEvent, transferables: Transferable[] = []): void {
   self.postMessage(event, transferables);
@@ -72,6 +79,7 @@ function postError(message: string, fatal = false): void {
 
 async function handleInit(loader_: ILoader, debug = false): Promise<void> {
   loader = loader_;
+  workerDebug = debug;
   mxfFile = new MxfFile(loader, debug);
   mpeg2Decoder = null;
   mpeg2Transcoder = null;
@@ -200,7 +208,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       // Chrome MSE rejects init segments containing unknown codec sample entries
       // (sowt) even when the SourceBuffer is video-only.
       const initSeg = fragmenter!.buildInitSegment(false);
-      console.log('[worker] MPEG-2 transcode init OK',
+      if (workerDebug) console.log('[worker] MPEG-2 transcode init OK',
         'sps:', Array.from(spspps.sps).map(b=>b.toString(16).padStart(2,'0')).join(' '),
         'pps:', Array.from(spspps.pps).map(b=>b.toString(16).padStart(2,'0')).join(' '),
         `dims: ${yuv.width}x${yuv.height} (coded: ${yuv.codedWidth}x${yuv.codedHeight})`,
@@ -417,7 +425,7 @@ async function handleFetchSegment(
         const encodeMs = performance.now() - flushT0;
         const framesEmitted = Number(mpeg2EditUnitCounter - counterBefore);
         const n = Math.max(1, framesEmitted);
-        console.log(
+        if (workerDebug) console.log(
           `[transcode] startFrame=${startFrame}: ${videoFrames.length} ES frames → ${framesEmitted} frames | ` +
           `decode+prep ${decodeMs.toFixed(0)} ms (${(decodeMs / n).toFixed(1)} ms/f) | ` +
           `encode drain ${encodeMs.toFixed(0)} ms (${(encodeMs / n).toFixed(1)} ms/f) | ` +
@@ -438,7 +446,7 @@ async function handleFetchSegment(
           scrubSegmentCache.set(startFrame, seg.slice());
         }
         if (seg) {
-          console.log('[worker] videoSegment', seg.length, 'bytes,', chunks.length, 'chunks, first chunk keyframe:', chunks[0]?.isKeyframe, 'first chunk editUnit:', chunks[0] ? Number(chunks[0].editUnit) : -1, keyframePreview ? `(keyframe preview, stretch ${stretchToFrames}f)` : '');
+          if (workerDebug) console.log('[worker] videoSegment', seg.length, 'bytes,', chunks.length, 'chunks, first chunk keyframe:', chunks[0]?.isKeyframe, 'first chunk editUnit:', chunks[0] ? Number(chunks[0].editUnit) : -1, keyframePreview ? `(keyframe preview, stretch ${stretchToFrames}f)` : '');
           post(
             { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: startFrame },
             [seg.buffer],
@@ -594,7 +602,7 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
   // decoding a whole GOP+lookahead per preview saturated the worker so nothing painted. Constant per
   // keyframe (independent of target) so it stays cacheable.
   const fps = storedEditRateNumerator / storedEditRateDenominator;
-  const runFrames = 1 + Math.max(4, Math.round(fps * 0.4));
+  const runFrames = 1 + Math.max(SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES, Math.round(fps * SCRUB_PREVIEW_LOOKAHEAD_SECONDS));
 
   // Seek part (mirrors handleSeek): supersede in-flight work and reset the decoder to the keyframe.
   seekGeneration++;

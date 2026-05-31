@@ -1,6 +1,7 @@
 import { EventEmitter, MxfPlayerEvents, ManifestData } from './events.js';
 import { MseController } from './mse/mse-controller.js';
 import { WorkerCommand, WorkerEvent } from './worker/worker-messages.js';
+import { CHUNK_DURATION_SECONDS } from './core/constants.js';
 
 export interface MxfConfig {
   /** Seconds of content to buffer before starting playback */
@@ -270,7 +271,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.worker.addEventListener('messageerror', (e) => {
       this.emit('error', { message: `Worker message error: ${String(e)}`, fatal: true });
     });
-    this.mseController = new MseController(this.video);
+    this.mseController = new MseController(this.video, !!this.config.debug);
     this.mseController.onError = (type, message) => {
       this.emit('error', { message: `MSE ${type}: ${message}`, fatal: false });
     };
@@ -381,7 +382,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.editRateDenominator = event.editRateDenominator;
 
     const fps = event.editRateNumerator / event.editRateDenominator;
-    this.framesPerChunk = Math.ceil(fps * 2); // ~2 second chunks
+    this.framesPerChunk = Math.ceil(fps * CHUNK_DURATION_SECONDS);
 
     this.manifest = {
       duration: event.duration,

@@ -1,11 +1,10 @@
+import { BACK_BUFFER_SECONDS } from '../core/constants.js';
+
 export type TrackType = 'video' | 'audio';
 
 type QueueOp =
   | { kind: 'append'; data: ArrayBuffer }
   | { kind: 'remove'; start: number; end: number };
-
-/** Seconds of already-played media to keep behind the playhead before evicting. */
-const BACK_BUFFER_SECONDS = 6;
 
 export class MseController {
   private readonly video: HTMLVideoElement;
@@ -18,9 +17,11 @@ export class MseController {
   /** Called when an append fails with QuotaExceededError and no behind-playhead data can be freed,
    *  i.e. the forward buffer is full — the player should stop fetching until the playhead advances. */
   onBufferFull: (() => void) | null = null;
+  private readonly debug: boolean;
 
-  constructor(video: HTMLVideoElement) {
+  constructor(video: HTMLVideoElement, debug = false) {
     this.video = video;
+    this.debug = debug;
   }
 
   open(videoMimeType: string | null, audioMimeType: string | null): Promise<void> {
@@ -48,7 +49,7 @@ export class MseController {
   }
 
   private addSourceBuffer(type: TrackType, mimeType: string): void {
-    console.log(`[mse] addSourceBuffer ${type} "${mimeType}"`);
+    if (this.debug) console.log(`[mse] addSourceBuffer ${type} "${mimeType}"`);
     const sb = this.mediaSource!.addSourceBuffer(mimeType);
     this.sourceBuffers.set(type, sb);
     this.queues.set(type, []);
@@ -149,7 +150,7 @@ export class MseController {
     } else {
       // Forward buffer is full and nothing behind to drop. Hold the append; the player must pause
       // fetching. trimBackBuffer() (as currentTime advances) will free room and drain the held op.
-      console.warn(`[mse] ${type} buffer full — pausing fetch until playhead advances`);
+      if (this.debug) console.warn(`[mse] ${type} buffer full — pausing fetch until playhead advances`);
       this.onBufferFull?.();
     }
   }

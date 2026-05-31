@@ -1,5 +1,5 @@
 /**
- * Puppeteer test: loads demo/debug.html, decodes the first MPEG-2 video frame,
+ * Puppeteer test: loads test/e2e/debug.html, decodes the first MPEG-2 video frame,
  * saves the YUV canvas as a PNG, and asserts the frame looks non-trivial.
  *
  * Run: $env:TEST_MXF_FILE="C:/temptemp/vistek.mxf"; npm run test:e2e
@@ -51,7 +51,7 @@ describe('MPEG-2 YUV decoder debug', () => {
     page.on('console', m => logs.push(`[${m.type()}] ${m.text()}`));
     page.on('pageerror', e => logs.push(`[pageerror] ${e.message}`));
 
-    await page.goto(`http://localhost:${PORT}/demo/debug.html`, { waitUntil: 'networkidle0' });
+    await page.goto(`http://localhost:${PORT}/test/e2e/debug.html`, { waitUntil: 'networkidle0' });
 
     const input = await page.$('#fileInput');
     if (!input) throw new Error('#fileInput not found');

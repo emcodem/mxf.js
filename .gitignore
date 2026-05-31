@@ -4,7 +4,7 @@ node_modules/
 # build output
 dist/
 
-# generated debug artifacts (demo/debug.html + yuv-debug.test.ts)
+# generated debug artifacts (test/e2e/debug.html + yuv-debug.test.ts)
 debug-*.png
 
 # large, regenerable test references (ffmpeg yuv422p dumps)
