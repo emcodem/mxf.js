@@ -539,9 +539,6 @@ export class Mpeg2Decoder {
   private pictureStructure = 3;       // 3 = frame picture
   private framePredFrameDct = true;   // when false, each MB carries a dct_type bit
   private dctType = false;            // current MB: true = field DCT, false = frame DCT
-  private dbgDctTypeRead = 0;
-  private dbgDctTypeOne = 0;
-  private dbgDctOneList: string[] = [];
   private fCode: [[number, number], [number, number]] = [[1, 1], [1, 1]];
 
   // macroblock geometry
@@ -583,7 +580,6 @@ export class Mpeg2Decoder {
   private customNonIntraQuantMatrix = new Uint8Array(64);
   private customChromaIntraQuantMatrix = new Uint8Array(64);
   private customChromaNonIntraQuantMatrix = new Uint8Array(64);
-  private dbgExtIds: string[] = [];
 
   // picture state
   private pictureType = 0;
@@ -618,7 +614,6 @@ export class Mpeg2Decoder {
   private mvScale = false;        // vertical PMV scaling (field mv in a frame picture)
   private dmv = false;            // dual-prime
   private concealmentMotionVectors = false; // intra MBs carry a forward MV + marker
-  private dbgMotionType = { frameMc: 0, fieldMc: 0, dualPrime: 0, fpfd: 0 };
 
   private quantizerScale = 0;
   private sliceBegin = false;
@@ -626,25 +621,6 @@ export class Mpeg2Decoder {
   private dcPredictorCr = 0;
   private dcPredictorCb = 0;
   private blockData = new Int32Array(64);
-
-  // diagnostics
-  private dbgSlices = 0;
-  private dbgMbTotal = 0;
-  private dbgLog: string[] = [];
-  private dbgTraceSlice = false;     // true while decoding the very first slice
-  private dbgMbTrace: string[] = []; // per-MB notes for the first slice
-  private dbgEscapes = 0;            // escape codes seen in current MB
-  private dbgN64 = false;            // a block hit n>=64 without EOB in current MB
-  private dbgTraceThisMb = false;    // true while decoding blocks of a target MB
-  private dbgBlockLog: string[] = []; // per-block notes for target MBs
-  // Trace the first P and first B picture (to localise inter-frame desync).
-  private dbgPicIdx = -1;
-  private dbgFirstPDone = false;
-  private dbgFirstBDone = false;
-  private dbgTracePic = false;
-  private dbgPicTrace: string[] = [];
-  private dbgLastMt = -1;            // raw frame/field_motion_type value (-1 if not read)
-  private dbgDeadLog: string[] = []; // first VLC dead-ends (desync origin) in traced pictures
 
   constructor(onFrame: (frame: YUVFrame) => void, bufferSize = 4 * 1024 * 1024) {
     this.onFrame = onFrame;
@@ -694,18 +670,10 @@ export class Mpeg2Decoder {
       alternateScan: this.alternateScan,
       intraQuantMatrix_0_7: Array.from(this.intraQuantMatrix.slice(0, 8)),
       mbWidth: this.mbWidth, mbHeight: this.mbHeight, mbSize: this.mbSize,
-      dbgSlices: this.dbgSlices, dbgMbTotal: this.dbgMbTotal,
-      dbgDctTypeRead: this.dbgDctTypeRead, dbgDctTypeOne: this.dbgDctTypeOne,
-      dbgDctOneList: this.dbgDctOneList,
-      dbgMotionType: this.dbgMotionType,
       concealmentMotionVectors: this.concealmentMotionVectors,
       framePredFrameDct: this.framePredFrameDct,
       pictureStructure: this.pictureStructure,
-      dbgPicTrace: this.dbgPicTrace,
-      dbgDeadLog: this.dbgDeadLog,
-      dbgExtIds: this.dbgExtIds,
       chromaIntraQuantMatrix_0_7: Array.from(this.chromaIntraQuantMatrix.slice(0, 8)),
-      dbgLog: this.dbgLog,
     };
   }
 
@@ -806,17 +774,6 @@ export class Mpeg2Decoder {
 
     if (this.pictureType <= 0 || this.pictureType > PICTURE_TYPE.B) return;
 
-    this.dbgPicIdx++;
-    this.dbgTracePic = false;
-    if (this.pictureType === PICTURE_TYPE.PREDICTIVE && !this.dbgFirstPDone) {
-      this.dbgFirstPDone = true; this.dbgTracePic = true;
-      this.dbgPicTrace.push(`=== FIRST P PICTURE (picIdx ${this.dbgPicIdx}) ===`);
-    } else if (this.pictureType === PICTURE_TYPE.B && this.dbgFirstPDone && !this.dbgFirstBDone) {
-      // First B picture AFTER a P (so its references exist — not a leading open-GOP B).
-      this.dbgFirstBDone = true; this.dbgTracePic = true;
-      this.dbgPicTrace.push(`=== FIRST NON-LEADING B PICTURE (picIdx ${this.dbgPicIdx}) ===`);
-    }
-
     if (!this.isMPEG2) {
       // MPEG-1
       if (this.pictureType === PICTURE_TYPE.PREDICTIVE) {
@@ -843,7 +800,6 @@ export class Mpeg2Decoder {
       while (code === START.EXTENSION || code === START.USER_DATA) {
         if (code === START.EXTENSION) {
           const extId = this.bits.read(4);
-          if (this.dbgExtIds.length < 20) this.dbgExtIds.push('0x' + extId.toString(16));
           if (extId === 0x08) this.decodePictureCodingExtension();
           else if (extId === 0x03) this.decodeQuantMatrixExtension();
           // other extension ids: leave unparsed; findNextStartCode skips their data
@@ -898,28 +854,19 @@ export class Mpeg2Decoder {
   }
 
   private decodePictureCodingExtension(): void {
-    // Dump the raw extension bits so the flag parse can be verified by hand.
-    const _bi = this.bits.index, _bo = _bi >> 3, _bb = _bi & 7;
-    const _raw: string[] = [];
-    for (let k = 0; k < 6; k++) _raw.push((this.bits.bytes[_bo + k] ?? 0).toString(2).padStart(8, '0'));
-    this.dbgLog.push(`>>> pic_coding_ext at bit ${_bi} (byte ${_bo}+${_bb}): ${_raw.join(' ')}`);
-
     this.fCode[0][0] = this.bits.read(4);
     this.fCode[0][1] = this.bits.read(4);
     this.fCode[1][0] = this.bits.read(4);
     this.fCode[1][1] = this.bits.read(4);
     this.intraDcPrecision = this.bits.read(2);
     this.pictureStructure = this.bits.read(2); // picture_structure (3 = frame)
-    const _tff = this.bits.read(1); // top_field_first
+    this.bits.skip(1); // top_field_first
     this.framePredFrameDct = this.bits.read(1) === 1; // frame_pred_frame_dct
-    const _fpfd = this.framePredFrameDct ? 1 : 0;
-    const _cmv = this.bits.read(1); // concealment_motion_vectors
-    this.concealmentMotionVectors = _cmv === 1;
+    this.concealmentMotionVectors = this.bits.read(1) === 1;
     this.qScaleType    = this.bits.read(1) === 1;
     this.intraVlcFormat = this.bits.read(1) === 1;
     this.alternateScan = this.bits.read(1) === 1;
     this.bits.skip(3); // repeat_first_field, chroma_420_type, progressive_frame
-    this.dbgLog.push(`    fCode=${this.fCode[0][0]},${this.fCode[0][1]},${this.fCode[1][0]},${this.fCode[1][1]} intraDcPrec=${this.intraDcPrecision} topFieldFirst=${_tff} framePredFrameDct=${_fpfd} concealMV=${_cmv} qScaleType=${this.qScaleType?1:0} intraVlc=${this.intraVlcFormat?1:0} altScan=${this.alternateScan?1:0}`);
   }
 
   /**
@@ -947,7 +894,6 @@ export class Mpeg2Decoder {
       for (let i = 0; i < 64; i++) this.customChromaNonIntraQuantMatrix[ZIG_ZAG[i]] = this.bits.read(8);
       this.chromaNonIntraQuantMatrix = this.customChromaNonIntraQuantMatrix;
     }
-    this.dbgLog.push(`>>> quant_matrix_extension parsed; intra[0..7]=${Array.from(this.intraQuantMatrix.slice(0,8)).join(',')} chromaIntra[0..7]=${Array.from(this.chromaIntraQuantMatrix.slice(0,8)).join(',')}`);
   }
 
   // -------------------------------------------------------------------------
@@ -970,37 +916,17 @@ export class Mpeg2Decoder {
     this.quantizerScale = this.qScaleType ? NON_LINEAR_QUANTIZER_SCALE[qsCode] : qsCode;
     while (this.bits.read(1)) this.bits.skip(8); // extra slice data
     let mbCount = 0;
-    this.dbgTraceSlice = (this.dbgSlices === 0);
     // A slice never spans more than one MB row, so it can hold at most mbWidth MBs.
     // The cap stops a desynced slice from over-reading into following rows (which would
     // corrupt them and inflate the MB count); the picture loop resyncs at the next slice.
     do { this.decodeMacroblock(); mbCount++; } while (mbCount < this.mbWidth && !this.bits.nextBytesAreStartCode());
-    this.dbgTraceSlice = false;
-    this.dbgSlices++;
-    this.dbgMbTotal += mbCount;
-    if (this.dbgTracePic && this.dbgPicTrace.length < 80) {
-      this.dbgPicTrace.push(`  slice ${slice}: qs=${this.quantizerScale} mbCount=${mbCount}/${this.mbWidth}${mbCount >= this.mbWidth && !this.bits.nextBytesAreStartCode() ? ' CAPPED(overrun)' : ''}`);
-    }
-    if (this.dbgSlices <= 3) {
-      this.dbgLog.push(`slice ${slice}: qsCode=${qsCode} qs=${this.quantizerScale} decoded ${mbCount}/${this.mbWidth} MBs, lastMbAddr=${this.macroblockAddress} (row ${(this.macroblockAddress/this.mbWidth)|0} col ${this.macroblockAddress%this.mbWidth})`);
-    }
-    if (this.dbgMbTrace.length && this.dbgLog.length < 40) {
-      this.dbgLog.push('  MB trace (col:incr:type[E=escapes][!64]): ' + this.dbgMbTrace.slice(0, 30).join(' '));
-      this.dbgMbTrace = [];
-    }
-    if (this.dbgBlockLog.length) {
-      this.dbgLog.push('  blocks(coef/esc/finalN) MB13-16: ' + this.dbgBlockLog.join(' '));
-      this.dbgBlockLog = [];
-    }
   }
 
-  private dbgHuffDead = false;
   private readHuffman(codeTable: Int32Array | Int16Array | Int8Array): number {
     let state = 0;
     do {
       state = codeTable[state + this.bits.read(1)];
     } while (state >= 0 && codeTable[state] !== 0);
-    this.dbgHuffDead = state < 0; // hit a missing (-1) child = invalid code path
     return codeTable[state + 2];
   }
 
@@ -1054,9 +980,6 @@ export class Mpeg2Decoder {
 
     const mbTable = MACROBLOCK_TYPE[this.pictureType]!;
     this.macroblockType = this.readHuffman(mbTable);
-    if (this.dbgTracePic && this.dbgHuffDead && this.dbgDeadLog.length < 12) {
-      this.dbgDeadLog.push(`MBTYPE deadend @r${this.mbRow}c${this.mbCol} (prev MB's reads desynced)`);
-    }
     this.macroblockIntra  = (this.macroblockType & 0x01) !== 0;
     this.macroblockMotFw  = (this.macroblockType & 0x08) !== 0;
     this.macroblockMotBw  = (this.macroblockType & 0x04) !== 0;
@@ -1072,13 +995,6 @@ export class Mpeg2Decoder {
     if (this.pictureStructure === 3 && !this.framePredFrameDct &&
         (this.macroblockIntra || (this.macroblockType & 0x02) !== 0)) {
       this.dctType = this.bits.read(1) === 1;
-      this.dbgDctTypeRead++;
-      if (this.dctType) {
-        this.dbgDctTypeOne++;
-        if (this.dbgDctOneList.length < 20) {
-          this.dbgDctOneList.push(`(r${this.mbRow},c${this.mbCol})`);
-        }
-      }
     }
 
     if ((this.macroblockType & 0x10) !== 0) {
@@ -1131,31 +1047,15 @@ export class Mpeg2Decoder {
     let cbp: number;
     if ((this.macroblockType & 0x02) !== 0) {
       cbp = this.readHuffman(CODE_BLOCK_PATTERN);
-      if (this.dbgTracePic && this.dbgHuffDead && this.dbgDeadLog.length < 12) {
-        this.dbgDeadLog.push(`CBP deadend @r${this.mbRow}c${this.mbCol} t0x${this.macroblockType.toString(16)} (coded_block_pattern VLC desync)`);
-      }
       if (this.chromaFormat === 2) cbp = (cbp << 2) | this.bits.read(2);
     } else {
       cbp = this.macroblockIntra ? (this.chromaFormat === 2 ? 0xff : 0x3f) : 0;
     }
 
-    if (this.dbgTraceSlice) { this.dbgEscapes = 0; this.dbgN64 = false; }
-    // Per-block detail for the macroblocks straddling the typical desync point.
-    this.dbgTraceThisMb = this.dbgTraceSlice && this.mbCol >= 13 && this.mbCol <= 16;
-
     const numBlocks = this.chromaFormat === 2 ? 8 : 6;
     for (let block = 0, mask = (numBlocks === 8 ? 0x80 : 0x20); block < numBlocks; block++) {
       if ((cbp & mask) !== 0) this.decodeBlock(block);
       mask >>= 1;
-    }
-
-    if (this.dbgTraceSlice && this.dbgMbTrace.length < 30) {
-      this.dbgMbTrace.push(`${this.mbCol}:${increment}:0x${this.macroblockType.toString(16)}${this.dbgEscapes?`E${this.dbgEscapes}`:''}${this.dbgN64?'!64':''}`);
-    }
-    // First P/B picture, first slice (row 0): per-MB type + raw motion_type + cbp.
-    if (this.dbgTracePic && this.mbRow === 0 && this.dbgPicTrace.length < 80) {
-      const flags = `${this.macroblockIntra ? 'I' : ''}${this.macroblockMotFw ? 'F' : ''}${this.macroblockMotBw ? 'B' : ''}${(this.macroblockType & 0x02) ? 'P' : ''}`;
-      this.dbgPicTrace.push(`    c${this.mbCol} inc${increment} t0x${this.macroblockType.toString(16)}[${flags}] mt${this.dbgLastMt} ${this.mvFormatField ? 'fld' : 'frm'} cbp0x${cbp.toString(16)}`);
     }
   }
 
@@ -1237,21 +1137,18 @@ export class Mpeg2Decoder {
   private readMotionType(): void {
     // Defaults — also used by intra MBs carrying concealment motion vectors (frame format).
     this.mvCount = 1; this.mvFormatField = false; this.mvScale = false; this.dmv = false;
-    this.dbgLastMt = -1;
     if (!this.macroblockMotFw && !this.macroblockMotBw) return;
 
     const framePic = this.pictureStructure === 3;
     if (framePic && this.framePredFrameDct) {
-      this.dbgMotionType.fpfd++;       // frame-based, 1 MV, no bits in the stream
-      return;
+      return;                          // frame-based, 1 MV, no bits in the stream
     }
     const mt = this.bits.read(2);
-    this.dbgLastMt = mt;
     if (framePic) {
       switch (mt) {
-        case 1: this.mvCount = 2; this.mvFormatField = true;  this.mvScale = true;  this.dbgMotionType.fieldMc++; break; // field
-        case 2: this.mvCount = 1; this.mvFormatField = false; this.mvScale = false; this.dbgMotionType.frameMc++; break; // frame
-        case 3: this.mvCount = 1; this.mvFormatField = true;  this.mvScale = true;  this.dmv = true; this.dbgMotionType.dualPrime++; break; // dual-prime
+        case 1: this.mvCount = 2; this.mvFormatField = true;  this.mvScale = true;  break; // field
+        case 2: this.mvCount = 1; this.mvFormatField = false; this.mvScale = false; break; // frame
+        case 3: this.mvCount = 1; this.mvFormatField = true;  this.mvScale = true;  this.dmv = true; break; // dual-prime
         default: break; // 0 reserved
       }
     } else {
@@ -1305,9 +1202,6 @@ export class Mpeg2Decoder {
   private decodeMVComponent(r: 0 | 1, s: 0 | 1, t: 0 | 1): void {
     const rSize = this.fCode[s][t] - 1;
     const motionCode = this.readHuffman(MOTION); // signed motion_code
-    if (this.dbgTracePic && this.dbgHuffDead && this.dbgDeadLog.length < 12) {
-      this.dbgDeadLog.push(`MOTION deadend @r${this.mbRow}c${this.mbCol} r${r}s${s}t${t} (MV VLC desync)`);
-    }
     const lim = 16 << rSize;
     let vec = this.PMV[r][s][t];
     if (motionCode > 0) {
@@ -1667,18 +1561,6 @@ export class Mpeg2Decoder {
   private decodeBlock(block: number): void {
     let n = 0;
     let quantMatrix: Uint8Array;
-    let dbgCoeffs = 0, dbgEsc = 0, dbgTerm = 'EOB';
-    // Dump the raw coefficient stream for two specific blocks: a working escape block
-    // (MB14 b1) and the first failing block (MB15 b0).
-    const dbgDump = (this.dbgTraceSlice && ((this.mbCol === 14 && block === 1) || (this.mbCol === 15 && block === 0)))
-      || (this.dbgTracePic && this.pictureType === PICTURE_TYPE.PREDICTIVE && this.mbRow === 0 && this.mbCol === 22);
-    if (dbgDump) {
-      const bi = this.bits.index;
-      const byteOff = bi >> 3, bitOff = bi & 7;
-      const raw = [];
-      for (let k = 0; k < 20; k++) raw.push((this.bits.bytes[byteOff + k] ?? 0).toString(2).padStart(8, '0'));
-      this.dbgLog.push(`  >>> c${this.mbCol}b${block} bitIndex=${bi} (byte ${byteOff}+${bitOff}b) bits=${raw.join(' ')}`);
-    }
 
     if (this.macroblockIntra) {
       let predictor: number;
@@ -1690,7 +1572,6 @@ export class Mpeg2Decoder {
         predictor = ((block & 1) === 0 ? this.dcPredictorCb : this.dcPredictorCr);
         dctSize = this.readHuffman(DCT_DC_SIZE_CHROMINANCE);
       }
-      if (dbgDump) this.dbgLog.push(`      DC dctSize=${dctSize}`);
       if (dctSize > 0) {
         const differential = this.bits.read(dctSize);
         this.blockData[0] = (differential & (1 << (dctSize - 1))) !== 0
@@ -1727,24 +1608,17 @@ export class Mpeg2Decoder {
     while (true) {
       let run = 0;
       let level: number;
-      const dbgBitBefore = this.bits.index;
       if (firstCoeff && this.bits.read(1) === 1) {
         run = 0;
         level = this.bits.read(1) ? -1 : 1;
         firstCoeff = false;
-        if (dbgDump) this.dbgLog.push(`      [bit ${dbgBitBefore}] dct_coeff_first run=0 level=${level}`);
       } else {
         if (firstCoeff) this.bits.rewind(1); // peeked a '0'; let readHuffman consume it
         firstCoeff = false;
         const coeff = this.readHuffman(dctCoeffTable);
-        if (this.dbgTracePic && this.dbgHuffDead && this.dbgDeadLog.length < 12) {
-          this.dbgDeadLog.push(`COEFF deadend @r${this.mbRow}c${this.mbCol} blk${block} n${n} intra${isIntra ? 1 : 0} (block-decode desync)`);
-        }
         // EOB is the leaf 0xFFFE in both B-14 ('10') and B-15 ('0110').
-        if (coeff === 0xFFFE) { if (dbgDump) this.dbgLog.push(`      [bit ${dbgBitBefore}] EOB (consumed ${this.bits.index - dbgBitBefore} bits)`); break; }
+        if (coeff === 0xFFFE) break;
         if (coeff === 0xffff) {
-          if (this.dbgTraceSlice) this.dbgEscapes++;
-          dbgEsc++;
           run = this.bits.read(6);
           if (isMPEG2) {
             level = this.bits.read(12);
@@ -1760,13 +1634,11 @@ export class Mpeg2Decoder {
           level = coeff & 0xff;
           if (this.bits.read(1)) level = -level;
         }
-        if (dbgDump) this.dbgLog.push(`      [bit ${this.bits.index}] coeff=0x${coeff.toString(16)} run=${run} level=${level} ${coeff===0xffff?'(ESC)':''}${this.dbgHuffDead?' DEAD-END!':''} -> n=${n + run}`);
       }
       n += run;
-      if (n >= 64) { if (this.dbgTraceSlice) this.dbgN64 = true; dbgTerm = 'N64'; break; }
+      if (n >= 64) break;
       const dezigZagged = zigZag[n];
       n++;
-      dbgCoeffs++;
       level <<= 1;
       if (!isIntra) level += (level < 0 ? -1 : 1);
       // Dequant scale differs by codec: MPEG-1 divides by 16 ((2·QF[±1])·W·qs / 16),
@@ -1787,10 +1659,6 @@ export class Mpeg2Decoder {
     if (isMPEG2) {
       const dcParity = (isIntra && this.intraDcPrecision === 3) ? ((this.blockData[0] >> 5) & 1) : 0;
       if (((mismatchParity ^ dcParity) & 1) === 0) this.blockData[63] ^= 2;
-    }
-
-    if (this.dbgTraceThisMb && this.dbgBlockLog.length < 120) {
-      this.dbgBlockLog.push(`c${this.mbCol}b${block}:coef${dbgCoeffs}esc${dbgEsc}n${n}${dbgTerm === 'N64' ? '!N64' : ''}`);
     }
 
     let destArray: Uint8ClampedArray;

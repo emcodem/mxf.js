@@ -70,10 +70,7 @@
         dec.flush();
 
         const dbg = dec.debugInfo();
-        console.log('[mc] motion types:', JSON.stringify(dbg.dbgMotionType), 'concealMV:', dbg.concealmentMotionVectors);
-        console.log('[mc] framePredFrameDct?', dbg.framePredFrameDct, 'pictureStructure?', dbg.pictureStructure);
-        console.log('[pictrace]\n' + (dbg.dbgPicTrace || []).join('\n'));
-        console.log('[deadends]\n' + (dbg.dbgDeadLog || []).join('\n'));
+        console.log('[mc] framePredFrameDct?', dbg.framePredFrameDct, 'pictureStructure?', dbg.pictureStructure, 'concealMV:', dbg.concealmentMotionVectors);
 
         if (!emitted.length) { status.textContent = `Decoder produced no frames (pictureType=${dbg.pictureType})`; return; }
         const yuv = emitted[0];
@@ -160,7 +157,6 @@
           `intraQuantMatrix[0..7]: ${dbg.intraQuantMatrix_0_7.join(', ')}`,
           `chromaIntraQuant[0..7]: ${(dbg.chromaIntraQuantMatrix_0_7 || []).join(', ')}`,
           `  (MPEG-2 default:      8, 16, 19, 22, 26, 27, 29, 34)`,
-          `extensions seen: ${(dbg.dbgExtIds || []).join(' ')}`,
           ``,
           `=== Plane stats ===`,
           `Y   min/mean/max: ${ySt.min} / ${ySt.mean.toFixed(1)} / ${ySt.max}   zeros: ${(yZeros/yuv.y.length*100).toFixed(1)}%`,
@@ -172,11 +168,7 @@
           ``,
           `=== Slice/MB decode ===`,
           `mbWidth: ${dbg.mbWidth}  mbHeight: ${dbg.mbHeight}  mbSize: ${dbg.mbSize}`,
-          `slices decoded: ${dbg.dbgSlices}   total MBs: ${dbg.dbgMbTotal}  (expected ${dbg.mbSize})`,
-          `dct_type read: ${dbg.dbgDctTypeRead}   field-DCT (dctType=1): ${dbg.dbgDctTypeOne}`,
-          `field-DCT MBs: ${(dbg.dbgDctOneList || []).join(' ')}`,
-          `motion types: ${JSON.stringify(dbg.dbgMotionType)}   concealMV: ${dbg.concealmentMotionVectors}`,
-          ...(dbg.dbgLog || []),
+          `framePredFrameDct: ${dbg.framePredFrameDct}   pictureStructure: ${dbg.pictureStructure}   concealMV: ${dbg.concealmentMotionVectors}`,
           ``,
           `=== First 32 bytes of ES frame ===`,
           hexDump,
