@@ -85,7 +85,7 @@ export class MxfFile {
 
     const { primer, metadataStart, metadataLength } = this.findHeaderMetadata(metaBuf);
     if (this.debug) {
-      console.log(`[jsmxf] headerByteCount=${metaSize}, metaBuf.length=${metaBuf.byteLength}, metadataStart=${metadataStart}, metadataLength=${metadataLength}`);
+      console.log(`[mxf.js] headerByteCount=${metaSize}, metaBuf.length=${metaBuf.byteLength}, metadataStart=${metadataStart}, metadataLength=${metadataLength}`);
     }
     let metadata = parseHeaderMetadata(metaBuf, metadataStart, metadataLength, primer, this.debug);
     metadata = { ...metadata, operationalPattern: headerPartition.operationalPattern };
@@ -104,7 +104,7 @@ export class MxfFile {
     const footerIndexSegments = await this.fetchIndexSegments(footerOffset, fileSize);
     const indexSegments = [...headerIndexSegments, ...footerIndexSegments];
     if (this.debug && indexSegments.length > 0) {
-      console.log(`[jsmxf] indexSegments: ${indexSegments.length} (${headerIndexSegments.length} header, ${footerIndexSegments.length} footer)`);
+      console.log(`[mxf.js] indexSegments: ${indexSegments.length} (${headerIndexSegments.length} header, ${footerIndexSegments.length} footer)`);
     }
 
     // ── Step 5: Locate the essence container start + any in-partition index ───
@@ -122,7 +122,7 @@ export class MxfFile {
         s.entries.length === seg.entries.length);
       if (!dup) indexSegments.push(seg);
     }
-    if (this.debug) console.log(`[jsmxf] essenceStart=${essenceStart}, essenceBodySID=${essenceBodySID}, +${essencePartitionIndex.length} in-partition index segs`);
+    if (this.debug) console.log(`[mxf.js] essenceStart=${essenceStart}, essenceBodySID=${essenceBodySID}, +${essencePartitionIndex.length} in-partition index segs`);
 
     // ── Step 5b: Multi-partition VBE index (XDCAM-style OP1a) ──────────────────
     // VBE index entry streamOffsets are essence-CONTAINER-relative — they count only essence bytes,
@@ -159,13 +159,13 @@ export class MxfFile {
           if (seg.editUnitByteCount > 0) continue; // CBG has no entry array
           for (const e of seg.entries) e.streamOffset = BigInt(mapStreamOffset(Number(e.streamOffset)));
         }
-        if (this.debug) console.log(`[jsmxf] multi-partition VBE index: ${partitions.length} partitions, ${indexSegments.length} segs (remapped)`);
+        if (this.debug) console.log(`[mxf.js] multi-partition VBE index: ${partitions.length} partitions, ${indexSegments.length} segs (remapped)`);
       }
     }
 
     // ── Step 6: Determine the seeking strategy ────────────────────────────────
     const indexMode: IndexMode = classifyIndexMode(indexSegments, essenceBodySID);
-    if (this.debug) console.log(`[jsmxf] indexMode=${indexMode}`);
+    if (this.debug) console.log(`[mxf.js] indexMode=${indexMode}`);
 
     this.bootstrap = { headerPartition, metadata, indexSegments, ripEntries, essenceStart, essenceBodySID, indexMode };
     return this.bootstrap;

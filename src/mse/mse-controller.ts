@@ -67,7 +67,7 @@ export class MseController extends EventEmitter<MseControllerEvents> {
     });
     sb.addEventListener('error', () => {
       const msg = `SourceBuffer error on ${type} track — codec may be unsupported or data is malformed`;
-      console.error(`[jsmxf] ${msg}`);
+      console.error(`[mxf.js] ${msg}`);
       this.emit('error', { track: type, message: msg });
     });
   }

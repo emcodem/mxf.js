@@ -15,9 +15,9 @@ export default defineConfig({
   build: {
     lib: {
       entry: 'src/index.ts',
-      name: 'Jsmxf',
+      name: 'MxfJs',
       formats: ['es', 'umd'],
-      fileName: (format) => `jsmxf.${format === 'es' ? 'esm' : 'umd'}.js`,
+      fileName: (format) => `mxf.${format === 'es' ? 'esm' : 'umd'}.js`,
     },
     outDir: 'dist',
     sourcemap: true,

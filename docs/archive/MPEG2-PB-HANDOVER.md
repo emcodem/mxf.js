@@ -14,7 +14,7 @@
 
 Status as of this session. Goal: make the MPEG-2 decoder (`src/codec/mpeg2-decoder.ts`)
 decode **P and B frames** (Long-GOP), not just I-frames. The target stream is
-`C:/temp/jsmxf/vistek.mxf` — 1080i50, 4:2:2, frame pictures (`picture_structure==3`),
+`C:/temp/mxf.js/vistek.mxf` — 1080i50, 4:2:2, frame pictures (`picture_structure==3`),
 `frame_pred_frame_dct==0`, `intra_vlc_format==1`, `q_scale_type==1`, `alternate_scan==1`,
 open-GOP, and it **uses dual-prime and field-based prediction in P/B frames**.
 
@@ -97,7 +97,7 @@ MV/dmvector/prediction logic, which can then be dumped per-MB.
 
 ## Verification harness (keep until P/B is correct, then strip the `dbg*`)
 
-- Run: `$env:TEST_MXF_FILE="C:/temp/jsmxf/vistek.mxf"; npm run test:e2e`
+- Run: `$env:TEST_MXF_FILE="C:/temp/mxf.js/vistek.mxf"; npm run test:e2e`
   (Puppeteer + system Chrome; loads `demo/debug.html`, decodes 12 frames, writes
   `debug-montage.png` and `debug-yuv.png`.)
 - `frames.yuv` (12-frame yuv422p ffmpeg reference) is in the project root; `demo/debug.html`

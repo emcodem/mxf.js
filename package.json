@@ -1,9 +1,9 @@
 {
-  "name": "jsmxf",
+  "name": "mxf.js",
   "version": "0.1.0",
   "description": "JavaScript MXF demuxer browser plugin — hls.js-style MSE playback",
-  "main": "dist/jsmxf.js",
-  "module": "dist/jsmxf.esm.js",
+  "main": "dist/mxf.js",
+  "module": "dist/mxf.esm.js",
   "types": "dist/index.d.ts",
   "files": [
     "dist"

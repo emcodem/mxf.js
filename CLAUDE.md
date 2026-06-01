@@ -1,4 +1,4 @@
-# jsmxf
+# mxf.js
 
 MXF demuxer browser plugin. HTTP Range / File API → Web Worker → fMP4 remux → MSE `<video>`.
 
@@ -8,7 +8,7 @@ MXF demuxer browser plugin. HTTP Range / File API → Web Worker → fMP4 remux 
 npm run dev        # Vite dev server at localhost:5173
 npm test           # vitest unit tests (31 tests)
 npm run test:e2e   # Puppeteer E2E — requires TEST_MXF_FILE
-$env:TEST_MXF_FILE="C:/temp/jsmxf/vistek.mxf"; npm run test:e2e
+$env:TEST_MXF_FILE="C:/temp/mxf.js/vistek.mxf"; npm run test:e2e
 npm run typecheck  # tsc --noEmit
 ```
 
@@ -43,12 +43,12 @@ The P/B desync that blocked this for several sessions was **not** missing motion
 NOTE: `vistek.mxf` turned out to use **only frame-based MC** (no dual-prime, no field MC) — earlier "dual-prime present" reports were phantoms of the desync. The decoder's `predictField`/dual-prime paths exist but are **unverified on real field-MC/dual-prime content**; a stream that actually uses them may still need work.
 
 **Open-GOP scrub fix — suppress leading B's after a random-access `reset()`.** XDCAM long-GOP is open-GOP: a GOP's leading B-frames (coded after the I, displayed before it) reference the *previous* GOP's anchor, and B-frames emit immediately — *before* the held I-anchor. `reset()` originally kept the old reference buffers ("stale refs are harmless" — true only for closed GOPs), so after a scrub/seek into an open GOP those undecodable leading B's predicted from whatever GOP we scrubbed away from → stale macroblocks from the wrong GOP, emitted at the keyframe's own slot. (Blanking the buffers instead just turned the garbage *green* — all-zero chroma is bright green in YUV; neutral is 128.)
-Fix (`reset()` + `decodePicture`/`flush`): after a reset, `suppressUntilKeyframe` discards every emitted frame until the random-access **I-frame** itself is emitted, so the keyframe — not an undecodable leading B — lands at the keyframe slot (and the dropped B's don't advance the edit-unit counter, so the I lands exactly at the resolved keyframe edit unit). This is correct for all seeks (you sought *to* the I; frames displayed before it are dropped) and needs no `closed_gop` parsing. Reference buffers are also blanked to neutral grey (Y=0, chroma=128) as defence-in-depth. **Also fixed a latent bug:** the held I-anchor was flagged `isKeyframe=false` because the flag read the *current* picture type (the next P) instead of the held frame's — now tracked via `heldAnchorIsKeyframe`. Clean stream start is unaffected (no `reset()` there, so a closed first-GOP's leading B's still emit — the yuv-debug from-start match relies on this). Regression test: `tests/xdcam-scrub-repro.test.ts` (skips without `C:/temp/jsmxf/xdcam_vistek.mxf`) asserts the first frame after a scrub-reset is the keyframe with content == a clean decode of the GOP-head.
+Fix (`reset()` + `decodePicture`/`flush`): after a reset, `suppressUntilKeyframe` discards every emitted frame until the random-access **I-frame** itself is emitted, so the keyframe — not an undecodable leading B — lands at the keyframe slot (and the dropped B's don't advance the edit-unit counter, so the I lands exactly at the resolved keyframe edit unit). This is correct for all seeks (you sought *to* the I; frames displayed before it are dropped) and needs no `closed_gop` parsing. Reference buffers are also blanked to neutral grey (Y=0, chroma=128) as defence-in-depth. **Also fixed a latent bug:** the held I-anchor was flagged `isKeyframe=false` because the flag read the *current* picture type (the next P) instead of the held frame's — now tracked via `heldAnchorIsKeyframe`. Clean stream start is unaffected (no `reset()` there, so a closed first-GOP's leading B's still emit — the yuv-debug from-start match relies on this). Regression test: `tests/xdcam-scrub-repro.test.ts` (skips without `C:/temp/mxf.js/xdcam_vistek.mxf`) asserts the first frame after a scrub-reset is the keyframe with content == a clean decode of the GOP-head.
 
 Chroma was verified clean: `test/e2e/debug.html` reports a per-frame chroma diff (`meanC`), and all frames are rounding-level (0.06–0.14) with the I-frame lowest. The `(r18,c59):130` worst-MB in the single-frame `[diff]` is a max-single-sample metric on a leading open-GOP B-frame (half-pel rounding at the test card's center color edges) — benign, not a decode error.
 
 ### Debug tooling (keep — needed for the motion-comp work)
-- `test/e2e/debug.html` + `test/e2e/yuv-debug.test.ts`: decodes N frames, renders a **montage** (`debug-montage.png`) to spot per-frame desync, and a single frame (`debug-yuv.png`). Auto-loads a reference frame from `C:/temp/jsmxf/ref.yuv` (`ffmpeg -i in.mxf -frames:v 1 -pix_fmt yuv422p ref.yuv`) and prints a **per-MB diff** vs ground truth, an offset/shift test, and a worst-MB pixel dump. `Mpeg2Decoder.debugInfo()` exposes slice/MB counts, dct_type stats, extension ids, and a `dbgLog` of slice/MB/coefficient traces. VLC/DC trees self-test at load (Kraft sum, round-trip).
+- `test/e2e/debug.html` + `test/e2e/yuv-debug.test.ts`: decodes N frames, renders a **montage** (`debug-montage.png`) to spot per-frame desync, and a single frame (`debug-yuv.png`). Auto-loads a reference frame from `C:/temp/mxf.js/ref.yuv` (`ffmpeg -i in.mxf -frames:v 1 -pix_fmt yuv422p ref.yuv`) and prints a **per-MB diff** vs ground truth, an offset/shift test, and a worst-MB pixel dump. `Mpeg2Decoder.debugInfo()` exposes slice/MB counts, dct_type stats, extension ids, and a `dbgLog` of slice/MB/coefficient traces. VLC/DC trees self-test at load (Kraft sum, round-trip).
 
 ## MPEG-2 transcode pipeline
 

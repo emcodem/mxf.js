@@ -6,7 +6,7 @@ export interface ILoader {
 }
 
 /**
- * Shared read-logging helper. Off by default; set globalThis.JSMXF_LOG_READS = true to enable.
+ * Shared read-logging helper. Off by default; set globalThis.MXFJS_LOG_READS = true to enable.
  * Logs every byte-range read with its purpose, size, latency and a running total so the
  * read pattern (one init burst, then one ~2 s chunk per playback step / seek) is visible.
  */
@@ -18,7 +18,7 @@ export function logRead(
   ms: number,
   state: { count: number; total: number },
 ): void {
-  if ((globalThis as { JSMXF_LOG_READS?: boolean }).JSMXF_LOG_READS !== true) return;
+  if ((globalThis as { MXFJS_LOG_READS?: boolean }).MXFJS_LOG_READS !== true) return;
   state.count++;
   const len = end - start + 1;
   state.total += len;

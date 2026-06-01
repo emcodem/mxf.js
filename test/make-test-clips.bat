@@ -1,13 +1,13 @@
 @echo off
 REM ===========================================================================
-REM make-test-clips.bat - generate MXF test clips for jsmxf Tier 3 verification
+REM make-test-clips.bat - generate MXF test clips for mxf.js Tier 3 verification
 REM
 REM Creates the corpus needed for the genericisation work (EXCEPT the OP-Atom
 REM file, which is provided separately). Sources are synthetic (testsrc2 + sine
 REM tones) so no input media is required.
 REM
 REM Requires: ffmpeg on PATH (built with libx264 + mxf muxer).
-REM Usage:    make-test-clips.bat [output_dir]   (default output dir: C:\temp\jsmxf)
+REM Usage:    make-test-clips.bat [output_dir]   (default output dir: C:\temp\mxf.js)
 REM
 REM NOTE: MXF audio is ALWAYS PCM - there is no separate "AES3" codec. What the
 REM code calls "AES3" is just D-10's particular 8-channel PCM layout (a 4-byte
@@ -18,7 +18,7 @@ REM ===========================================================================
 
 setlocal
 set "OUT=%~1"
-if "%OUT%"=="" set "OUT=C:\temp\jsmxf"
+if "%OUT%"=="" set "OUT=C:\temp\mxf.js"
 set "DUR=5"
 
 where ffmpeg >nul 2>nul
@@ -35,7 +35,7 @@ REM ---------------------------------------------------------------------------
 REM 1) UHD XAVC-like: H.264 High 4:2:2 INTRA, 3840x2160 @ 25p, OP1a, + stereo 24-bit PCM
 REM    Tests D1.7: SPS-derived UHD dimensions in the avc1 box. Intra-only + High 4:2:2
 REM    mirrors XAVC-Intra. (Chrome decodes High 4:2:2 in software; UHD 4:2:2 playback may
-REM    be heavy - this primarily verifies jsmxf parsing / init-segment dimensions.)
+REM    be heavy - this primarily verifies mxf.js parsing / init-segment dimensions.)
 echo [1/4] UHD XAVC (3840x2160p25, H.264 High 4:2:2 intra)...
 ffmpeg -y -hide_banner -loglevel error ^
   -f lavfi -i testsrc2=size=3840x2160:rate=25 ^
@@ -62,7 +62,7 @@ if errorlevel 1 (echo   FAILED) else (echo   ok)
 
 REM ---------------------------------------------------------------------------
 REM 3) Multi-audio: H.264 1080 @ 25p + TWO separate stereo 24-bit PCM audio tracks, OP1a
-REM    Tests D1.1 multi-track audio (jsmxf currently assumes a single audio track).
+REM    Tests D1.1 multi-track audio (mxf.js currently assumes a single audio track).
 echo [3/4] Multi-audio (1080p25 + two stereo PCM tracks)...
 ffmpeg -y -hide_banner -loglevel error ^
   -f lavfi -i testsrc2=size=1920x1080:rate=25 ^

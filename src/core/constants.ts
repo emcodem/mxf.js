@@ -1,5 +1,5 @@
 /**
- * Tuning constants for jsmxf, collected in one place.
+ * Tuning constants for mxf.js, collected in one place.
  *
  * These were previously scattered across mxf-file.ts, essence-extractor.ts, demux-worker.ts,
  * mse-controller.ts and mxf-player.ts as local `const`s and inline magic numbers. Centralising

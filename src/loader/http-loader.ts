@@ -8,7 +8,7 @@ import { ILoader, logRead } from './loader.js';
 function noRangeError(url: string): Error {
   return new Error(
     `${url}: the server ignored the Range request (responded 200, not 206 Partial Content). ` +
-    `It does not support byte-range requests, which jsmxf needs to stream without downloading the ` +
+    `It does not support byte-range requests, which mxf.js needs to stream without downloading the ` +
     `entire file. Use a range-capable static server — e.g. \`npx http-server --cors\`, nginx, or ` +
     `caddy. Python's \`http.server\` does NOT support ranges.`,
   );

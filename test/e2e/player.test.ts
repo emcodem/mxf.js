@@ -2,7 +2,7 @@
  * E2E test: load an MXF file in a real Chrome browser via Puppeteer and assert
  * that the player initialises without MSE SourceBuffer errors.
  *
- * Defaults to C:/temp/jsmxf/vistek.mxf. Override with TEST_MXF_FILE env var.
+ * Defaults to C:/temp/mxf.js/vistek.mxf. Override with TEST_MXF_FILE env var.
  * Set VERBOSE=1 for full console/log output.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'vitest';
@@ -16,7 +16,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '../..');
 const PORT = 5199;
 
-const TEST_FILE = process.env.TEST_MXF_FILE ?? 'C:/temp/jsmxf/vistek.mxf';
+const TEST_FILE = process.env.TEST_MXF_FILE ?? 'C:/temp/mxf.js/vistek.mxf';
 
 let vite: ViteDevServer;
 let browser: Browser;
@@ -117,7 +117,7 @@ describe('MXF player E2E', () => {
     const resp = await page.goto(`http://localhost:${PORT}/demo/index.html`);
     expect(resp?.status()).toBe(200);
     const h1 = await page.$eval('h1', el => el.textContent);
-    expect(h1).toContain('jsmxf');
+    expect(h1).toContain('mxf.js');
     await page.close();
   });
 
@@ -338,7 +338,7 @@ describe('MXF player E2E', () => {
   // updating (multiple 'seeked' events + an advancing playhead) instead of freezing — the reported
   // "stops playing frames once I scrub". Uses the all-intra XAVC file (cheap remux preview path);
   // skips if absent.
-  const SCRUB_FILE = process.env.TEST_SCRUB_FILE ?? 'C:/temp/jsmxf/xavc_p50_vistek.mxf';
+  const SCRUB_FILE = process.env.TEST_SCRUB_FILE ?? 'C:/temp/mxf.js/xavc_p50_vistek.mxf';
   test('fast scrub keeps rendering frames (no freeze)', async () => {
     if (!fs.existsSync(SCRUB_FILE)) {
       console.log(`skip scrub test — file not found: ${SCRUB_FILE}`);
@@ -426,7 +426,7 @@ describe('MXF player E2E', () => {
   // known limit: MPEG-2 is a per-keyframe transcode (~few previews/s) so display-fps drops as the
   // drag outruns it, whereas XAVC remux stays smooth. Defaults to the MPEG-2 long-GOP file (the
   // interesting case); override with TEST_SPEED_FILE.
-  const SPEED_FILE = process.env.TEST_SPEED_FILE ?? process.env.TEST_SCRUB_FILE ?? 'C:/temp/jsmxf/xdcam_vistek.mxf';
+  const SPEED_FILE = process.env.TEST_SPEED_FILE ?? process.env.TEST_SCRUB_FILE ?? 'C:/temp/mxf.js/xdcam_vistek.mxf';
   test('scrub throughput at varying speeds (frames actually displayed)', async () => {
     if (!fs.existsSync(SPEED_FILE)) {
       console.log(`skip scrub-speed test — file not found: ${SPEED_FILE}`);
@@ -534,7 +534,7 @@ describe('MXF player E2E', () => {
   // Buffering regression: high-bitrate AVC-Intra (~280 Mbps) must NOT prefetch the whole file
   // (which saturated the worker and overflowed the SourceBuffer with QuotaExceededError). The
   // resident buffer must stay bounded and no quota/SourceBuffer error must fire.
-  const BUFFER_FILE = process.env.TEST_BUFFER_FILE ?? 'C:/temp/jsmxf/xavc_class100_50i_vistek.mxf';
+  const BUFFER_FILE = process.env.TEST_BUFFER_FILE ?? 'C:/temp/mxf.js/xavc_class100_50i_vistek.mxf';
   test('buffer stays bounded — no whole-file prefetch / quota overflow', async () => {
     if (!fs.existsSync(BUFFER_FILE)) {
       console.log(`skip buffer test — file not found: ${BUFFER_FILE}`);

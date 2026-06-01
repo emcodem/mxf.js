@@ -1,4 +1,4 @@
-# jsmxf
+# mxf.js
 
 A JavaScript **MXF demuxer + player** that runs entirely in the browser — no server-side transcoding, no plugins, no WASM. It reads broadcast MXF files (local `File` or remote URL), demuxes the essence in a Web Worker, remuxes (h264) or transcodes (mpeg2) it to fragmented MP4, and plays it through a native `<video>` element via Media Source Extensions (MSE). PCM audio that MSE can't handle is decoded and played through the Web Audio API.
 
@@ -27,7 +27,7 @@ HTTP Range / File API ──► Web Worker ──► demux ──► remux / tra
 | Codec | Path | Notes |
 |-------|------|-------|
 | **H.264 / AVC-Intra (XAVC)** | Remux to fMP4 | Played natively by Chrome (High 4:2:2 / profile 122 via its software decoder). SPS-derived `avc1` dimensions for interlaced 1080i MBAFF. - Firefox support missing yet (that requires WASM)|
-| **MPEG-2** (D-10 / IMX, XDCAM Long-GOP) | Decode in JS → re-encode to H.264 via WebCodecs `VideoEncoder` → fMP4 | Full MPEG-2 decoder ported from jsmpeg and extended for interlaced 1080i 4:2:2 Long-GOP. I/P/B frames, open-GOP scrub handling, field-DCT, 4:2:0 and 4:2:2. |
+| **MPEG-2** (D-10 / IMX, XDCAM Long-GOP) | Decode in JS → re-encode to H.264 via WebCodecs `VideoEncoder` → fMP4 | Full javascript MPEG-2 decoder (derived and extended from https://github.com/phoboslab/jsmpeg) and extended for interlaced 1080i 4:2:2 Long-GOP. I/P/B frames, open-GOP scrub handling, field-DCT, 4:2:0 and 4:2:2. |
 
 All video flows through the single `<video>` element, so seeking and scrubbing work identically for every source.
 
@@ -47,14 +47,14 @@ All video flows through the single `<video>` element, so seeking and scrubbing w
 ## Installation
 
 ```powershell
-npm install jsmxf
+npm install mxf.js
 ```
 
 Or clone and run from source:
 
 ```powershell
-git clone <repo-url> jsmxf
-cd jsmxf
+git clone <repo-url> mxf.js
+cd mxf.js
 npm install
 npm run dev        # Vite dev server at http://localhost:5173
 ```
@@ -68,7 +68,7 @@ npm run dev        # Vite dev server at http://localhost:5173
 ## Usage
 
 ```ts
-import { MxfPlayer } from 'jsmxf';
+import { MxfPlayer } from 'mxf.js';
 
 const video = document.querySelector('video');           // a real <video> element
 const player = new MxfPlayer(video, {
@@ -130,7 +130,7 @@ A runnable demo is in [`demo/index.html`](demo/index.html) (`npm run dev`, then 
 | `maxBufferSeconds` | `number` | `30` | Maximum seconds to buffer ahead of the playhead (caps prefetch). |
 | `pcmAudioMode` | `'mse' \| 'webaudio' \| 'auto'` | `'auto'` | How to play PCM audio. `'auto'` uses MSE where supported, else Web Audio. |
 | `seekMode` | `'accurate' \| 'keyframe'` | `'accurate'` | Default `seek()` behaviour. `accurate` decodes keyframe→target; `keyframe` shows just the GOP-head I-frame. Scrubbing always uses keyframe internally and settles accurately on release. |
-| `debug` | `boolean` | `false` | Verbose `[jsmxf]` console logging. |
+| `debug` | `boolean` | `false` | Verbose `[mxf.js]` console logging. |
 
 ### Methods
 
@@ -186,7 +186,7 @@ import type {
   IndexMode,                       // 'cbg' | 'vbe' | 'none'
   MxfTrack, MxfPackage, MxfMetadata,
   PictureDescriptor, SoundDescriptor,
-} from 'jsmxf';
+} from 'mxf.js';
 ```
 
 ```ts
@@ -247,7 +247,7 @@ npm run build      # production bundle into dist/
 E2E tests need a real MXF file and the **system Chrome** (the bundled Puppeteer Chromium lacks proprietary-codec support for H.264 MSE):
 
 ```powershell
-$env:TEST_MXF_FILE="C:/temp/jsmxf/vistek.mxf"; npm run test:e2e
+$env:TEST_MXF_FILE="C:/temp/mxf.js/vistek.mxf"; npm run test:e2e
 ```
 
 System Chrome is expected at `C:\Program Files\Google\Chrome\Application\chrome.exe`.

@@ -217,7 +217,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       // so it's diagnosable instead of an opaque "Worker error".
       const detail = [e.message, e.filename && `${e.filename}:${e.lineno ?? '?'}:${e.colno ?? '?'}`,
         (e.error as Error | undefined)?.stack].filter(Boolean).join(' — ');
-      console.error('[jsmxf] worker error:', e, e.error);
+      console.error('[mxf.js] worker error:', e, e.error);
       this.emit('error', {
         message: detail || 'Worker failed to load — reload the page (the dev server may have restarted)',
         fatal: true,
@@ -531,7 +531,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   }
 
   private log(msg: string): void {
-    if (this.config.debug) console.log('[jsmxf]', msg);
+    if (this.config.debug) console.log('[mxf.js]', msg);
   }
 
   private destroyInternal(): void {

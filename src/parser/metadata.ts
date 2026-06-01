@@ -126,7 +126,7 @@ export function parseHeaderMetadata(
   }
 
   if (debug) {
-    console.log(`[jsmxf] parseHeaderMetadata: ${sets.length} sets found`);
+    console.log(`[mxf.js] parseHeaderMetadata: ${sets.length} sets found`);
     const seen = new Set<string>();
     for (const s of sets) {
       const h = formatUL(s.classUL);
@@ -149,7 +149,7 @@ export function parseHeaderMetadata(
         ulMatchClass(cls, CLASS_MPEGVID_DESCRIPTOR) ||
         ulMatchClass(cls, CLASS_AVC_DESCRIPTOR)) {
       pictureDescriptor = parsePictureDescriptorFromSet(set);
-      if (debug) console.log(`[jsmxf] found picture descriptor: codec=${pictureDescriptor.codec} ${pictureDescriptor.storedWidth}x${pictureDescriptor.storedHeight}`);
+      if (debug) console.log(`[mxf.js] found picture descriptor: codec=${pictureDescriptor.codec} ${pictureDescriptor.storedWidth}x${pictureDescriptor.storedHeight}`);
     }
 
     // Detect a sound descriptor by the presence of audio local tags rather than by descriptor
@@ -160,7 +160,7 @@ export function parseHeaderMetadata(
     if (!soundDescriptor &&
         (set.localItems.has(0x3d03) || set.localItems.has(0x3d07) || set.localItems.has(0x3d01))) {
       soundDescriptor = parseSoundDescriptorFromSet(set);
-      if (debug) console.log(`[jsmxf] found sound descriptor: codec=${soundDescriptor.codec} ${soundDescriptor.sampleRate}Hz ${soundDescriptor.channelCount}ch ${soundDescriptor.bitDepth}bit`);
+      if (debug) console.log(`[mxf.js] found sound descriptor: codec=${soundDescriptor.codec} ${soundDescriptor.sampleRate}Hz ${soundDescriptor.channelCount}ch ${soundDescriptor.bitDepth}bit`);
     }
 
     if (ulMatchClass(cls, CLASS_MATERIAL_PACKAGE) ||
@@ -190,7 +190,7 @@ export function parseHeaderMetadata(
   }
 
   if (debug) {
-    console.log(`[jsmxf] duration=${maxDuration} editRate=${editRateNumerator}/${editRateDenominator} packages=${packages.length}`);
+    console.log(`[mxf.js] duration=${maxDuration} editRate=${editRateNumerator}/${editRateDenominator} packages=${packages.length}`);
   }
 
   return {
@@ -261,7 +261,7 @@ function parsePackage(classUL: Uint8Array, set: RawSet, allSets: RawSet[], debug
     const v = new DataView(tracksData.buffer, tracksData.byteOffset, tracksData.byteLength);
     const count = v.getUint32(0, false);
     const itemLen = v.getUint32(4, false);
-    if (debug) console.log(`[jsmxf] package ${packageType}: ${count} track refs (itemLen=${itemLen})`);
+    if (debug) console.log(`[mxf.js] package ${packageType}: ${count} track refs (itemLen=${itemLen})`);
 
     for (let i = 0; i < count; i++) {
       const refUID = tracksData.slice(8 + i * itemLen, 8 + (i + 1) * itemLen);

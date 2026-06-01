@@ -1,11 +1,11 @@
 // Ported from C:\dev\jsmpeg2_git\jsmpeg (buffer.js + mpeg2.js).
 // Stripped to decode-only: no canvas, no TS demuxer, no player infrastructure.
 
-// The VLC/DC tree builders below self-test at module load. Set globalThis.JSMXF_DEBUG_VLC = true
+// The VLC/DC tree builders below self-test at module load. Set globalThis.MXFJS_DEBUG_VLC = true
 // to print the per-table self-test summaries (off by default so importing the library is silent).
 // A self-test *failure* still logs unconditionally — it means a table is corrupt, which is a real
 // defect, not noise.
-const DEBUG_VLC = (globalThis as { JSMXF_DEBUG_VLC?: boolean }).JSMXF_DEBUG_VLC === true;
+const DEBUG_VLC = (globalThis as { MXFJS_DEBUG_VLC?: boolean }).MXFJS_DEBUG_VLC === true;
 
 export interface YUVFrame {
   y: Uint8ClampedArray;

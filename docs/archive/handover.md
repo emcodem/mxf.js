@@ -1,4 +1,4 @@
-# jsmxf — Handover
+# mxf.js — Handover
 
 MXF demuxer browser plugin. hls.js-style: HTTP Range / File API → Web Worker demux → fMP4 remux → MSE `<video>`.
 
@@ -105,7 +105,7 @@ Added to `manifest` event: `resolvedVideoCodec: string`, `resolvedVideoMode: 'ms
 
 The init segment triggers `RunSegmentParserLoop: stream parsing failed` from Chrome's `ChunkDemuxer`. The hardcoded-H.264 sanity test in `test/e2e/player.test.ts` (`Chrome MSE accepts hardcoded H.264 init segment`) also fires `sourcebuffer-error` with a hand-crafted known-good Baseline Profile init segment.
 
-**Conclusion: Puppeteer's bundled Chrome for Testing does not support H.264 in MSE.** This is an environmental limitation of the headless test runner, NOT a bug in jsmxf code. The Chrome binary Puppeteer ships may be a Chromium build without proprietary codec support.
+**Conclusion: Puppeteer's bundled Chrome for Testing does not support H.264 in MSE.** This is an environmental limitation of the headless test runner, NOT a bug in mxf.js code. The Chrome binary Puppeteer ships may be a Chromium build without proprietary codec support.
 
 The SourceBuffer error in the **user's real Chrome** (reported in the original issue) may be a separate, still-open bug. With the current code state:
 - Dimensions: correctly taken from MPEG-2 sequence headers (not the unreliable MXF descriptor)
@@ -124,7 +124,7 @@ The SourceBuffer error in the **user's real Chrome** (reported in the original i
 
 ```
 npm run test:e2e                                      # smoke only (no H.264 support needed)
-TEST_MXF_FILE=C:/temp/jsmxf/vistek.mxf npm run test:e2e  # with file, VERBOSE=1 for full log
+TEST_MXF_FILE=C:/temp/mxf.js/vistek.mxf npm run test:e2e  # with file, VERBOSE=1 for full log
 ```
 
 ### Setup

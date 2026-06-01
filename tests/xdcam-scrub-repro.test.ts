@@ -21,7 +21,7 @@ import { Mpeg2Decoder, type YUVFrame } from '../src/codec/mpeg2-decoder.js';
 import { resolveFrameOffset } from '../src/parser/index-table.js';
 import { ILoader } from '../src/loader/loader.js';
 
-const FILE = process.env.TEST_XDCAM_FILE ?? 'C:/temp/jsmxf/xdcam_vistek.mxf';
+const FILE = process.env.TEST_XDCAM_FILE ?? 'C:/temp/mxf.js/xdcam_vistek.mxf';
 
 class FsLoader implements ILoader {
   readonly fileSize: Promise<number>;

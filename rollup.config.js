@@ -13,14 +13,14 @@ export default [
     input: 'src/index.ts',
     output: [
       {
-        file: 'dist/jsmxf.esm.js',
+        file: 'dist/mxf.esm.js',
         format: 'esm',
         sourcemap: true,
       },
       {
-        file: 'dist/jsmxf.js',
+        file: 'dist/mxf.js',
         format: 'umd',
-        name: 'Jsmxf',
+        name: 'MxfJs',
         sourcemap: true,
       },
     ],
