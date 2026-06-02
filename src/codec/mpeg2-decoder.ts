@@ -312,10 +312,10 @@ const DCT_DC_SIZE_CHROMINANCE = _buildSimpleTree(_DC_CHR_CODE, _DC_CHR_BITS, 'ch
 // codeword routed to a dead end), which the all-intra I-frame never hit but every
 // inter block did. Rebuilt from the canonical FFmpeg data with the Kraft-checked
 // _buildVlcTree so completeness is verified at load. Run/level are shared with B-15
-// (ff_mpeg12_run / ff_mpeg12_level == _B14_RUN / _B14_LEVEL).
+// (ff_mpeg12_run / ff_mpeg12_level == _MPEG12_RUN / _MPEG12_LEVEL).
 // Source: libavcodec/mpeg12data.c (LGPL).
 // ---------------------------------------------------------------------------
-const _B14_VLCS_NEXT: ReadonlyArray<readonly [number, number]> = [
+const _B14_VLCS: ReadonlyArray<readonly [number, number]> = [
   [0x3, 2], [0x4, 4], [0x5, 5], [0x6, 7], [0x26, 8], [0x21, 8], [0xa, 10], [0x1d, 12],
   [0x18, 12], [0x13, 12], [0x10, 12], [0x1a, 13], [0x19, 13], [0x18, 13], [0x17, 13], [0x1f, 14],
   [0x1e, 14], [0x1d, 14], [0x1c, 14], [0x1b, 14], [0x1a, 14], [0x19, 14], [0x18, 14], [0x17, 14],
@@ -335,13 +335,14 @@ const _B14_VLCS_NEXT: ReadonlyArray<readonly [number, number]> = [
 ];
 
 // ---------------------------------------------------------------------------
-// Table B-14: alternate DCT coefficient VLC for intra blocks (intra_vlc_format=1)
-// Source: ISO 13818-2, Annex B, Table B.14 / FFmpeg libavcodec/mpeg12data.c (LGPL)
+// Table B-15 (ff_mpeg2_vlc_table): alternate DCT coefficient VLC for intra
+// blocks, used when intra_vlc_format == 1.
+// Source: ISO 13818-2, Annex B, Table B.15 / FFmpeg libavcodec/mpeg12data.c (LGPL)
 // ff_mpeg2_vlc_table entries: [code_msb_first, bit_length]
 // 0..110 correspond to ff_mpeg12_run/ff_mpeg12_level; 111=escape; 112=EOB
 // ---------------------------------------------------------------------------
 
-const _B14_VLCS: ReadonlyArray<readonly [number, number]> = [
+const _B15_VLCS: ReadonlyArray<readonly [number, number]> = [
   [0x02, 2], [0x06, 3], [0x07, 4], [0x1c, 5], [0x1d, 5], [0x05, 6], [0x04, 6], [0x7b, 7],
   [0x7c, 7], [0x23, 8], [0x22, 8], [0xfa, 8], [0xfb, 8], [0xfe, 8], [0xff, 8], [0x1f,14],
   [0x1e,14], [0x1d,14], [0x1c,14], [0x1b,14], [0x1a,14], [0x19,14], [0x18,14], [0x17,14],
@@ -357,9 +358,9 @@ const _B14_VLCS: ReadonlyArray<readonly [number, number]> = [
   [0x1f,12], [0x1a,12], [0x19,12], [0x17,12], [0x16,12], [0x1f,13], [0x1e,13], [0x1d,13],
   [0x1c,13], [0x1b,13], [0x1f,16], [0x1e,16], [0x1d,16], [0x1c,16], [0x1b,16],
   [0x01, 6],  // escape → 0xffff
-  [0x06, 4],  // EOB    → 0xFFFE (B-14 uses 4-bit EOB, not the 0x0001 trick used for B-13)
+  [0x06, 4],  // EOB    → 0xFFFE (B-15 uses 4-bit EOB, not the 0x0001 trick used for B-14)
 ];
-const _B14_RUN = new Uint8Array([
+const _MPEG12_RUN = new Uint8Array([
    0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
    0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
    0, 0, 0, 0, 0, 0, 0, 0,
@@ -370,7 +371,7 @@ const _B14_RUN = new Uint8Array([
   10,10, 11,11, 12,12, 13,13, 14,14, 15,15, 16,16,
   17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
 ]);
-const _B14_LEVEL = new Uint8Array([
+const _MPEG12_LEVEL = new Uint8Array([
    1, 2, 3, 4, 5, 6, 7, 8,  9,10,11,12,13,14,15,16,
   17,18,19,20,21,22,23,24, 25,26,27,28,29,30,31,32,
   33,34,35,36,37,38,39,40,
@@ -383,7 +384,7 @@ const _B14_LEVEL = new Uint8Array([
 ]);
 
 /**
- * Build a ternary-tree VLC lookup array in the same format as DCT_COEFF, matching
+ * Build a ternary-tree VLC lookup array in the same format as DCT_COEFF_B14, matching
  * the traversal in readHuffman():
  *   - terminal node = [0, 0, value]   (left slot 0 marks "leaf"; readHuffman stops here)
  *   - internal node = [leftChild|−1, rightChild|−1, 0]
@@ -457,10 +458,12 @@ function _buildVlcTree(
   return flat;
 }
 
-const DCT_COEFF_1 = _buildVlcTree(_B14_VLCS, _B14_RUN, _B14_LEVEL);
+// B-15 (ff_mpeg2_vlc_table), used by intra blocks when intra_vlc_format==1.
+// Distinct 4-bit EOB (code '0110' → leaf 0xFFFE).
+const DCT_COEFF_B15 = _buildVlcTree(_B15_VLCS, _MPEG12_RUN, _MPEG12_LEVEL);
 // B-14 (dct_coeff_next), used by inter blocks and intra blocks with intra_vlc_format==0.
 // EOB is the leaf 0xFFFE (code '10'); (run0,level1) is the leaf 0x0001 (code '11').
-const DCT_COEFF = _buildVlcTree(_B14_VLCS_NEXT, _B14_RUN, _B14_LEVEL);
+const DCT_COEFF_B14 = _buildVlcTree(_B14_VLCS, _MPEG12_RUN, _MPEG12_LEVEL);
 
 /**
  * Build a readHuffman-compatible ternary-tree from explicit (code, bits, value) entries.
@@ -1653,9 +1656,9 @@ export class Mpeg2Decoder {
     }
 
     const zigZag = this.alternateScan ? ALTERNATE_SCAN : ZIG_ZAG;
-    // B-14 (intra_vlc_format=1) applies only to intra-coded blocks.
-    const useB14 = this.intraVlcFormat && this.macroblockIntra;
-    const dctCoeffTable = useB14 ? DCT_COEFF_1 : DCT_COEFF;
+    // B-15 (intra_vlc_format=1) applies only to intra-coded blocks.
+    const useB15 = this.intraVlcFormat && this.macroblockIntra;
+    const dctCoeffTable = useB15 ? DCT_COEFF_B15 : DCT_COEFF_B14;
     const isMPEG2 = this.isMPEG2;
     const isIntra = this.macroblockIntra;
     const qs = this.quantizerScale;

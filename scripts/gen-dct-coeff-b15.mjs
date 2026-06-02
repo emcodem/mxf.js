@@ -1,10 +1,10 @@
 /**
- * Converts the FFmpeg ff_mpeg2_vlc_table (Table B-14, alternate DCT coefficient
+ * Converts the FFmpeg ff_mpeg2_vlc_table (Table B-15, alternate DCT coefficient
  * VLC for MPEG-2 intra blocks) into the ternary-tree format used by mpeg2-decoder.ts.
  *
  * Source data from libavcodec/mpeg12data.c (LGPL, Fabrice Bellard / Michael Niedermayer).
  *
- * Run with: node scripts/gen-dct-coeff-1.mjs
+ * Run with: node scripts/gen-dct-coeff-b15.mjs
  */
 
 // ff_mpeg2_vlc_table[i] = [code_msb_first, bit_length]
@@ -42,7 +42,7 @@ const ff_mpeg2_vlc = [
   [0x1c,13], [0x1b,13], [0x1f,16], [0x1e,16],
   [0x1d,16], [0x1c,16], [0x1b,16],
   [0x01, 6], // escape → 0xffff
-  [0x06, 4], // EOB    → 0xFFFE  (different from B-13's 0x0001 trick)
+  [0x06, 4], // EOB    → 0xFFFE  (different from B-14's 0x0001 trick)
 ];
 
 const ff_mpeg12_level = [
@@ -95,7 +95,7 @@ for (let i = 0; i < MPEG12_RL_NB_ELEMS; i++) {
   const [code, len] = ff_mpeg2_vlc[111];
   entries.push({ bits: code.toString(2).padStart(len, '0'), value: 0xffff });
 }
-// EOB: index 112 — use 0xFFFE (handled explicitly in decodeBlock for B-14)
+// EOB: index 112 — use 0xFFFE (handled explicitly in decodeBlock for B-15)
 {
   const [code, len] = ff_mpeg2_vlc[112];
   entries.push({ bits: code.toString(2).padStart(len, '0'), value: 0xFFFE });
@@ -149,4 +149,4 @@ const rows = [];
 for (let i = 0; i < flat.length; i += 12) {
   rows.push('  ' + flat.slice(i, i + 12).join(', ') + ',');
 }
-console.log(`\nconst DCT_COEFF_1 = new Int32Array([\n${rows.join('\n')}\n]);`);
+console.log(`\nconst DCT_COEFF_B15 = new Int32Array([\n${rows.join('\n')}\n]);`);
