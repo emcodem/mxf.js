@@ -101,7 +101,12 @@ export class MxfFile {
     // Scan the already-fetched header buffer first, then check the footer.
     const headerIndexSegments = this.scanBufferForIndexSegments(metaBuf, 0);
     const footerOffset = this.findFooterOffset(ripEntries, headerPartition);
-    const footerIndexSegments = await this.fetchIndexSegments(footerOffset, fileSize);
+    const footerStart = Number(footerOffset);
+    // If the footer lies within the tail buffer already fetched, reuse it — this avoids a second
+    // network seek to the end of a large file (e.g. 30 GB on SMB), which can cost several seconds.
+    const footerIndexSegments = (footerStart > 0 && footerStart >= tailStart)
+      ? this.parseFooterIndexSegments(tailBuf.slice(footerStart - tailStart))
+      : await this.fetchIndexSegments(footerOffset, fileSize);
     const indexSegments = [...headerIndexSegments, ...footerIndexSegments];
     if (this.debug && indexSegments.length > 0) {
       console.log(`[mxf.js] indexSegments: ${indexSegments.length} (${headerIndexSegments.length} header, ${footerIndexSegments.length} footer)`);
@@ -386,25 +391,21 @@ export class MxfFile {
     return { partitions, segments };
   }
 
-  private async fetchIndexSegments(footerOffset: bigint, fileSize: number): Promise<IndexTableSegment[]> {
-    const footerStart = Number(footerOffset);
-    if (footerStart <= 0 || footerStart >= fileSize) return [];
-
-    const footerBuf = await this.loader.fetchRange(footerStart, fileSize - 1, 'bootstrap: footer index table');
-
-    // Skip the footer partition pack, then scan for index table segments
+  private parseFooterIndexSegments(footerBuf: ArrayBuffer): IndexTableSegment[] {
     const fpKlvOffset = KLVIterator.skipRunIn(footerBuf);
     let parseStart = fpKlvOffset;
     try {
       const fpKlv = readKLV(footerBuf, fpKlvOffset);
-      if (isPartitionPack(fpKlv.key)) {
-        parseStart = fpKlvOffset + fpKlv.totalLength;
-      }
-    } catch {
-      // can't parse partition pack; scan from start
-    }
-
+      if (isPartitionPack(fpKlv.key)) parseStart = fpKlvOffset + fpKlv.totalLength;
+    } catch { /* scan from start */ }
     return this.scanBufferForIndexSegments(footerBuf, parseStart);
+  }
+
+  private async fetchIndexSegments(footerOffset: bigint, fileSize: number): Promise<IndexTableSegment[]> {
+    const footerStart = Number(footerOffset);
+    if (footerStart <= 0 || footerStart >= fileSize) return [];
+    const footerBuf = await this.loader.fetchRange(footerStart, fileSize - 1, 'bootstrap: footer index table');
+    return this.parseFooterIndexSegments(footerBuf);
   }
 
   getBootstrap(): MxfBootstrap | null {
