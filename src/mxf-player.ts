@@ -235,10 +235,8 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   }
 
   private createWorker(): Worker {
-    // Worker source is inlined at build time via Rollup
-    // In development, import the worker as a module URL
-    const workerUrl = new URL('./worker/demux-worker.ts', import.meta.url);
-    return new Worker(workerUrl, { type: 'module' });
+    const workerUrl = new URL('./demux-worker.js', import.meta.url);
+    return new Worker(workerUrl);
   }
 
   private async onWorkerMessage(event: WorkerEvent): Promise<void> {
