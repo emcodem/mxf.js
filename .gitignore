@@ -1,9 +1,6 @@
 # dependencies
 node_modules/
 
-# build output
-dist/
-
 # generated debug artifacts (test/e2e/debug.html + yuv-debug.test.ts)
 debug-*.png
 
