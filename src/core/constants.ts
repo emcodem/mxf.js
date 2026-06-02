@@ -14,8 +14,13 @@
 // ── Bootstrap / metadata read windows (mxf-file.ts) ──────────────────────────
 /** Initial read to grab the header Partition Pack (its KLV length is read from this). */
 export const PARTITION_PACK_READ_SIZE = 512;
-/** Tail window read to locate the Random Index Pack at end-of-file. */
-export const TAIL_READ_SIZE = 65536;
+/** Tail window read to locate the Random Index Pack and footer index at end-of-file.
+ *  2 MB covers the RIP + footer partition pack + per-frame VBE index for clips up to ~190 000 frames
+ *  (11 bytes/entry × 190 000 ≈ 2 MB), so one read usually covers both — avoiding a second seek to
+ *  the end of a large file on a slow network share. */
+export const TAIL_READ_SIZE = 2 * 1024 * 1024;
+/** Hard cap on how much to read for the footer when it precedes the tail window (very large index). */
+export const FOOTER_READ_MAX = 4 * 1024 * 1024;
 /** Minimum header-metadata read when headerByteCount is present (encoders often understate it). */
 export const HEADER_METADATA_MIN_READ = 1024 * 1024;
 /** Header-metadata read when headerByteCount is absent/zero. */

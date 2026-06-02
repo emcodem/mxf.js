@@ -16,6 +16,7 @@ import {
 import {
   PARTITION_PACK_READ_SIZE,
   TAIL_READ_SIZE,
+  FOOTER_READ_MAX,
   HEADER_METADATA_MIN_READ,
   HEADER_METADATA_FALLBACK_READ,
   ESSENCE_SCAN_WINDOW,
@@ -404,7 +405,10 @@ export class MxfFile {
   private async fetchIndexSegments(footerOffset: bigint, fileSize: number): Promise<IndexTableSegment[]> {
     const footerStart = Number(footerOffset);
     if (footerStart <= 0 || footerStart >= fileSize) return [];
-    const footerBuf = await this.loader.fetchRange(footerStart, fileSize - 1, 'bootstrap: footer index table');
+    // Cap the read: never fetch more than FOOTER_READ_MAX bytes regardless of what footerPartition
+    // says (a wrong/small footerPartition offset would otherwise read almost the entire file).
+    const readEnd = Math.min(fileSize - 1, footerStart + FOOTER_READ_MAX - 1);
+    const footerBuf = await this.loader.fetchRange(footerStart, readEnd, 'bootstrap: footer index table');
     return this.parseFooterIndexSegments(footerBuf);
   }
 

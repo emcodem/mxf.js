@@ -41,8 +41,14 @@ export class Mp4Fragmenter {
     const pd = this.metadata.pictureDescriptor;
     const sd = this.metadata.soundDescriptor;
 
-    const frameRateNum = pd?.frameRateNumerator ?? this.metadata.editRateNumerator;
-    const frameRateDen = pd?.frameRateDenominator ?? this.metadata.editRateDenominator;
+    // Always derive frameDurationTicks from the track edit rate, NOT the picture descriptor's
+    // SampleRate (tag 0x3001). For interlaced content the descriptor often stores the field rate
+    // (e.g. 50/1 for 1080i50) while the edit rate is the frame rate (25/1). The edit unit counter
+    // increments once per coded AU (= per frame), so baseTime = editUnit * frameDurationTicks is
+    // only correct when frameDurationTicks is computed from the edit rate. Using the field rate
+    // halves every timestamp → video plays at 2× speed until a seek re-anchors currentTime.
+    const frameRateNum = this.metadata.editRateNumerator;
+    const frameRateDen = this.metadata.editRateDenominator;
 
     const videoTimescale = 90000; // standard 90 kHz
     const frameDurationTicks = Math.round(videoTimescale * frameRateDen / frameRateNum);
