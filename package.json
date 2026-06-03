@@ -14,6 +14,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:e2e:latency": "vitest run --config vitest.e2e.config.ts test/e2e/latency.test.ts",
+    "serve:range": "node scripts/range-server.mjs --dir C:\\temp\\mxf.js --port 8000 --latency 0",
+    "serve:range:50": "node scripts/range-server.mjs --dir C:\\temp\\mxf.js --port 8000 --latency 50",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

@@ -69,6 +69,11 @@
     let player = null;
     let seeking = false;
 
+    // E2E test hook: enabled only with ?e2e=1. Exposes the player and a high-res event log so the
+    // latency/perf tests can drive the player directly and timestamp manifest/timeupdate/buffering
+    // events. Completely inert (no globals set) during normal use.
+    const E2E = new URLSearchParams(location.search).has('e2e');
+
     // Build one checkbox per source audio channel. Checked channels are played (mixed to stereo);
     // default is the first pair (1 + 2). Any change pushes the new selection to the player.
     function buildChannelSelector(channelCount, activeChannels) {
@@ -160,6 +165,17 @@
         log(`Audio: ${channelCount} channel(s); playing ${activeChannels.map(c => c + 1).join(', ')}`);
         buildChannelSelector(channelCount, activeChannels);
       });
+
+      if (E2E) {
+        window.__mxfPlayer = player;
+        const ev = (window.__mxfEvents ??= []);
+        const stamp = (name, detail) => ev.push({ name, t: performance.now(), detail });
+        player.on('manifest',   d => stamp('manifest',   { duration: d.duration, indexMode: d.indexMode, longGop: d.longGop }));
+        player.on('timeupdate', d => stamp('timeupdate', { currentTime: d.currentTime }));
+        player.on('buffering',  d => stamp('buffering',  { bufferedSeconds: d.bufferedSeconds }));
+        player.on('error',      d => stamp('error', d));
+        window.__mxfReset = () => { window.__mxfEvents.length = 0; };
+      }
     }
 
     playBtn.addEventListener('click', () => {
