@@ -62,6 +62,39 @@ describe('KLVIterator', () => {
     expect(iter.next()).toBeNull();
   });
 
+  it('resync recovers the next valid KLV after a malformed one', () => {
+    // a (valid) | corrupt KLV claiming a huge length | b (valid). next() returns null on the
+    // corrupt packet; resync() must skip it and land on b.
+    const a = makeKLV(0x01, new Uint8Array([0xaa]));
+    const corruptKey = new Uint8Array(16);
+    corruptKey[0] = 0x06; corruptKey[1] = 0x0e; corruptKey[2] = 0x2b; corruptKey[3] = 0x34;
+    const corrupt = new Uint8Array([...corruptKey, 0x84, 0x7f, 0xff, 0xff, 0xff]); // length ~2GB, no value
+    const b = makeKLV(0x02, new Uint8Array([0xbb, 0xcc]));
+    const buf = new Uint8Array(a.length + corrupt.length + b.length);
+    buf.set(a, 0);
+    buf.set(corrupt, a.length);
+    buf.set(b, a.length + corrupt.length);
+
+    const iter = new KLVIterator(buf.buffer);
+    expect(iter.next()!.valueLength).toBe(1);   // a
+    expect(iter.next()).toBeNull();              // corrupt → null, pos not advanced
+    expect(iter.resync()).toBe(true);            // skip forward to b
+    const pktB = iter.next()!;
+    expect(pktB.valueLength).toBe(2);            // recovered b
+    expect(pktB.key[4]).toBe(0x02);
+  });
+
+  it('resync returns false when no further valid key exists', () => {
+    const a = makeKLV(0x01, new Uint8Array([0xaa]));
+    const trailing = new Uint8Array([0x06, 0x0e, 0x2b, 0x34, 0x00]); // looks like a key start, too short
+    const buf = new Uint8Array(a.length + trailing.length);
+    buf.set(a, 0);
+    buf.set(trailing, a.length);
+    const iter = new KLVIterator(buf.buffer);
+    iter.next(); // a
+    expect(iter.resync()).toBe(false);
+  });
+
   it('skipRunIn finds 06 0E 2B 34 key after garbage bytes', () => {
     const garbage = new Uint8Array([0x00, 0x00, 0x00, 0x01, 0xff, 0xfe]);
     const klv = makeKLV(0x01, new Uint8Array([0x42]));

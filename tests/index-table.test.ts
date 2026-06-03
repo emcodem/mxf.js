@@ -2,8 +2,10 @@ import { describe, it, expect } from 'vitest';
 import {
   parseIndexTableSegment, resolveFrameOffset, resolveExactFrameOffset, gopLengthFromKeyframe,
   findCbgSegment, resolveCbgFrameOffset, classifyIndexMode,
+  segUsesPredictionFlags, isKeyframeEntry, resolveEntryMeta,
+  findKeyframeFloor, findKeyframeCeil, longGopGopLength, resolveLongGopKeyframe,
 } from '../src/parser/index-table.js';
-import type { IndexTableSegment } from '../src/parser/index-table.js';
+import type { IndexTableSegment, IndexEntry } from '../src/parser/index-table.js';
 
 /** Build an IndexTableSegment with sensible defaults; override per-test. */
 function makeSegment(opts: Partial<IndexTableSegment> = {}): IndexTableSegment {
@@ -267,5 +269,76 @@ describe('classifyIndexMode', () => {
   it('ignores a VBE segment for a different essence stream', () => {
     const audioVbe = makeSegment({ ...vbe, bodySID: 2 });
     expect(classifyIndexMode([audioVbe], 1)).toBe('none');
+  });
+});
+
+describe('long-GOP keyframe predicate + helpers', () => {
+  // A ffmpeg-style VBE GOP of 12: keyframe at 0 and 12. Prediction bits (0x30) are populated, and
+  // the legacy random-access bit (0x80) is set on the keyframes — i.e. INVERTED, so the legacy test
+  // would mis-detect every frame. The auto-detecting predicate must use the 0x30 bits instead.
+  function entry(flags: number, streamOffset: bigint, temporalOffset = 0): IndexEntry {
+    return { temporalOffset, keyFrameOffset: 0, flags, streamOffset };
+  }
+  function ffmpegGop(): IndexTableSegment {
+    const entries: IndexEntry[] = [];
+    for (let i = 0; i < 24; i++) {
+      const isKf = i % 12 === 0;
+      // keyframe: 0x80 set (legacy inverted), 0x30 clear. predicted: 0x10 (P) / 0x30 not all clear.
+      entries.push(entry(isKf ? 0x80 : 0x10, BigInt(i * 1000)));
+    }
+    return makeSegment({ bodySID: 1, indexStartPosition: 0n, indexDuration: 24n, entries });
+  }
+
+  it('detects prediction-bit usage and inverts the keyframe test accordingly', () => {
+    const seg = ffmpegGop();
+    expect(segUsesPredictionFlags(seg)).toBe(true);
+    expect(isKeyframeEntry(seg, seg.entries[0])).toBe(true);   // 0x80 set but 0x30 clear → keyframe
+    expect(isKeyframeEntry(seg, seg.entries[1])).toBe(false);  // 0x10 → predicted
+    expect(isKeyframeEntry(seg, seg.entries[12])).toBe(true);
+  });
+
+  it('falls back to the legacy 0x80 test when no prediction bits are present', () => {
+    const seg = makeSegment({
+      bodySID: 1, indexStartPosition: 0n, indexDuration: 3n,
+      entries: [entry(0x00, 0n), entry(0x80, 100n), entry(0x80, 200n)],
+    });
+    expect(segUsesPredictionFlags(seg)).toBe(false);
+    expect(isKeyframeEntry(seg, seg.entries[0])).toBe(true);  // 0x80 clear → keyframe (legacy)
+    expect(isKeyframeEntry(seg, seg.entries[1])).toBe(false);
+  });
+
+  it('resolveEntryMeta returns per-frame temporalOffset / flags / isKeyframe', () => {
+    const seg = ffmpegGop();
+    const m0 = resolveEntryMeta([seg], 0n, 1)!;
+    expect(m0.isKeyframe).toBe(true);
+    const m5 = resolveEntryMeta([seg], 5n, 1)!;
+    expect(m5.isKeyframe).toBe(false);
+    expect(m5.flags).toBe(0x10);
+    expect(resolveEntryMeta([seg], 99n, 1)).toBeNull(); // out of range
+  });
+
+  it('findKeyframeFloor / findKeyframeCeil snap to GOP boundaries', () => {
+    const seg = [ffmpegGop()];
+    expect(findKeyframeFloor(seg, 5n, 1)).toBe(0n);
+    expect(findKeyframeFloor(seg, 12n, 1)).toBe(12n);
+    expect(findKeyframeFloor(seg, 13n, 1)).toBe(12n);
+    expect(findKeyframeCeil(seg, 0n, 1)).toBe(0n);
+    expect(findKeyframeCeil(seg, 5n, 1)).toBe(12n);
+    expect(findKeyframeCeil(seg, 12n, 1)).toBe(12n);
+  });
+
+  it('longGopGopLength measures the distance to the next keyframe', () => {
+    expect(longGopGopLength([ffmpegGop()], 0n, 1)).toBe(12);
+    expect(longGopGopLength([ffmpegGop()], 12n, 1)).toBe(12);
+  });
+
+  it('resolveLongGopKeyframe snaps a mid-GOP edit unit back to its keyframe byte offset', () => {
+    const r = resolveLongGopKeyframe([ffmpegGop()], 7n, 1_000_000n, 1)!;
+    expect(r.nearestKeyframeEditUnit).toBe(0n);
+    expect(r.byteOffset).toBe(1_000_000n); // essenceStart + entry[0].streamOffset (0)
+    expect(r.isKeyframe).toBe(true);
+    const r2 = resolveLongGopKeyframe([ffmpegGop()], 13n, 0n, 1)!;
+    expect(r2.nearestKeyframeEditUnit).toBe(12n);
+    expect(r2.byteOffset).toBe(12_000n);
   });
 });

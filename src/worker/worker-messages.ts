@@ -53,6 +53,8 @@ export type WorkerEvent =
       resolvedVideoMode: 'mse' | 'webcodecs';
       /** Seeking strategy this file supports: 'cbg' | 'vbe' | 'none'. */
       indexMode: IndexMode;
+      /** True for H.264 Long-GOP (XAVC-L) streams that need B-frame reorder (PTS/DTS) on fetch. */
+      longGop: boolean;
       /** True PCM output channel count (decoded from the first audio, may exceed descriptor count
        *  for AES3 / separate-mono layouts). 0 if no audio. Lets the UI build a channel selector
        *  at load time rather than waiting for audio to start. */
@@ -72,7 +74,19 @@ export type WorkerEvent =
        *  playhead here to render it — this is what's buffered, not the mid-GOP dragged target. */
       editUnit: number;
     }
-  | { type: 'videoSegment'; data: ArrayBuffer; seq: number; editUnit: number }
+  | {
+      type: 'videoSegment';
+      data: ArrayBuffer;
+      seq: number;
+      editUnit: number;
+      /**
+       * Long-GOP only: the edit unit the next forward fetch should start at. The worker aligns each
+       * Long-GOP fetch to whole GOPs (so per-GOP POC ranking is complete and segments tile), which
+       * means it may cover more frames than requested; the player adopts this as `nextFetchFrame`
+       * instead of its optimistic `+= frameCount`. Omitted for non-Long-GOP segments.
+       */
+      nextFrame?: number;
+    }
   | { type: 'audioSegment'; data: ArrayBuffer; seq: number; editUnit: number }
   | { type: 'pcmSamples'; samples: Float32Array; editUnit: number; sampleRate: number; channelCount: number }
   | {

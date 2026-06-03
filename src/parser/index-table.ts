@@ -120,6 +120,172 @@ export interface ResolvedOffset {
   byteOffset: bigint;
   isKeyframe: boolean;
   nearestKeyframeEditUnit: bigint;
+  /** Signed DTS offset (edit units) from the index entry, when available (long-GOP Tier-1). */
+  temporalOffset?: number;
+  /** Raw index-entry flags byte, when available. */
+  flags?: number;
+}
+
+/** Per-edit-unit index metadata the long-GOP path needs (reorder + keyframe), from a VBE entry. */
+export interface EntryMeta {
+  temporalOffset: number;
+  flags: number;
+  isKeyframe: boolean;
+}
+
+const predictionFlagCache = new WeakMap<IndexTableSegment, boolean>();
+
+/**
+ * Whether a segment populates the MPEG picture-coding "prediction" bits (flags & 0x30). ffmpeg-style
+ * VBE indexes set these (and leave the legacy random-access bit 0x80 in a form that mis-detects every
+ * frame as a keyframe), so their presence selects the correct keyframe predicate. Memoized per segment.
+ */
+export function segUsesPredictionFlags(seg: IndexTableSegment): boolean {
+  let cached = predictionFlagCache.get(seg);
+  if (cached === undefined) {
+    cached = seg.entries.some(e => (e.flags & 0x30) !== 0);
+    predictionFlagCache.set(seg, cached);
+  }
+  return cached;
+}
+
+/**
+ * Auto-detecting keyframe predicate for a VBE index entry. If the segment populates the prediction
+ * bits (see {@link segUsesPredictionFlags}) a keyframe is one whose picture-coding bits are clear
+ * (`(flags & 0x30) === 0`, i.e. intra-coded); otherwise the legacy random-access test
+ * (`(flags & 0x80) === 0`) is used. This is the predicate the long-GOP path resolves through; the
+ * MPEG-2 / XAVC-Intra sites keep their original `(flags & 0x80) === 0` test untouched.
+ */
+export function isKeyframeEntry(seg: IndexTableSegment, entry: IndexEntry): boolean {
+  if (segUsesPredictionFlags(seg)) return (entry.flags & 0x30) === 0;
+  return (entry.flags & 0x80) === 0;
+}
+
+/**
+ * Find the first segment whose [indexStartPosition, +indexDuration) range covers `editUnit`, with
+ * the entry index within it. Unlike {@link entrySegmentFor} (the long-GOP path) this does NOT filter
+ * by BodySID and does NOT require an entry array — it mirrors the legacy MPEG-2 / AVC-Intra seek
+ * resolvers, which run after their caller has already checked for a CBG segment, and which keep the
+ * legacy `(flags & 0x80) === 0` keyframe test (see CLAUDE.md — intentionally distinct from the
+ * long-GOP auto-detecting predicate).
+ */
+function findCoveringSegment(
+  segments: IndexTableSegment[],
+  editUnit: bigint,
+): { seg: IndexTableSegment; entryIdx: number } | null {
+  for (const seg of segments) {
+    const segEnd = seg.indexStartPosition + seg.indexDuration;
+    if (editUnit < seg.indexStartPosition || editUnit >= segEnd) continue;
+    return { seg, entryIdx: Number(editUnit - seg.indexStartPosition) };
+  }
+  return null;
+}
+
+function entrySegmentFor(
+  segments: IndexTableSegment[],
+  editUnit: bigint,
+  videoBodySID: number,
+): { seg: IndexTableSegment; idx: number } | null {
+  for (const seg of segments) {
+    if (seg.entries.length === 0) continue;
+    if (videoBodySID !== 0 && seg.bodySID !== 0 && seg.bodySID !== videoBodySID) continue;
+    const segEnd = seg.indexStartPosition + seg.indexDuration;
+    if (editUnit < seg.indexStartPosition || editUnit >= segEnd) continue;
+    const idx = Number(editUnit - seg.indexStartPosition);
+    if (idx < 0 || idx >= seg.entries.length) continue;
+    return { seg, idx };
+  }
+  return null;
+}
+
+/** Per-edit-unit reorder + keyframe metadata from the VBE entry array (long-GOP path). */
+export function resolveEntryMeta(
+  segments: IndexTableSegment[],
+  editUnit: bigint,
+  videoBodySID = 0,
+): EntryMeta | null {
+  const hit = entrySegmentFor(segments, editUnit, videoBodySID);
+  if (!hit) return null;
+  const entry = hit.seg.entries[hit.idx];
+  return {
+    temporalOffset: entry.temporalOffset,
+    flags: entry.flags,
+    isKeyframe: isKeyframeEntry(hit.seg, entry),
+  };
+}
+
+/** Largest keyframe edit unit ≤ `editUnit` (long-GOP seek snap), using {@link isKeyframeEntry}. */
+export function findKeyframeFloor(
+  segments: IndexTableSegment[],
+  editUnit: bigint,
+  videoBodySID = 0,
+): bigint | null {
+  const hit = entrySegmentFor(segments, editUnit, videoBodySID);
+  if (!hit) return null;
+  const { seg } = hit;
+  for (let i = hit.idx; i >= 0; i--) {
+    if (isKeyframeEntry(seg, seg.entries[i])) return seg.indexStartPosition + BigInt(i);
+  }
+  return null;
+}
+
+/**
+ * Resolve the preceding-keyframe random-access point for a long-GOP seek: snaps `editUnit` back to
+ * the nearest keyframe (via {@link findKeyframeFloor}) and returns that keyframe's byte offset.
+ * Returns null if no VBE entry segment covers the edit unit (caller falls back to other strategies).
+ */
+export function resolveLongGopKeyframe(
+  segments: IndexTableSegment[],
+  editUnit: bigint,
+  essenceContainerStart: bigint,
+  videoBodySID = 0,
+): ResolvedOffset | null {
+  const kf = findKeyframeFloor(segments, editUnit, videoBodySID);
+  if (kf === null) return null;
+  const hit = entrySegmentFor(segments, kf, videoBodySID);
+  if (!hit) return null;
+  const entry = hit.seg.entries[hit.idx];
+  return {
+    byteOffset: essenceContainerStart + entry.streamOffset,
+    isKeyframe: true,
+    nearestKeyframeEditUnit: kf,
+    temporalOffset: entry.temporalOffset,
+    flags: entry.flags,
+  };
+}
+
+/**
+ * Smallest keyframe edit unit ≥ `editUnit` (long-GOP fetch end-alignment), using {@link isKeyframeEntry}.
+ * Returns the end of the covering segment (indexStartPosition + indexDuration) if no further keyframe
+ * exists — i.e. "fetch to the end". Returns null if no VBE entry segment covers the edit unit.
+ */
+export function findKeyframeCeil(
+  segments: IndexTableSegment[],
+  editUnit: bigint,
+  videoBodySID = 0,
+): bigint | null {
+  const hit = entrySegmentFor(segments, editUnit, videoBodySID);
+  if (!hit) return null;
+  const { seg } = hit;
+  for (let i = hit.idx; i < seg.entries.length; i++) {
+    if (isKeyframeEntry(seg, seg.entries[i])) return seg.indexStartPosition + BigInt(i);
+  }
+  return seg.indexStartPosition + BigInt(seg.entries.length);
+}
+
+/** Long-GOP GOP length: frames from `keyframeEditUnit` to the next keyframe, using {@link isKeyframeEntry}. */
+export function longGopGopLength(
+  segments: IndexTableSegment[],
+  keyframeEditUnit: bigint,
+  videoBodySID = 0,
+): number {
+  const hit = entrySegmentFor(segments, keyframeEditUnit, videoBodySID);
+  if (!hit) return 1;
+  const { seg, idx } = hit;
+  for (let i = idx + 1; i < seg.entries.length; i++) {
+    if (isKeyframeEntry(seg, seg.entries[i])) return i - idx;
+  }
+  return Math.max(1, seg.entries.length - idx);
 }
 
 /**
@@ -196,38 +362,28 @@ export function resolveFrameOffset(
   const cbg = findCbgSegment(segments, videoBodySID);
   if (cbg) return resolveCbgFrameOffset(cbg, editUnit, essenceContainerStart);
 
-  for (const seg of segments) {
-    const segEnd = seg.indexStartPosition + seg.indexDuration;
-    if (editUnit < seg.indexStartPosition || editUnit >= segEnd) continue;
+  const hit = findCoveringSegment(segments, editUnit);
+  if (!hit) return null;
+  const { seg, entryIdx } = hit;
 
-    if (seg.editUnitByteCount > 0) {
-      // Constant byte extent: simple multiplication
-      const offset = BigInt(seg.editUnitByteCount) * (editUnit - seg.indexStartPosition);
-      return {
-        byteOffset: essenceContainerStart + offset,
-        isKeyframe: true,
-        nearestKeyframeEditUnit: editUnit,
-      };
-    }
-
-    const entryIdx = Number(editUnit - seg.indexStartPosition);
-    if (entryIdx >= seg.entries.length) return null;
-
-    const entry = seg.entries[entryIdx];
-    const isKeyframe = (entry.flags & 0x80) === 0; // flag bit 7 set means NOT a keyframe in some variants
-    const kfOffset = entry.keyFrameOffset;
-    const nearestIdx = entryIdx + kfOffset;
-    const nearestEU = seg.indexStartPosition + BigInt(nearestIdx);
-
-    const kfEntry = seg.entries[nearestIdx] ?? entry;
-
-    return {
-      byteOffset: essenceContainerStart + kfEntry.streamOffset,
-      isKeyframe,
-      nearestKeyframeEditUnit: nearestEU,
-    };
+  if (seg.editUnitByteCount > 0) {
+    // Constant byte extent: simple multiplication
+    const offset = BigInt(seg.editUnitByteCount) * (editUnit - seg.indexStartPosition);
+    return { byteOffset: essenceContainerStart + offset, isKeyframe: true, nearestKeyframeEditUnit: editUnit };
   }
-  return null;
+
+  if (entryIdx >= seg.entries.length) return null;
+  const entry = seg.entries[entryIdx];
+  const isKeyframe = (entry.flags & 0x80) === 0; // flag bit 7 set means NOT a keyframe in some variants
+  const nearestIdx = entryIdx + entry.keyFrameOffset;
+  const nearestEU = seg.indexStartPosition + BigInt(nearestIdx);
+  const kfEntry = seg.entries[nearestIdx] ?? entry;
+
+  return {
+    byteOffset: essenceContainerStart + kfEntry.streamOffset,
+    isKeyframe,
+    nearestKeyframeEditUnit: nearestEU,
+  };
 }
 
 /**
@@ -244,21 +400,18 @@ export function gopLengthFromKeyframe(
   segments: IndexTableSegment[],
   keyframeEditUnit: bigint
 ): number {
-  for (const seg of segments) {
-    const segEnd = seg.indexStartPosition + seg.indexDuration;
-    if (keyframeEditUnit < seg.indexStartPosition || keyframeEditUnit >= segEnd) continue;
+  const hit = findCoveringSegment(segments, keyframeEditUnit);
+  if (!hit) return 1;
+  const { seg } = hit;
 
-    if (seg.editUnitByteCount > 0) return 1; // CBE: every edit unit is a keyframe
+  if (seg.editUnitByteCount > 0) return 1; // CBE: every edit unit is a keyframe
 
-    const startIdx = Number(keyframeEditUnit - seg.indexStartPosition);
-    for (let i = startIdx + 1; i < seg.entries.length; i++) {
-      const isKeyframe = (seg.entries[i].flags & 0x80) === 0;
-      if (isKeyframe) return i - startIdx;
-    }
-    // No further keyframe in this segment: hold to the end of the segment.
-    return Math.max(1, seg.entries.length - startIdx);
+  const startIdx = Number(keyframeEditUnit - seg.indexStartPosition);
+  for (let i = startIdx + 1; i < seg.entries.length; i++) {
+    if ((seg.entries[i].flags & 0x80) === 0) return i - startIdx;
   }
-  return 1;
+  // No further keyframe in this segment: hold to the end of the segment.
+  return Math.max(1, seg.entries.length - startIdx);
 }
 
 /**
@@ -277,27 +430,20 @@ export function resolveExactFrameOffset(
   const cbg = findCbgSegment(segments, videoBodySID);
   if (cbg) return resolveCbgFrameOffset(cbg, editUnit, essenceContainerStart);
 
-  for (const seg of segments) {
-    const segEnd = seg.indexStartPosition + seg.indexDuration;
-    if (editUnit < seg.indexStartPosition || editUnit >= segEnd) continue;
+  const hit = findCoveringSegment(segments, editUnit);
+  if (!hit) return null;
+  const { seg, entryIdx } = hit;
 
-    if (seg.editUnitByteCount > 0) {
-      const offset = BigInt(seg.editUnitByteCount) * (editUnit - seg.indexStartPosition);
-      return {
-        byteOffset: essenceContainerStart + offset,
-        isKeyframe: true,
-        nearestKeyframeEditUnit: editUnit,
-      };
-    }
-
-    const entryIdx = Number(editUnit - seg.indexStartPosition);
-    if (entryIdx >= seg.entries.length) return null;
-    const entry = seg.entries[entryIdx];
-    return {
-      byteOffset: essenceContainerStart + entry.streamOffset,
-      isKeyframe: (entry.flags & 0x80) === 0,
-      nearestKeyframeEditUnit: editUnit,
-    };
+  if (seg.editUnitByteCount > 0) {
+    const offset = BigInt(seg.editUnitByteCount) * (editUnit - seg.indexStartPosition);
+    return { byteOffset: essenceContainerStart + offset, isKeyframe: true, nearestKeyframeEditUnit: editUnit };
   }
-  return null;
+
+  if (entryIdx >= seg.entries.length) return null;
+  const entry = seg.entries[entryIdx];
+  return {
+    byteOffset: essenceContainerStart + entry.streamOffset,
+    isKeyframe: (entry.flags & 0x80) === 0,
+    nearestKeyframeEditUnit: editUnit,
+  };
 }

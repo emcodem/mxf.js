@@ -17,6 +17,7 @@ import {
   PARTITION_PACK_READ_SIZE,
   TAIL_READ_SIZE,
   FOOTER_READ_MAX,
+  FOOTER_INDEX_MAX,
   HEADER_METADATA_MIN_READ,
   HEADER_METADATA_FALLBACK_READ,
   ESSENCE_SCAN_WINDOW,
@@ -120,14 +121,7 @@ export class MxfFile {
     // e.g. XAVC, place a CBG index segment in the index region that follows).
     const { essenceStart, bodySID: essenceBodySID, indexSegments: essencePartitionIndex } =
       await this.locateEssence(ripEntries, headerPartition, afterPP + metaSize, fileSize);
-    for (const seg of essencePartitionIndex) {
-      const dup = indexSegments.some(s =>
-        s.bodySID === seg.bodySID && s.indexSID === seg.indexSID &&
-        s.indexStartPosition === seg.indexStartPosition &&
-        s.editUnitByteCount === seg.editUnitByteCount &&
-        s.entries.length === seg.entries.length);
-      if (!dup) indexSegments.push(seg);
-    }
+    this.mergeIndexSegments(indexSegments, essencePartitionIndex);
     if (this.debug) console.log(`[mxf.js] essenceStart=${essenceStart}, essenceBodySID=${essenceBodySID}, +${essencePartitionIndex.length} in-partition index segs`);
 
     // ── Step 5b: Multi-partition VBE index (XDCAM-style OP1a) ──────────────────
@@ -144,12 +138,7 @@ export class MxfFile {
     if (!hasCbg && hasVbeEntries && ripEntries.some(e => e.bodySID > 0)) {
       const { partitions, segments } = await this.collectMultiPartitionIndex(ripEntries, fileSize);
       if (partitions.length > 0) {
-        for (const seg of segments) {
-          const dup = indexSegments.some(s =>
-            s.bodySID === seg.bodySID && s.indexSID === seg.indexSID &&
-            s.indexStartPosition === seg.indexStartPosition && s.entries.length === seg.entries.length);
-          if (!dup) indexSegments.push(seg);
-        }
+        this.mergeIndexSegments(indexSegments, segments);
         // For a stream offset SO, find the body partition whose essence it falls in (largest
         // bodyOffset ≤ SO) and map: fileOffset = partition.essenceFileStart + (SO − bodyOffset).
         // Expressed relative to essenceStart so the resolver's `essenceStart + streamOffset` is
@@ -319,12 +308,28 @@ export class MxfFile {
     }
   }
 
+  /** Append `source` index segments to `target`, skipping any structural duplicate already present. */
+  private mergeIndexSegments(target: IndexTableSegment[], source: IndexTableSegment[]): void {
+    for (const seg of source) {
+      const dup = target.some(s =>
+        s.bodySID === seg.bodySID && s.indexSID === seg.indexSID &&
+        s.indexStartPosition === seg.indexStartPosition &&
+        s.editUnitByteCount === seg.editUnitByteCount &&
+        s.entries.length === seg.entries.length);
+      if (!dup) target.push(seg);
+    }
+  }
+
   private scanBufferForIndexSegments(buffer: ArrayBuffer, startOffset: number): IndexTableSegment[] {
     const segments: IndexTableSegment[] = [];
     const iter = new KLVIterator(buffer, startOffset);
     while (iter.hasMore()) {
       const pkt = iter.next();
-      if (!pkt) break;
+      if (!pkt) {
+        // Resync past a malformed KLV so one bad packet doesn't hide index segments after it.
+        if (iter.resync()) continue;
+        break;
+      }
       if (isIndexTableSegment(pkt.key)) {
         try {
           segments.push(parseIndexTableSegment(buffer, pkt));
@@ -405,11 +410,42 @@ export class MxfFile {
   private async fetchIndexSegments(footerOffset: bigint, fileSize: number): Promise<IndexTableSegment[]> {
     const footerStart = Number(footerOffset);
     if (footerStart <= 0 || footerStart >= fileSize) return [];
-    // Cap the read: never fetch more than FOOTER_READ_MAX bytes regardless of what footerPartition
-    // says (a wrong/small footerPartition offset would otherwise read almost the entire file).
-    const readEnd = Math.min(fileSize - 1, footerStart + FOOTER_READ_MAX - 1);
-    const footerBuf = await this.loader.fetchRange(footerStart, readEnd, 'bootstrap: footer index table');
-    return this.parseFooterIndexSegments(footerBuf);
+
+    // First read enough to parse the footer partition pack, so we can honour its declared
+    // indexByteCount. A long VBE index (≈11 bytes/frame) easily exceeds a fixed window; reading too
+    // little used to make readKLV throw on the over-long segment, which dropped the index entirely
+    // and forced indexMode 'none' (no seeking) on long programmes.
+    const headEnd = Math.min(fileSize - 1, footerStart + FOOTER_READ_MAX - 1);
+    const headBuf = await this.loader.fetchRange(footerStart, headEnd, 'bootstrap: footer partition pack');
+
+    let indexRegionStart = -1;
+    let indexLen = 0;
+    try {
+      const ppStart = KLVIterator.skipRunIn(headBuf);
+      const pp = parsePartitionPack(headBuf, footerStart);
+      const afterPP = ppStart + readKLV(headBuf, ppStart).totalLength;
+      // Index region follows the (usually empty) footer header metadata.
+      indexRegionStart = footerStart + afterPP + Number(pp.headerByteCount);
+      indexLen = Number(pp.indexByteCount);
+    } catch { /* not a parseable PP — fall back to scanning the head window below */ }
+
+    // If the partition pack declares an index region that overflows the head window, read exactly
+    // that region (bounded by FOOTER_INDEX_MAX as a corruption guard) and scan it.
+    if (indexLen > 0 && indexRegionStart >= 0) {
+      const start = indexRegionStart;
+      const end = Math.min(fileSize - 1, start + Math.min(indexLen, FOOTER_INDEX_MAX) - 1);
+      if (start < fileSize && end >= start) {
+        // Reuse the head buffer if it already covers the whole index region (no second read needed).
+        if (start >= footerStart && end <= headEnd) {
+          return this.scanBufferForIndexSegments(headBuf.slice(start - footerStart, end - footerStart + 1), 0);
+        }
+        const idxBuf = await this.loader.fetchRange(start, end, 'bootstrap: footer index table');
+        return this.scanBufferForIndexSegments(idxBuf, 0);
+      }
+    }
+
+    // No usable indexByteCount: scan whatever we read after the partition pack (legacy behaviour).
+    return this.parseFooterIndexSegments(headBuf);
   }
 
   getBootstrap(): MxfBootstrap | null {

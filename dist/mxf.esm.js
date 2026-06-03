@@ -190,7 +190,7 @@ class S extends v {
     this.video.src = "", this.mediaSource = null, this.sourceBuffers.clear(), this.queues.clear(), this.removeAllListeners();
   }
 }
-class T {
+class F {
   constructor(e, t) {
     this.video = e, this.onAudioInfo = t, this.cxt = null, this.startTime = null, this.channelCount = 0, this.active = [0, 1], this.scheduled = [], this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
@@ -324,7 +324,7 @@ class T {
     this.scheduled = e;
   }
 }
-class B {
+class T {
   constructor(e, t, s) {
     this.video = e, this.requestPreview = t, this.settle = s, this.active = !1, this.cycle = 0, this.latestFrame = null, this.seq = 0, this.watchdog = null, this.wasPlaying = !1, this.suppressSeeking = !1, this.hasStream = !1, this.duration = 0, this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
@@ -410,7 +410,7 @@ class B {
     this.watchdog !== null && (clearTimeout(this.watchdog), this.watchdog = null);
   }
 }
-const F = {
+const B = {
   startBufferSeconds: 10,
   maxBufferSeconds: 30,
   pcmAudioMode: "auto",
@@ -419,7 +419,7 @@ const F = {
 };
 class y extends v {
   constructor(e, t = {}) {
-    super(), this.worker = null, this.mseController = null, this.manifest = null, this.nextFetchFrame = 0, this.framesPerChunk = 50, this.fetchPending = !1, this.bufferFull = !1, this.editRateNumerator = 25, this.editRateDenominator = 1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.video = e, this.config = { ...F, ...t }, this.audio = new T(this.video, (s) => this.emit("audio-info", s)), this.scrub = new B(
+    super(), this.worker = null, this.mseController = null, this.manifest = null, this.nextFetchFrame = 0, this.framesPerChunk = 50, this.fetchPending = !1, this.bufferFull = !1, this.editRateNumerator = 25, this.editRateDenominator = 1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.video = e, this.config = { ...B, ...t }, this.audio = new F(this.video, (s) => this.emit("audio-info", s)), this.scrub = new T(
       this.video,
       (s, i) => {
         var r;
@@ -477,7 +477,7 @@ class y extends v {
    * kicks the single-flight preview pump; does NOT touch video.currentTime (see beginScrub()).
    */
   scrubTo(e) {
-    this.scrub.scrubTo(e);
+    this.indexMode !== "none" && this.scrub.scrubTo(e);
   }
   /**
    * Leave scrub mode and settle on an accurate frame at `timeSeconds` (the released position):
@@ -549,7 +549,7 @@ class y extends v {
         (t = this.mseController) != null && t.hasVideoBuffer() || (s = this.mseController) != null && s.hasAudioBuffer() ? (this.mseController.appendSegment("video", e.data), this.mseController.appendSegment("audio", e.data), this.fetchNextChunk()) : this.pendingInitSegment = e.data;
         break;
       case "videoSegment":
-        (i = this.mseController) == null || i.appendSegment("video", e.data);
+        (i = this.mseController) == null || i.appendSegment("video", e.data), e.nextFrame !== void 0 && !this.scrub.isActive && !this.previewParked && (this.nextFetchFrame = e.nextFrame);
         break;
       case "audioSegment":
         (r = this.mseController) == null || r.appendSegment("audio", e.data);
@@ -603,7 +603,8 @@ class y extends v {
       tracks: e.tracks,
       pictureDescriptor: t,
       soundDescriptor: s,
-      indexMode: e.indexMode
+      indexMode: e.indexMode,
+      longGop: e.longGop
     };
     const r = e.resolvedVideoCodec ?? (t == null ? void 0 : t.codec) ?? "unknown", n = t && e.videoCodecSupported ? S.getMimeType("video", r) : null;
     let a = s ? S.getMimeType("audio", s.codec) : null;

@@ -11,6 +11,8 @@ export interface ManifestData {
   soundDescriptor: SoundDescriptor | null;
   /** Seeking strategy this file supports: 'cbg' | 'vbe' | 'none'. */
   indexMode: IndexMode;
+  /** True for H.264 Long-GOP (XAVC-L) streams (B-frame reorder applied on fetch). */
+  longGop: boolean;
 }
 
 export interface MxfPlayerEvents {

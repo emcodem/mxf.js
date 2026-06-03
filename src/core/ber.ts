@@ -12,12 +12,17 @@ export function decodeBerLength(view: DataView, offset: number): BerLength {
   if (numBytes === 0) {
     throw new Error('Indefinite BER length not supported');
   }
-  if (numBytes > 6) {
+  // SMPTE long-form BER is up to 8 bytes. We accumulate in a JS number (safe to 2^53), so guard
+  // against a length that would exceed that — any such value is corrupt for our purposes anyway.
+  if (numBytes > 8) {
     throw new Error(`BER length too large: ${numBytes} bytes`);
   }
   let length = 0;
   for (let i = 0; i < numBytes; i++) {
     length = (length * 256) + view.getUint8(offset + 1 + i);
+  }
+  if (!Number.isSafeInteger(length)) {
+    throw new Error(`BER length exceeds safe integer range: ${length}`);
   }
   return { length, bytesRead: 1 + numBytes };
 }

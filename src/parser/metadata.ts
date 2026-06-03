@@ -69,6 +69,40 @@ const DD_PICTURE  = cls(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x01,0x01,0x03,0x02,0
 const DD_SOUND    = cls(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x01,0x01,0x03,0x02,0x02,0x02,0x00,0x00,0x00);
 const DD_TIMECODE = cls(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x01,0x01,0x03,0x02,0x01,0x01,0x00,0x00,0x00);
 
+// ── Dynamic local-tag aliasing (Primer Pack) ──────────────────────────────────
+// MXF local tags below 0x8000 are statically registered, and the standard items this parser reads
+// (StoredWidth, ChannelCount, …) always use their static tags — so for conformant files the Primer
+// is informational. A file MAY instead assign a DYNAMIC tag (0x8000+) to an item, resolvable only
+// through the Primer's tag→UL map. This table aliases such a UL back to the canonical static tag we
+// read. It is intentionally empty until validated against a real dynamic-tag file (shipping
+// speculative ULs would risk mis-aliasing); the mechanism + plumbing are in place and tested so
+// adding an entry is a one-liner. See remapDynamicTags.
+interface DynamicTagAlias { ul: Uint8Array; tag: number; }
+const DYNAMIC_TAG_ALIASES: DynamicTagAlias[] = [];
+
+/**
+ * Resolve dynamic local tags (0x8000+) in a parsed set to the canonical static tags this parser
+ * understands, using the Primer's tag→UL map. No-op for the common case (canonical tag already
+ * present, or no dynamic tags / no aliases). Exported for direct testing.
+ */
+export function remapDynamicTags(
+  items: Map<number, Uint8Array>,
+  primer: PrimerPack,
+  aliases: DynamicTagAlias[] = DYNAMIC_TAG_ALIASES,
+): void {
+  if (aliases.length === 0 || primer.size === 0) return;
+  for (const alias of aliases) {
+    if (items.has(alias.tag)) continue; // canonical tag already present — nothing to alias
+    for (const [tag, ul] of primer) {
+      if (tag < 0x8000) continue;        // only dynamic tags need Primer resolution
+      if (bytesEqual(ul, alias.ul) && items.has(tag)) {
+        items.set(alias.tag, items.get(tag)!);
+        break;
+      }
+    }
+  }
+}
+
 // ── Raw set representation ────────────────────────────────────────────────────
 interface RawSet {
   classUL: Uint8Array;
@@ -95,7 +129,7 @@ export function parseHeaderMetadata(
   buffer: ArrayBuffer,
   metadataOffset: number,
   metadataLength: number,
-  _primer: PrimerPack,
+  primer: PrimerPack,
   debug = false
 ): MxfMetadata {
   const iter = new KLVIterator(buffer, metadataOffset);
@@ -105,7 +139,13 @@ export function parseHeaderMetadata(
 
   while (iter.offset < end && iter.hasMore()) {
     const pkt = iter.next();
-    if (!pkt) break;
+    if (!pkt) {
+      // A malformed set in the middle of the metadata must not silently truncate everything after
+      // it (a broken file may still carry a usable picture/sound descriptor further on). Try to
+      // resync to the next valid KLV; only stop if none remains.
+      if (iter.resync()) continue;
+      break;
+    }
 
     const k = pkt.key;
     // Skip KLV fill (06 0E 2B 34 01 01 01 02 03 01 02 10 …) that may sit between/after sets.
@@ -119,6 +159,7 @@ export function parseHeaderMetadata(
     if (k[8] === 0x0d && k[9] === 0x01 && k[10] !== 0x01) break;
 
     const localItems = parseLocalTagItems(buffer, pkt.valueOffset, pkt.valueLength);
+    remapDynamicTags(localItems, primer); // resolve any dynamic local tags to canonical ones
     const instanceUID = localItems.get(TAG_INSTANCE_UID) ?? new Uint8Array(16);
     const classUL = new Uint8Array(pkt.key);
 

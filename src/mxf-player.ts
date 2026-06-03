@@ -161,6 +161,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    * kicks the single-flight preview pump; does NOT touch video.currentTime (see beginScrub()).
    */
   scrubTo(timeSeconds: number): void {
+    // Indexless (Tier-3 'none') files have no keyframe map to resolve a fast preview against, so
+    // live scrub previews are disabled — endScrub() still settles accurately at the released
+    // position (a normal, possibly slow, seek). Skip arming the single-flight preview pump.
+    if (this.indexMode === 'none') return;
     this.scrub.scrubTo(timeSeconds);
   }
 
@@ -259,6 +263,11 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
       case 'videoSegment':
         this.mseController?.appendSegment('video', event.data);
+        // Long-GOP fetches are GOP-aligned and may cover more frames than requested; adopt the
+        // worker's reported next start so forward fetches stay keyframe-aligned and tile exactly.
+        if (event.nextFrame !== undefined && !this.scrub.isActive && !this.previewParked) {
+          this.nextFetchFrame = event.nextFrame;
+        }
         break;
 
       case 'audioSegment':
@@ -347,6 +356,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       pictureDescriptor: pd,
       soundDescriptor: sd,
       indexMode: event.indexMode,
+      longGop: event.longGop,
     };
 
     // Use the resolved output codec for the MIME type (e.g. 'h264' for transcoded MPEG-2).

@@ -57,12 +57,17 @@ export function parsePartitionPack(buffer: ArrayBuffer, bufferFileOffset: number
   const bodySID = r.readU32BE();
   const operationalPattern = r.readBytesCopy(16);
 
-  // Essence containers: batch array (4-byte count, 4-byte item length, then N*16 byte ULs)
+  // Essence containers: batch array (4-byte count, 4-byte item length, then N*16 byte ULs).
+  // Bounded against the KLV value length: a corrupt count/itemLen must not loop into the next
+  // packet or spin allocating (an itemLen of 0 would otherwise iterate `ecCount` times for nothing).
   const ecCount = r.readU32BE();
   const ecItemLen = r.readU32BE();
+  const ecValueEnd = klv.valueOffset + klv.valueLength;
   const essenceContainers: Uint8Array[] = [];
-  for (let i = 0; i < ecCount; i++) {
-    essenceContainers.push(r.readBytesCopy(ecItemLen));
+  if (ecItemLen > 0) {
+    for (let i = 0; i < ecCount && r.offset + ecItemLen <= ecValueEnd; i++) {
+      essenceContainers.push(r.readBytesCopy(ecItemLen));
+    }
   }
 
   return {

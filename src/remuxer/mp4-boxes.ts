@@ -172,26 +172,33 @@ export function stco(): Uint8Array {
   return fullBox('stco', 0, 0, u32BE(0));
 }
 
-// avcC — AVC decoder configuration record
-export function avcC(sps: Uint8Array, pps: Uint8Array): Uint8Array {
-  const inner = new Uint8Array([
-    1,           // configurationVersion
-    sps[1],      // AVCProfileIndication
-    sps[2],      // profile_compatibility
-    sps[3],      // AVCLevelIndication
-    0xff,        // lengthSizeMinusOne=3 (4 bytes)
-    0xe1,        // numSPS=1
-    (sps.length >> 8) & 0xff, sps.length & 0xff,
-    ...sps,
-    0x01,        // numPPS=1
-    (pps.length >> 8) & 0xff, pps.length & 0xff,
-    ...pps,
-  ]);
-  return box('avcC', inner);
+// avcC — AVC decoder configuration record. Accepts one or more SPS and one or more PPS: a stream
+// whose slices reference a second PPS (common) decodes correctly only if every PPS is present here.
+export function avcC(spsList: Uint8Array[], ppsList: Uint8Array[]): Uint8Array {
+  if (spsList.length === 0 || ppsList.length === 0) {
+    throw new Error('avcC requires at least one SPS and one PPS');
+  }
+  const sps0 = spsList[0];
+  const parts: number[] = [
+    1,                          // configurationVersion
+    sps0[1],                    // AVCProfileIndication
+    sps0[2],                    // profile_compatibility
+    sps0[3],                    // AVCLevelIndication
+    0xff,                       // reserved(6 bits)=1 | lengthSizeMinusOne=3 (4-byte NALU lengths)
+    0xe0 | (spsList.length & 0x1f), // reserved(3 bits)=1 | numOfSequenceParameterSets
+  ];
+  for (const sps of spsList) {
+    parts.push((sps.length >> 8) & 0xff, sps.length & 0xff, ...sps);
+  }
+  parts.push(ppsList.length & 0xff); // numOfPictureParameterSets
+  for (const pps of ppsList) {
+    parts.push((pps.length >> 8) & 0xff, pps.length & 0xff, ...pps);
+  }
+  return box('avcC', new Uint8Array(parts));
 }
 
 // avc1 — AVC sample entry
-export function avc1(width: number, height: number, spsNALU: Uint8Array, ppsNALU: Uint8Array): Uint8Array {
+export function avc1(width: number, height: number, spsList: Uint8Array[], ppsList: Uint8Array[]): Uint8Array {
   return box('avc1',
     new Uint8Array(6),      // reserved
     u16BE(1),               // data reference index
@@ -205,7 +212,7 @@ export function avc1(width: number, height: number, spsNALU: Uint8Array, ppsNALU
     new Uint8Array(32),     // compressorname
     u16BE(0x0018),          // depth
     u16BE(0xffff),          // pre-defined = int(16) -1
-    avcC(spsNALU, ppsNALU),
+    avcC(spsList, ppsList),
   );
 }
 

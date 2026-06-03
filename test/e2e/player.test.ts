@@ -35,7 +35,7 @@ beforeAll(async () => {
   await vite.listen();
 
   browser = await puppeteer.launch({
-    headless: true,
+    headless: false,
     executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
     args: [
       '--no-sandbox',

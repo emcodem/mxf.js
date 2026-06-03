@@ -26,8 +26,8 @@ export interface FragmenterConfig {
 export class Mp4Fragmenter {
   private readonly metadata: MxfMetadata;
   private config: FragmenterConfig | null = null;
-  private spsNALU: Uint8Array | null = null;
-  private ppsNALU: Uint8Array | null = null;
+  private spsNALUs: Uint8Array[] = [];
+  private ppsNALUs: Uint8Array[] = [];
   private seqNum = 0;
   private videoCodec: 'h264' | 'mpeg2' | 'unknown' = 'unknown';
   private transcodeWidth = 0;
@@ -80,14 +80,14 @@ export class Mp4Fragmenter {
       // the SPS, or its MSE stream parser rejects the init segment. The MXF descriptor often
       // stores per-field height for interlaced AVC-Intra (e.g. 544 for a 1088-line MBAFF frame),
       // so prefer the SPS-derived coded dimensions when available.
-      if (this.videoCodec === 'h264' && this.spsNALU && !this.transcodeWidth) {
-        const dims = parseSPSCodedDimensions(this.spsNALU);
+      if (this.videoCodec === 'h264' && this.spsNALUs.length > 0 && !this.transcodeWidth) {
+        const dims = parseSPSCodedDimensions(this.spsNALUs[0]);
         if (dims) { w = dims.width; h = dims.height; }
       }
 
       let codecBox: Uint8Array;
       if (this.videoCodec === 'h264') {
-        if (!this.spsNALU || !this.ppsNALU) {
+        if (this.spsNALUs.length === 0 || this.ppsNALUs.length === 0) {
           // No SPS/PPS means we cannot build a correct avc1/avcC box. This used to silently emit a
           // hardcoded 1920×1080 High@4.0 SPS, which produced a WRONG-SIZED init segment for any
           // other resolution/profile — Chrome's MSE parser then rejected it (or, worse, mis-sized
@@ -95,7 +95,7 @@ export class Mp4Fragmenter {
           // first keyframe; surface that it couldn't rather than guessing.
           throw new Error('Cannot build H.264 init segment: SPS/PPS unavailable (extraction from the first keyframe failed)');
         }
-        codecBox = avc1(w, h, this.spsNALU, this.ppsNALU);
+        codecBox = avc1(w, h, this.spsNALUs, this.ppsNALUs);
       } else {
         codecBox = mp4v(w, h);
       }
@@ -164,12 +164,13 @@ export class Mp4Fragmenter {
       if (_codec === 'h264') {
         data = isAnnexB(frame.data) ? annexBtoAVCC(frame.data) : frame.data;
 
-        // Extract SPS/PPS from first keyframe if not yet found
-        if (!this.spsNALU && frame.isKeyframe) {
+        // Extract SPS/PPS from first keyframe if not yet found (keep ALL PPS — slices may reference
+        // a non-first one).
+        if (this.spsNALUs.length === 0 && frame.isKeyframe) {
           const { sps, pps } = extractSPSPPS(data);
           if (sps.length > 0 && pps.length > 0) {
-            this.spsNALU = sps[0];
-            this.ppsNALU = pps[0];
+            this.spsNALUs = sps;
+            this.ppsNALUs = pps;
           }
         }
       } else {
@@ -237,17 +238,18 @@ export class Mp4Fragmenter {
     return concat(moofBox, mdatBox);
   }
 
-  setSPSPPS(sps: Uint8Array, pps: Uint8Array): void {
-    this.spsNALU = sps;
-    this.ppsNALU = pps;
+  setSPSPPS(sps: Uint8Array[], pps: Uint8Array[]): void {
+    this.spsNALUs = sps;
+    this.ppsNALUs = pps;
   }
 
   /** Switch to H.264 transcode mode: overrides codec and sets display dimensions from the
-   *  MPEG-2 elementary stream (more reliable than the MXF descriptor stored dimensions). */
+   *  MPEG-2 elementary stream (more reliable than the MXF descriptor stored dimensions). The
+   *  transcoder emits a single SPS/PPS pair. */
   enableTranscodeMode(sps: Uint8Array, pps: Uint8Array, width = 0, height = 0): void {
     this.videoCodec = 'h264';
-    this.spsNALU = sps;
-    this.ppsNALU = pps;
+    this.spsNALUs = [sps];
+    this.ppsNALUs = [pps];
     this.transcodeWidth = width;
     this.transcodeHeight = height;
   }
@@ -298,10 +300,10 @@ export class Mp4Fragmenter {
     return concat(moofBox, mdatBox);
   }
 
-  get hasSPSPPS(): boolean { return this.spsNALU !== null && this.ppsNALU !== null; }
-  get spsPPS(): { sps: Uint8Array; pps: Uint8Array } | null {
-    if (!this.spsNALU || !this.ppsNALU) return null;
-    return { sps: this.spsNALU, pps: this.ppsNALU };
+  get hasSPSPPS(): boolean { return this.spsNALUs.length > 0 && this.ppsNALUs.length > 0; }
+  get spsPPS(): { sps: Uint8Array[]; pps: Uint8Array[] } | null {
+    if (this.spsNALUs.length === 0 || this.ppsNALUs.length === 0) return null;
+    return { sps: this.spsNALUs, pps: this.ppsNALUs };
   }
 }
 

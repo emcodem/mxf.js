@@ -17,7 +17,8 @@ function noRangeError(url: string): Error {
 export class HttpLoader implements ILoader {
   private readonly url: string;
   readonly fileSize: Promise<number>;
-  private abortController: AbortController | null = null;
+  /** Controllers for in-flight reads, so destroy() can abort them all (teardown / new file). */
+  private readonly inflight = new Set<AbortController>();
   private readStats = { count: 0, total: 0 };
 
   constructor(url: string) {
@@ -66,35 +67,46 @@ export class HttpLoader implements ILoader {
     throw new Error(`Server did not report a size for ${this.url} (no Content-Range or Content-Length)`);
   }
 
-  async fetchRange(start: number, end: number, reason = ''): Promise<ArrayBuffer> {
-    this.abortController = new AbortController();
+  async fetchRange(start: number, end: number, reason = '', signal?: AbortSignal): Promise<ArrayBuffer> {
+    // Each read owns a controller (so destroy() can abort it); the caller's signal, when given, is
+    // linked to it so a seek/scrub supersession cancels the underlying fetch instead of letting it
+    // download to completion.
+    const ac = new AbortController();
+    if (signal) {
+      if (signal.aborted) ac.abort();
+      else signal.addEventListener('abort', () => ac.abort(), { once: true });
+    }
+    this.inflight.add(ac);
     const t0 = performance.now();
-    let res: Response;
     try {
-      res = await fetch(this.url, {
-        headers: { Range: `bytes=${start}-${end}` },
-        signal: this.abortController.signal,
-      });
-    } catch (e) {
-      throw new Error(
-        `fetchRange ${start}-${end} on ${this.url} failed: ${e instanceof Error ? e.message : String(e)}`,
-      );
+      let res: Response;
+      try {
+        res = await fetch(this.url, { headers: { Range: `bytes=${start}-${end}` }, signal: ac.signal });
+      } catch (e) {
+        if (ac.signal.aborted) throw e; // AbortError — propagate as-is so callers can detect it
+        throw new Error(
+          `fetchRange ${start}-${end} on ${this.url} failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      // A 200 here means the server ignored the Range and is about to stream the WHOLE file — bail
+      // (and cancel the body) rather than download gigabytes for a small read.
+      if (res.status === 200) {
+        try { await res.body?.cancel(); } catch { /* ignore */ }
+        throw noRangeError(this.url);
+      }
+      if (res.status !== 206) {
+        throw new Error(`fetchRange ${start}-${end} failed: ${res.status} ${res.statusText}`);
+      }
+      const buf = await res.arrayBuffer();
+      logRead('HTTP', start, end, reason, performance.now() - t0, this.readStats);
+      return buf;
+    } finally {
+      this.inflight.delete(ac);
     }
-    // A 200 here means the server ignored the Range and is about to stream the WHOLE file — bail
-    // (and cancel the body) rather than download gigabytes for a small read.
-    if (res.status === 200) {
-      try { await res.body?.cancel(); } catch { /* ignore */ }
-      throw noRangeError(this.url);
-    }
-    if (res.status !== 206) {
-      throw new Error(`fetchRange ${start}-${end} failed: ${res.status} ${res.statusText}`);
-    }
-    const buf = await res.arrayBuffer();
-    logRead('HTTP', start, end, reason, performance.now() - t0, this.readStats);
-    return buf;
   }
 
   destroy(): void {
-    this.abortController?.abort();
+    for (const ac of this.inflight) ac.abort();
+    this.inflight.clear();
   }
 }

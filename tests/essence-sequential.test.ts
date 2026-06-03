@@ -22,6 +22,12 @@ function klv(prefix: Uint8Array, value: Uint8Array): Uint8Array {
 function videoKLV(size: number, fill = 0xaa): Uint8Array {
   return klv(UL_GC_PICTURE_ITEM_PREFIX, new Uint8Array(size).fill(fill));
 }
+/** A picture element on a specific track (byte 15 = element number) — for multi-video-track tests. */
+function videoKLVTrack(trackNum: number, size: number, fill = 0xaa): Uint8Array {
+  const out = klv(UL_GC_PICTURE_ITEM_PREFIX, new Uint8Array(size).fill(fill));
+  out[15] = trackNum; // element number distinguishes the two video tracks
+  return out;
+}
 function audioKLV(size: number, fill = 0x11): Uint8Array {
   return klv(UL_GC_SOUND_ITEM_PREFIX, new Uint8Array(size).fill(fill));
 }
@@ -122,6 +128,22 @@ describe('EssenceExtractor sequential (no-index) reader', () => {
     // Multiple windowed reads, and no single read approached the whole-file 1.5 GB old cap.
     expect(loader.reads.length).toBeGreaterThan(1);
     expect(loader.maxRead).toBeLessThanOrEqual(8 * 1024 * 1024);
+  });
+
+  it('demuxes only the first video track when two video tracks are interleaved', async () => {
+    // Each edit unit carries TWO picture elements (track 1 then track 2) + audio. Only track 1 must
+    // be emitted as video, and the edit-unit counter must advance once per edit unit (not twice).
+    const stream = concat([
+      videoKLVTrack(1, 64, 0xa1), videoKLVTrack(2, 48, 0xb2), audioKLV(32),
+      videoKLVTrack(1, 64, 0xa1), videoKLVTrack(2, 48, 0xb2), audioKLV(32),
+      videoKLVTrack(1, 64, 0xa1), videoKLVTrack(2, 48, 0xb2), audioKLV(32),
+    ]);
+    const ex = new EssenceExtractor(new MemLoader(stream), noIndexBootstrap());
+    const frames = await collect(ex.fetchFrames(0n, 3));
+    const video = frames.filter(f => f.trackType === 'video');
+    expect(video.map(v => Number(v.editUnit))).toEqual([0, 1, 2]); // not [0,0,1,1,2,2]
+    expect(video.every(v => v.size === 64)).toBe(true);            // only track 1 (size 64)
+    expect(frames.filter(f => f.trackType === 'audio').map(a => Number(a.editUnit))).toEqual([0, 1, 2]);
   });
 
   it('handles a single frame larger than the base window (adaptive grow)', async () => {

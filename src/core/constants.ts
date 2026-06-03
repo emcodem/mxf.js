@@ -19,8 +19,12 @@ export const PARTITION_PACK_READ_SIZE = 512;
  *  (11 bytes/entry × 190 000 ≈ 2 MB), so one read usually covers both — avoiding a second seek to
  *  the end of a large file on a slow network share. */
 export const TAIL_READ_SIZE = 2 * 1024 * 1024;
-/** Hard cap on how much to read for the footer when it precedes the tail window (very large index). */
+/** Initial read to parse the footer partition pack (so its declared indexByteCount can be honoured). */
 export const FOOTER_READ_MAX = 4 * 1024 * 1024;
+/** Upper bound on a footer index region read, when the partition pack declares its indexByteCount.
+ *  The index is metadata sized to the content (≈11 bytes/frame for VBE), so 64 MB covers ~6M frames
+ *  (~66 h @25fps) — far beyond any real programme — while still guarding a corrupt giant count. */
+export const FOOTER_INDEX_MAX = 64 * 1024 * 1024;
 /** Minimum header-metadata read when headerByteCount is present (encoders often understate it). */
 export const HEADER_METADATA_MIN_READ = 1024 * 1024;
 /** Header-metadata read when headerByteCount is absent/zero. */

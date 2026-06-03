@@ -69,6 +69,28 @@ export class KLVIterator {
     }
   }
 
+  /**
+   * Recover from a malformed KLV: scan forward from just past the current position to the next byte
+   * sequence that looks like an MXF key (the UL prefix 06 0E 2B 34) AND parses as a KLV, and resume
+   * there. Returns true if it resynced, false if no further valid key was found before the buffer
+   * end. Bounded by the buffer length. Use this only when the whole region is resident (header
+   * metadata, an index region) — NOT on the windowed essence reader, whose null from next() means
+   * "incomplete trailing KLV, carry it to the next read" rather than "corruption".
+   */
+  resync(): boolean {
+    const limit = this.buffer.byteLength - KEY_LENGTH;
+    for (let i = this.pos + 1; i < limit; i++) {
+      if (this.u8[i] === 0x06 && this.u8[i + 1] === 0x0e && this.u8[i + 2] === 0x2b && this.u8[i + 3] === 0x34) {
+        try {
+          readKLV(this.buffer, i);
+          this.pos = i;
+          return true;
+        } catch { /* not a valid KLV here — keep scanning */ }
+      }
+    }
+    return false;
+  }
+
   // Peek at key without advancing
   peekKey(): Uint8Array | null {
     if (!this.hasMore()) return null;

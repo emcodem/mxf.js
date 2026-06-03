@@ -1,7 +1,12 @@
 export interface ILoader {
   readonly fileSize: Promise<number>;
-  /** @param reason optional label describing the purpose of the read (for read logging). */
-  fetchRange(start: number, end: number, reason?: string): Promise<ArrayBuffer>;
+  /**
+   * @param reason optional label describing the purpose of the read (for read logging).
+   * @param signal optional AbortSignal; aborting it cancels the read (e.g. a seek superseding a
+   *        prefetch) so a slow network read isn't downloaded to completion after it's no longer
+   *        wanted. Aborted reads reject with an AbortError.
+   */
+  fetchRange(start: number, end: number, reason?: string, signal?: AbortSignal): Promise<ArrayBuffer>;
   destroy(): void;
 }
 

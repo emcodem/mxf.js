@@ -2,10 +2,20 @@ import { HttpLoader } from '../loader/http-loader.js';
 import { FileLoader } from '../loader/file-loader.js';
 import { ILoader } from '../loader/loader.js';
 import { MxfFile } from '../mxf-file.js';
+import type { MxfBootstrap } from '../mxf-file.js';
 import { EssenceExtractor } from '../essence/essence-extractor.js';
 import { Mp4Fragmenter } from '../remuxer/mp4-fragmenter.js';
-import { resolveFrameOffset, gopLengthFromKeyframe } from '../parser/index-table.js';
+import {
+  resolveFrameOffset, gopLengthFromKeyframe,
+  resolveLongGopKeyframe, findKeyframeFloor, findKeyframeCeil, longGopGopLength, resolveEntryMeta,
+} from '../parser/index-table.js';
 import { isAnnexB, annexBtoAVCC, extractSPSPPS, buildAVCDecoderConfigRecord } from '../essence/avc-tools.js';
+import { parseSpsPocInfo, buildPpsPocMap } from '../essence/h264-poc.js';
+import type { SpsPocInfo, PpsPocInfo } from '../essence/h264-poc.js';
+import { resolveReorder, accessUnitHasBSlice } from '../essence/reorder-resolver.js';
+import type { ReorderInputFrame } from '../essence/reorder-resolver.js';
+import { SparseKeyframeIndex } from '../essence/sparse-keyframe-index.js';
+import { selectNoIndexLongGopRun, NOINDEX_GOP_LOOKAHEAD } from './longgop-noindex.js';
 import { decodePcmElements } from '../audio/pcm.js';
 import { WorkerCommand, WorkerEvent } from './worker-messages.js';
 import type { EssenceFrame } from '../essence/essence-extractor.js';
@@ -37,10 +47,23 @@ let workerDebug = false;
 // decoder + encoder, the display-order edit-unit counter, and the held-anchor decode loop.
 let mpeg2Pipeline: Mpeg2Pipeline | null = null;
 
+// H.264 Long-GOP (XAVC-L) reorder state: set during handleInit when B-frames are detected. The
+// fetch path then reconstructs PTS/DTS via the index temporalOffset (Tier 1) or parsed POC (Tier 2).
+let longGop: {
+  sps: SpsPocInfo;
+  ppsFlagMap: Map<number, PpsPocInfo>;
+} | null = null;
+// True for the first long-GOP fetch after a seek/scrub-reset: enables open-GOP leading-B drop so the
+// keyframe (not an undecodable leading B) lands first. Set by handleSeek/handleScrubPreview/init.
+let longGopBoundaryPending = true;
+// Tier-3 (indexMode 'none') only: lazily-built keyframe map (edit unit → byte offset) populated as a
+// side effect of no-index scans, so a seek can resume near the target instead of rescanning from 0.
+let sparseKf: SparseKeyframeIndex | null = null;
+
 // Serializes fetches (one at a time) and lets a seek discard superseded work — see FetchQueue.
 // run executes one job by delegating to handleFetchSegment (hoisted, so referencing it here is fine).
-const fetchQ = new FetchQueue((job) =>
-  handleFetchSegment(job.startFrame, job.frameCount, job.seqBase, job.gen, job.stretchToFrames, job.previewSeq),
+const fetchQ = new FetchQueue((job, signal) =>
+  handleFetchSegment(job.startFrame, job.frameCount, job.seqBase, job.gen, job.stretchToFrames, job.previewSeq, signal),
 );
 // seqBase pool for internally-scheduled scrub-preview decodes (kept apart from the player's seqBase).
 let scrubSeqBase = 1_000_000;
@@ -62,6 +85,9 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
   workerDebug = debug;
   mxfFile = new MxfFile(loader, debug);
   mpeg2Pipeline = null;
+  longGop = null;
+  longGopBoundaryPending = true;
+  sparseKf = null;
   scrubSegmentCache.clear();
 
   try {
@@ -159,6 +185,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
         resolvedVideoCodec: pipeline.codecString,
         resolvedVideoMode: 'mse',
         indexMode: bootstrap.indexMode,
+        longGop: false, // MPEG-2 transcode path handles reorder inside the decoder, not here
         audioChannelCount,
       });
 
@@ -178,6 +205,8 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       // be a keyframe carrying parameter sets). If that extraction fails there is no correct init
       // segment to build, so fail loudly rather than guessing dimensions (see mp4-fragmenter).
       let gotSpsPps = false;
+      let spsPocInfo: SpsPocInfo | null = null;
+      let ppsFlagMap: Map<number, PpsPocInfo> = new Map();
       try {
         const extractor = new EssenceExtractor(loader_, bootstrap);
         for await (const frame of extractor.fetchFrames(0n, 1)) {
@@ -186,9 +215,12 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
           const { sps, pps } = extractSPSPPS(avccData);
           if (sps.length > 0 && pps.length > 0) {
             gotSpsPps = true;
-            fragmenter!.setSPSPPS(sps[0], pps[0]);
+            fragmenter!.setSPSPPS(sps, pps);
+            // Parse POC syntax from the in-band parameter sets so the fetch path can reorder B-frames.
+            spsPocInfo = parseSpsPocInfo(sps[0]);
+            ppsFlagMap = buildPpsPocMap(pps);
             if (videoMode === 'webcodecs') {
-              const desc = buildAVCDecoderConfigRecord(sps[0], pps[0]);
+              const desc = buildAVCDecoderConfigRecord(sps, pps);
               const p = sps[0][1], c = sps[0][2], l = sps[0][3];
               const codec = `avc1.${p.toString(16).padStart(2,'0')}${c.toString(16).padStart(2,'0')}${l.toString(16).padStart(2,'0')}`;
               pendingVideoInit = { codec, description: desc, width: pd.width, height: pd.height };
@@ -203,6 +235,32 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       if (!gotSpsPps) {
         postError('H.264: no SPS/PPS in the first video frame — cannot build an init segment (the first frame must be a keyframe carrying parameter sets)', true);
         return;
+      }
+
+      // Detect Long-GOP: probe ~2 GOPs for any B slice. Reorder works with a VBE index (GOP-aligned
+      // via the index entry flags — Tier 1/2) and with NO index (Tier 3: GOP-aligned by scanning for
+      // IDRs, with a lazily-built SparseKeyframeIndex). CBG is all-intra, so it's skipped.
+      if (spsPocInfo && (bootstrap.indexMode === 'vbe' || bootstrap.indexMode === 'none') && videoMode !== 'webcodecs') {
+        try {
+          const probe = new EssenceExtractor(loader_, bootstrap);
+          let seen = 0;
+          for await (const frame of probe.fetchFrames(0n, 30)) {
+            if (frame.trackType !== 'video') continue;
+            seen++;
+            const avcc = isAnnexB(frame.data) ? new Uint8Array(annexBtoAVCC(frame.data)) : new Uint8Array(frame.data);
+            if (accessUnitHasBSlice(avcc, spsPocInfo, ppsFlagMap)) {
+              longGop = { sps: spsPocInfo, ppsFlagMap };
+              break;
+            }
+            if (seen >= 30) break;
+          }
+          // Tier 3: a no-index long-GOP file needs the sparse keyframe map; the fetch/seek paths
+          // populate it as they scan (the probe above is too short to seed it meaningfully).
+          if (longGop && bootstrap.indexMode === 'none') sparseKf = new SparseKeyframeIndex();
+          if (workerDebug) console.log(`[longgop] detection: ${longGop ? `Long-GOP (B-frames present, ${bootstrap.indexMode} index)` : 'all-predictive/intra (no reorder)'}`);
+        } catch (e) {
+          if (workerDebug) console.log('[longgop] B-slice probe failed, treating as non-Long-GOP:', e);
+        }
       }
     }
 
@@ -222,6 +280,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       resolvedVideoCodec: pd?.codec ?? 'unknown',
       resolvedVideoMode: resolvedMode,
       indexMode: bootstrap.indexMode,
+      longGop: longGop !== null,
       audioChannelCount,
     });
 
@@ -248,6 +307,7 @@ async function handleFetchSegment(
   gen: number,
   stretchToFrames = 0,
   previewSeq?: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   // A scrub preview is a throwaway single-frame decode that must always answer with previewDone
   // (so the player's single-flight pump never deadlocks) and must skip audio.
@@ -265,23 +325,66 @@ async function handleFetchSegment(
   }
 
   try {
-    const extractor = new EssenceExtractor(loader, bootstrap);
-    const frames: EssenceFrame[] = [];
-    // The MPEG-2 transcode path feeds one persistent decoder, so it needs the exact
-    // consecutive frame range (no keyframe snapping) to avoid re-feeding pictures it has
-    // already decoded. Seeks land on a keyframe anyway, where exact and snapped agree.
-    const exact = !!mpeg2Pipeline;
-    for await (const frame of extractor.fetchFrames(BigInt(startFrame), frameCount, exact)) {
-      frames.push(frame);
+    const extractor = new EssenceExtractor(loader, bootstrap, signal);
+
+    // Long-GOP fetches are GOP-aligned: snap the start back to its keyframe floor and extend the
+    // end forward to the next keyframe, so the run is whole GOPs (POC ranking is complete and
+    // segments tile). `exact` so storage edit units are numbered from the real keyframe EU.
+    let fetchStart = startFrame;
+    let fetchCount = frameCount;
+    let lgNextFrame = startFrame + frameCount; // reported to the player as the next fetch start
+    let videoFrames: EssenceFrame[];
+    let audioFrames: EssenceFrame[];
+
+    // Tier 3: no usable index → can't resolve GOP boundaries by math. Scan from the nearest known
+    // keyframe (SparseKeyframeIndex floor, else the essence start), classify IDRs, retain only the
+    // enclosing GOP run, and record discovered keyframes. Memory-safe (scanned-past frames are
+    // discarded), so even a cold seek that rescans from the start doesn't buffer the whole file.
+    const noIndexLongGop = !!longGop && !mpeg2Pipeline && bootstrap.indexMode === 'none';
+    if (noIndexLongGop) {
+      // Resume the scan at the nearest known keyframe (else the essence start), reading enough to
+      // cover the window plus a lookahead to reach the next IDR (GOP boundary).
+      const floor = sparseKf?.floor(BigInt(startFrame)) ?? null;
+      const scanEU = floor ? Number(floor.editUnit) : 0;
+      const fromByteOffset = floor ? floor.byteOffset : bootstrap.essenceStart;
+      const scanBound = (startFrame + frameCount - scanEU) + NOINDEX_GOP_LOOKAHEAD;
+      const run = await selectNoIndexLongGopRun(
+        extractor.fetchFrames(BigInt(scanEU), scanBound, false, fromByteOffset),
+        { startFrame, frameCount, scanBound, sparseKf, isAborted: () => gen !== fetchQ.currentGeneration },
+      );
+      if (run === null) return; // superseded mid-scan
+      videoFrames = run.video;
+      audioFrames = run.audio;
+      fetchStart = run.startStorageEU;
+      lgNextFrame = run.nextFrame;
+    } else {
+      if (longGop && !mpeg2Pipeline) {
+        const segs = bootstrap.indexSegments, vid = bootstrap.essenceBodySID;
+        const kStart = findKeyframeFloor(segs, BigInt(startFrame), vid);
+        const kEnd = findKeyframeCeil(segs, BigInt(startFrame + frameCount), vid);
+        if (kStart !== null) fetchStart = Number(kStart);
+        lgNextFrame = kEnd !== null ? Number(kEnd) : startFrame + frameCount;
+        fetchCount = Math.max(1, lgNextFrame - fetchStart);
+      }
+
+      // The MPEG-2 transcode path feeds one persistent decoder, so it needs the exact
+      // consecutive frame range (no keyframe snapping) to avoid re-feeding pictures it has
+      // already decoded. Long-GOP also fetches exact (from the snapped keyframe). Seeks land on a
+      // keyframe anyway, where exact and snapped agree.
+      const exact = !!mpeg2Pipeline || !!longGop;
+      const frames: EssenceFrame[] = [];
+      for await (const frame of extractor.fetchFrames(BigInt(fetchStart), fetchCount, exact)) {
+        frames.push(frame);
+      }
+
+      // A seek arrived while we were reading bytes: the decoder has been reset to a new
+      // position, so feeding it these (now stale) frames would corrupt the post-seek decode.
+      // Drop this fetch entirely; the player issues a fresh fetch after the 'seeked' event.
+      if (gen !== fetchQ.currentGeneration) return;
+
+      videoFrames = frames.filter(f => f.trackType === 'video');
+      audioFrames = frames.filter(f => f.trackType === 'audio');
     }
-
-    // A seek arrived while we were reading bytes: the decoder has been reset to a new
-    // position, so feeding it these (now stale) frames would corrupt the post-seek decode.
-    // Drop this fetch entirely; the player issues a fresh fetch after the 'seeked' event.
-    if (gen !== fetchQ.currentGeneration) return;
-
-    const videoFrames = frames.filter(f => f.trackType === 'video');
-    const audioFrames = frames.filter(f => f.trackType === 'audio');
 
     // -----------------------------------------------------------------------
     // MPEG-2 → H.264 transcode
@@ -327,6 +430,45 @@ async function handleFetchSegment(
           if (workerDebug) console.log('[worker] videoSegment', seg.length, 'bytes,', chunks.length, 'chunks, first chunk keyframe:', chunks[0]?.isKeyframe, 'first chunk editUnit:', chunks[0] ? Number(chunks[0].editUnit) : -1, keyframePreview ? `(keyframe preview, stretch ${stretchToFrames}f)` : '');
           post(
             { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: startFrame },
+            [seg.buffer],
+          );
+        }
+      }
+    } else if (longGop) {
+      // -----------------------------------------------------------------------
+      // H.264 Long-GOP (XAVC-L): reconstruct B-frame display order, then remux (fragmenter
+      // unchanged — it honours the per-sample pts/dts/isKeyframe we attach here).
+      // -----------------------------------------------------------------------
+      if (videoFrames.length > 0) {
+        const segs = bootstrap.indexSegments, vid = bootstrap.essenceBodySID;
+        const isBoundary = longGopBoundaryPending;
+        longGopBoundaryPending = false;
+
+        const inputs: ReorderInputFrame[] = videoFrames.map(f => ({
+          avcc: isAnnexB(f.data) ? new Uint8Array(annexBtoAVCC(f.data)) : new Uint8Array(f.data),
+          editUnit: f.editUnit,
+          meta: resolveEntryMeta(segs, f.editUnit, vid),
+        }));
+        const resolved = resolveReorder(inputs, {
+          sps: longGop.sps,
+          ppsFlagMap: longGop.ppsFlagMap,
+          startStorageEU: BigInt(fetchStart),
+          isRunKeyframeBoundary: isBoundary,
+        });
+
+        // Attach the resolved PTS/DTS/isKeyframe to the source frames (decode order, kept frames).
+        const reordered: EssenceFrame[] = resolved.map(s => ({
+          ...videoFrames[s.sourceIndex],
+          pts: s.pts,
+          dts: s.dts,
+          isKeyframe: s.isKeyframe,
+        }));
+        const seg = fragmenter.buildVideoSegment(reordered);
+        if (seg) {
+          if (workerDebug) console.log(`[longgop] fetch ${fetchStart}..${lgNextFrame - 1} (req ${startFrame}+${frameCount})${isBoundary ? ' [boundary, leading-B drop]' : ''}: ${videoFrames.length} AUs → ${resolved.length} samples`);
+          if (isScrubPreview) scrubSegmentCache.set(startFrame, seg.slice());
+          post(
+            { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: fetchStart, nextFrame: lgNextFrame },
             [seg.buffer],
           );
         }
@@ -396,12 +538,27 @@ async function handleFetchSegment(
     if (!isScrubPreview) post({ type: 'segmentDone' });
 
   } catch (e) {
-    postError(`Failed to fetch segment: ${e instanceof Error ? e.message : String(e)}`);
+    // A read aborted by a seek/scrub supersession is expected — the next fetch is already queued, so
+    // swallow it (and any error once superseded) rather than surfacing a spurious error to the player.
+    const aborted = (e instanceof Error && e.name === 'AbortError') || signal?.aborted || gen !== fetchQ.currentGeneration;
+    if (!aborted) postError(`Failed to fetch segment: ${e instanceof Error ? e.message : String(e)}`);
   } finally {
     // Always answer a scrub preview, even when superseded (gen mismatch returns above) or errored,
     // so the player's single-flight pump can fire the next preview at the latest dragged position.
     if (isScrubPreview) post({ type: 'previewDone', seq: previewSeq!, editUnit: startFrame });
   }
+}
+
+/**
+ * Resolve the random-access keyframe edit unit for a seek/scrub target: the nearest preceding
+ * keyframe via the long-GOP-aware predicate when reordering, else the standard resolver. Returns
+ * `targetFrame` itself when the index can't resolve it (caller seeks there directly).
+ */
+function resolveKeyframeFor(bootstrap: MxfBootstrap, targetFrame: number): number {
+  const resolved = longGop
+    ? resolveLongGopKeyframe(bootstrap.indexSegments, BigInt(targetFrame), bootstrap.essenceStart, bootstrap.essenceBodySID)
+    : resolveFrameOffset(bootstrap.indexSegments, BigInt(targetFrame), bootstrap.essenceStart, bootstrap.essenceBodySID);
+  return resolved ? Number(resolved.nearestKeyframeEditUnit) : targetFrame;
 }
 
 function handleSeek(targetFrame: number): void {
@@ -413,22 +570,34 @@ function handleSeek(targetFrame: number): void {
   // required: the post-seek fetch starts at a keyframe (GOP boundary, carrying a fresh
   // sequence header), and stale references from the old position would corrupt the
   // first decoded pictures. The counter is reset so timestamps resume from the seek point.
-  const resolvedSeek = resolveFrameOffset(
-    bootstrap.indexSegments,
-    BigInt(targetFrame),
-    bootstrap.essenceStart,
-    bootstrap.essenceBodySID,
-  );
   // Supersede any queued/in-flight fetch from the old position (see FetchQueue.supersede): an
   // in-flight fetch checks the generation after its awaits and discards its now-stale frames.
   fetchQ.supersede();
 
-  const nearestKeyframe = resolvedSeek ? Number(resolvedSeek.nearestKeyframeEditUnit) : targetFrame;
+  // Long-GOP uses the auto-detecting keyframe predicate (the legacy 0x80 test mis-detects every
+  // ffmpeg-VBE frame as a keyframe); other codecs keep the original resolution.
+  let nearestKeyframe: number;
+  let gopFrameCount: number;
+  if (longGop && bootstrap.indexMode === 'none') {
+    // Tier 3: snap to the nearest discovered keyframe (the fetch path refines it by scanning for the
+    // enclosing IDR). GOP length is unknown without an index, and fast scrub is disabled for 'none',
+    // so report 1.
+    const fl = sparseKf?.floor(BigInt(targetFrame)) ?? null;
+    nearestKeyframe = fl ? Number(fl.editUnit) : targetFrame;
+    gopFrameCount = 1;
+  } else {
+    nearestKeyframe = resolveKeyframeFor(bootstrap, targetFrame);
+    gopFrameCount = longGop
+      ? longGopGopLength(bootstrap.indexSegments, BigInt(nearestKeyframe), bootstrap.essenceBodySID)
+      : gopLengthFromKeyframe(bootstrap.indexSegments, BigInt(nearestKeyframe));
+  }
+
   // Resets the decoder's references + resumes the edit-unit counter from the keyframe (no-op for
   // the H.264 path, where there is no pipeline and the counter is unused).
   mpeg2Pipeline?.reset(nearestKeyframe);
+  // The next fetch is the first of a new GOP run: drop open-GOP leading B's so the keyframe lands first.
+  longGopBoundaryPending = true;
 
-  const gopFrameCount = gopLengthFromKeyframe(bootstrap.indexSegments, BigInt(nearestKeyframe));
   post({ type: 'seeked', nearestKeyframeEditUnit: nearestKeyframe, gopFrameCount });
 }
 
@@ -445,13 +614,7 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
   const bootstrap = mxfFile.getBootstrap();
   if (!bootstrap) { post({ type: 'previewDone', seq, editUnit: targetFrame }); return; }
 
-  const resolved = resolveFrameOffset(
-    bootstrap.indexSegments,
-    BigInt(targetFrame),
-    bootstrap.essenceStart,
-    bootstrap.essenceBodySID,
-  );
-  const keyframe = resolved ? Number(resolved.nearestKeyframeEditUnit) : targetFrame;
+  const keyframe = resolveKeyframeFor(bootstrap, targetFrame);
 
   // Cache hit: this GOP head was already decoded+encoded this session — re-serve its segment
   // verbatim with no decode/encode (and without disturbing the decoder state). Dragging within a
@@ -479,6 +642,8 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
   // Seek part (mirrors handleSeek): supersede in-flight work and reset the decoder to the keyframe.
   fetchQ.supersede();
   mpeg2Pipeline?.reset(keyframe);
+  // This preview run starts a fresh GOP: drop open-GOP leading B's so the keyframe paints first.
+  longGopBoundaryPending = true;
 
   // Enqueue the throwaway decode (serialized via the queue so it can't race a normal fetch).
   // stretchToFrames stays 0 — these are real consecutive frames, so the segment is naturally

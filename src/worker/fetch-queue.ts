@@ -25,9 +25,14 @@ export class FetchQueue {
   private busy = false;
   private readonly queue: FetchJob[] = [];
   private generation = 0;
+  /** Abort controller for the job currently running, so supersede() can cancel its in-flight read. */
+  private currentAbort: AbortController | null = null;
 
-  /** @param run Executes one job. The queue awaits it to completion before starting the next. */
-  constructor(private readonly run: (job: FetchJob) => Promise<void>) {}
+  /**
+   * @param run Executes one job, receiving an AbortSignal that fires when the job is superseded.
+   *   The queue awaits it to completion before starting the next.
+   */
+  constructor(private readonly run: (job: FetchJob, signal: AbortSignal) => Promise<void>) {}
 
   /** The live generation. An in-flight job whose captured gen differs has been superseded. */
   get currentGeneration(): number {
@@ -52,6 +57,7 @@ export class FetchQueue {
   supersede(): number {
     this.generation++;
     this.queue.length = 0;
+    this.currentAbort?.abort(); // cancel the in-flight read so it doesn't download to completion
     return this.generation;
   }
 
@@ -60,7 +66,13 @@ export class FetchQueue {
     this.busy = true;
     try {
       while (this.queue.length > 0) {
-        await this.run(this.queue.shift()!);
+        const job = this.queue.shift()!;
+        this.currentAbort = new AbortController();
+        try {
+          await this.run(job, this.currentAbort.signal);
+        } finally {
+          this.currentAbort = null;
+        }
       }
     } finally {
       this.busy = false;
