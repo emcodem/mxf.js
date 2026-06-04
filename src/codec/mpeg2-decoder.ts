@@ -650,6 +650,12 @@ export class Mpeg2Decoder {
   private dcPredictorCr = 0;
   private dcPredictorCb = 0;
   private blockData = new Int32Array(64);
+  // IDCT output goes here so blockData keeps only its sparse dequantized coefficients; we then clear
+  // just those positions instead of a full 64-int blockData.fill(0) per block (6–8× per macroblock).
+  // touchedIdx records every position written this block (DC, each coefficient, the MPEG-2 mismatch
+  // index 63); sized > 64 for the worst case (full block + DC + mismatch).
+  private pixelData = new Int32Array(64);
+  private touchedIdx = new Int32Array(80);
 
   constructor(onFrame: (frame: YUVFrame) => void, bufferSize = 4 * 1024 * 1024) {
     this.onFrame = onFrame;
@@ -1626,6 +1632,8 @@ export class Mpeg2Decoder {
   private decodeBlock(block: number): void {
     let n = 0;
     let quantMatrix: Uint8Array;
+    const touched = this.touchedIdx;
+    let tc = 0; // positions written into blockData this block; cleared at the end (replaces fill(0))
 
     if (this.macroblockIntra) {
       let predictor: number;
@@ -1649,6 +1657,7 @@ export class Mpeg2Decoder {
       else if ((block & 1) === 0) this.dcPredictorCb = this.blockData[0];
       else this.dcPredictorCr = this.blockData[0];
       this.blockData[0] <<= (3 + 5 - this.intraDcPrecision);
+      touched[tc++] = 0;
       quantMatrix = block < 4 ? this.intraQuantMatrix : this.chromaIntraQuantMatrix;
       n = 1;
     } else {
@@ -1662,6 +1671,8 @@ export class Mpeg2Decoder {
     const isMPEG2 = this.isMPEG2;
     const isIntra = this.macroblockIntra;
     const qs = this.quantizerScale;
+    // Dequant divisor is loop-invariant (MPEG-2 >>5, MPEG-1 >>4); hoist the select out of the loop.
+    const dequantShift = isMPEG2 ? 5 : 4;
     let mismatchParity = 0;
 
     // For non-intra blocks the FIRST coefficient is coded with the dct_coeff_first VLC:
@@ -1710,7 +1721,7 @@ export class Mpeg2Decoder {
       // MPEG-2 by 32 (ISO 13818-2 7.4.2.3). Using /16 for MPEG-2 makes every AC
       // coefficient twice the correct amplitude → ~2× ringing/overshoot at edges
       // while flat (DC-only) areas stay correct.
-      level = (level * qs * quantMatrix[dezigZagged]) >> (isMPEG2 ? 5 : 4);
+      level = (level * qs * quantMatrix[dezigZagged]) >> dequantShift;
       if (isMPEG2) {
         if (level > 2047) level = 2047; else if (level < -2047) level = -2047;
         mismatchParity ^= (level & 1);
@@ -1719,11 +1730,12 @@ export class Mpeg2Decoder {
         if (level > 2047) level = 2047; else if (level < -2048) level = -2048;
       }
       this.blockData[dezigZagged] = level * PREMULTIPLIER_MATRIX[dezigZagged];
+      touched[tc++] = dezigZagged;
     }
 
     if (isMPEG2) {
       const dcParity = (isIntra && this.intraDcPrecision === 3) ? ((this.blockData[0] >> 5) & 1) : 0;
-      if (((mismatchParity ^ dcParity) & 1) === 0) this.blockData[63] ^= 2;
+      if (((mismatchParity ^ dcParity) & 1) === 0) { this.blockData[63] ^= 2; touched[tc++] = 63; }
     }
 
     let destArray: Uint8ClampedArray;
@@ -1763,20 +1775,20 @@ export class Mpeg2Decoder {
     if (this.macroblockIntra) {
       if (n === 1) {
         copyValue((this.blockData[0] + 128) >> 8, destArray, destIndex, scan);
-        this.blockData[0] = 0;
+        for (let i = 0; i < tc; i++) this.blockData[touched[i]] = 0;
       } else {
-        idct(this.blockData);
-        copyBlock(this.blockData, destArray, destIndex, scan);
-        this.blockData.fill(0);
+        idct(this.blockData, this.pixelData);
+        copyBlock(this.pixelData, destArray, destIndex, scan);
+        for (let i = 0; i < tc; i++) this.blockData[touched[i]] = 0;
       }
     } else {
       if (n === 1) {
         addValue((this.blockData[0] + 128) >> 8, destArray, destIndex, scan);
-        this.blockData[0] = 0;
+        for (let i = 0; i < tc; i++) this.blockData[touched[i]] = 0;
       } else {
-        idct(this.blockData);
-        addBlock(this.blockData, destArray, destIndex, scan);
-        this.blockData.fill(0);
+        idct(this.blockData, this.pixelData);
+        addBlock(this.pixelData, destArray, destIndex, scan);
+        for (let i = 0; i < tc; i++) this.blockData[touched[i]] = 0;
       }
     }
     // n is reset implicitly — the loop variable; no explicit reset needed
@@ -1787,37 +1799,40 @@ export class Mpeg2Decoder {
 // IDCT + block copy helpers
 // ---------------------------------------------------------------------------
 
-function idct(block: Int32Array): void {
+// Two-pass row/column IDCT. The row pass reads `src` and writes `dst`; the column pass operates
+// in place on `dst` (reading the row-pass results). Keeping `src` untouched lets the caller clear
+// only the sparse coefficient positions afterward instead of zeroing all 64 entries.
+function idct(src: Int32Array, dst: Int32Array): void {
   let b1: number, b3: number, b4: number, b6: number, b7: number, tmp1: number, tmp2: number, m0: number;
   let x0: number, x1: number, x2: number, x3: number, x4: number, y3: number, y4: number, y5: number, y6: number, y7: number;
 
   for (let i = 0; i < 8; i++) {
-    b1 = block[4*8+i]; b3 = block[2*8+i] + block[6*8+i]; b4 = block[5*8+i] - block[3*8+i];
-    tmp1 = block[1*8+i] + block[7*8+i]; tmp2 = block[3*8+i] + block[5*8+i];
-    b6 = block[1*8+i] - block[7*8+i]; b7 = tmp1 + tmp2;
-    m0 = block[0*8+i];
+    b1 = src[4*8+i]; b3 = src[2*8+i] + src[6*8+i]; b4 = src[5*8+i] - src[3*8+i];
+    tmp1 = src[1*8+i] + src[7*8+i]; tmp2 = src[3*8+i] + src[5*8+i];
+    b6 = src[1*8+i] - src[7*8+i]; b7 = tmp1 + tmp2;
+    m0 = src[0*8+i];
     x4 = ((b6*473 - b4*196 + 128) >> 8) - b7;
     x0 = x4 - (((tmp1 - tmp2)*362 + 128) >> 8);
-    x1 = m0 - b1; x2 = (((block[2*8+i] - block[6*8+i])*362 + 128) >> 8) - b3; x3 = m0 + b1;
+    x1 = m0 - b1; x2 = (((src[2*8+i] - src[6*8+i])*362 + 128) >> 8) - b3; x3 = m0 + b1;
     y3 = x1 + x2; y4 = x3 + b3; y5 = x1 - x2; y6 = x3 - b3;
     y7 = -x0 - ((b4*473 + b6*196 + 128) >> 8);
-    block[0*8+i] = b7 + y4; block[1*8+i] = x4 + y3; block[2*8+i] = y5 - x0; block[3*8+i] = y6 - y7;
-    block[4*8+i] = y6 + y7; block[5*8+i] = x0 + y5; block[6*8+i] = y3 - x4; block[7*8+i] = y4 - b7;
+    dst[0*8+i] = b7 + y4; dst[1*8+i] = x4 + y3; dst[2*8+i] = y5 - x0; dst[3*8+i] = y6 - y7;
+    dst[4*8+i] = y6 + y7; dst[5*8+i] = x0 + y5; dst[6*8+i] = y3 - x4; dst[7*8+i] = y4 - b7;
   }
   for (let i = 0; i < 64; i += 8) {
-    b1 = block[4+i]; b3 = block[2+i] + block[6+i]; b4 = block[5+i] - block[3+i];
-    tmp1 = block[1+i] + block[7+i]; tmp2 = block[3+i] + block[5+i];
-    b6 = block[1+i] - block[7+i]; b7 = tmp1 + tmp2;
-    m0 = block[0+i];
+    b1 = dst[4+i]; b3 = dst[2+i] + dst[6+i]; b4 = dst[5+i] - dst[3+i];
+    tmp1 = dst[1+i] + dst[7+i]; tmp2 = dst[3+i] + dst[5+i];
+    b6 = dst[1+i] - dst[7+i]; b7 = tmp1 + tmp2;
+    m0 = dst[0+i];
     x4 = ((b6*473 - b4*196 + 128) >> 8) - b7;
     x0 = x4 - (((tmp1 - tmp2)*362 + 128) >> 8);
-    x1 = m0 - b1; x2 = (((block[2+i] - block[6+i])*362 + 128) >> 8) - b3; x3 = m0 + b1;
+    x1 = m0 - b1; x2 = (((dst[2+i] - dst[6+i])*362 + 128) >> 8) - b3; x3 = m0 + b1;
     y3 = x1 + x2; y4 = x3 + b3; y5 = x1 - x2; y6 = x3 - b3;
     y7 = -x0 - ((b4*473 + b6*196 + 128) >> 8);
-    block[0+i] = (b7 + y4 + 128) >> 8; block[1+i] = (x4 + y3 + 128) >> 8;
-    block[2+i] = (y5 - x0 + 128) >> 8; block[3+i] = (y6 - y7 + 128) >> 8;
-    block[4+i] = (y6 + y7 + 128) >> 8; block[5+i] = (x0 + y5 + 128) >> 8;
-    block[6+i] = (y3 - x4 + 128) >> 8; block[7+i] = (y4 - b7 + 128) >> 8;
+    dst[0+i] = (b7 + y4 + 128) >> 8; dst[1+i] = (x4 + y3 + 128) >> 8;
+    dst[2+i] = (y5 - x0 + 128) >> 8; dst[3+i] = (y6 - y7 + 128) >> 8;
+    dst[4+i] = (y6 + y7 + 128) >> 8; dst[5+i] = (x0 + y5 + 128) >> 8;
+    dst[6+i] = (y3 - x4 + 128) >> 8; dst[7+i] = (y4 - b7 + 128) >> 8;
   }
 }
 

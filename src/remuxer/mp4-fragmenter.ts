@@ -290,14 +290,25 @@ export class Mp4Fragmenter {
       samples[samples.length - 1].duration += extraFrames * config.frameDurationTicks;
     }
 
-    const allData = concatU8(dataParts);
     const baseTime = chunks[0].editUnit * BigInt(config.frameDurationTicks);
     const moofSize = 88 + samples.length * 16;
     const dataOffset = moofSize + 8;
     const trafBox = traf(VIDEO_TRACK_ID, baseTime, samples, dataOffset);
     const moofBox = moof(++this.seqNum, trafBox);
-    const mdatBox = mdat(allData);
-    return concat(moofBox, mdatBox);
+
+    // Assemble moof + mdat into a single allocation, writing each chunk payload once. This avoids the
+    // concatU8(dataParts) copy plus the mdat()/concat() copy the previous code paid (the whole H.264
+    // payload was copied twice per segment). The mdat header matches box('mdat', …): u32 size + 'mdat'.
+    let payloadLen = 0;
+    for (const p of dataParts) payloadLen += p.length;
+    const mdatSize = 8 + payloadLen;
+    const out = new Uint8Array(moofBox.length + mdatSize);
+    let o = 0;
+    out.set(moofBox, o); o += moofBox.length;
+    new DataView(out.buffer).setUint32(o, mdatSize, false); o += 4;
+    out[o++] = 0x6d; out[o++] = 0x64; out[o++] = 0x61; out[o++] = 0x74; // 'mdat'
+    for (const p of dataParts) { out.set(p, o); o += p.length; }
+    return out;
   }
 
   get hasSPSPPS(): boolean { return this.spsNALUs.length > 0 && this.ppsNALUs.length > 0; }

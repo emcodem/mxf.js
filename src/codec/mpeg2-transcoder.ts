@@ -27,6 +27,15 @@ export class Mpeg2Transcoder {
   private displayHeight: number;
   private encoderError: Error | null = null;
 
+  // Persistent per-frame scratch, reused across encodeFrame() calls to avoid ~3.5 MB of allocation
+  // per frame (the dominant GC pressure during a decode/scrub burst). Sized lazily on first use;
+  // the pipeline rejects mid-stream format changes, so the dimensions never change after that.
+  // `new VideoFrame(bufferSource, …)` copies the pixel data into the frame's own storage at
+  // construction (WebCodecs spec), so reusing `interleaveBuf` on the next call is safe.
+  private interleaveBuf: Uint8Array | null = null;
+  private cb420: Uint8ClampedArray | null = null;
+  private cr420: Uint8ClampedArray | null = null;
+
   constructor(
     codedWidth: number,
     codedHeight: number,
@@ -130,13 +139,18 @@ export class Mpeg2Transcoder {
     const ySize = frame.codedWidth * frame.codedHeight;
     const uvW   = frame.codedWidth >> 1;
     const uvH   = frame.codedHeight >> 1; // always 4:2:0 output
+    const uvSize = uvW * uvH;
 
     let cb420: Uint8ClampedArray;
     let cr420: Uint8ClampedArray;
     if (frame.chromaFormat === 2) {
-      // 4:2:2 → 4:2:0: average each pair of chroma rows
-      cb420 = new Uint8ClampedArray(uvW * uvH);
-      cr420 = new Uint8ClampedArray(uvW * uvH);
+      // 4:2:2 → 4:2:0: average each pair of chroma rows (into persistent scratch).
+      if (this.cb420 === null || this.cb420.length !== uvSize) {
+        this.cb420 = new Uint8ClampedArray(uvSize);
+        this.cr420 = new Uint8ClampedArray(uvSize);
+      }
+      cb420 = this.cb420;
+      cr420 = this.cr420!;
       for (let row = 0; row < uvH; row++) {
         const s0 = row * 2 * uvW, s1 = s0 + uvW, dst = row * uvW;
         for (let col = 0; col < uvW; col++) {
@@ -149,8 +163,11 @@ export class Mpeg2Transcoder {
       cr420 = frame.cr;
     }
 
-    const uvSize = uvW * uvH;
-    const buf = new Uint8Array(ySize + uvSize * 2);
+    const bufLen = ySize + uvSize * 2;
+    if (this.interleaveBuf === null || this.interleaveBuf.length !== bufLen) {
+      this.interleaveBuf = new Uint8Array(bufLen);
+    }
+    const buf = this.interleaveBuf;
     buf.set(frame.y,  0);
     buf.set(cb420, ySize);
     buf.set(cr420, ySize + uvSize);
