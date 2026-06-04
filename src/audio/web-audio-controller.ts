@@ -50,6 +50,11 @@ export class WebAudioController {
   private anchorMedia = 0;
   // Bumped on every (re)lock; chunks tag themselves with it so a run schedules each chunk at most once.
   private runId = 0;
+  // Playhead-progress probe (media seconds vs AudioContext wall seconds) to detect a frozen playhead:
+  // the element can rebuffer mid-play without going paused, and resyncing in place there would replay
+  // the same audio on a loop. lastWall < 0 means "re-initialise" (set on every gate/pause).
+  private lastWall = -1;
+  private lastMedia = 0;
 
   // Decoded PCM retained for the buffered region, sorted by mediaStart. Bounded by BACK/FWD windows.
   private store: AudioChunk[] = [];
@@ -196,8 +201,24 @@ export class WebAudioController {
     // rewind (rate≠1) instead of thrashing on resync.
     if (v.paused || v.seeking || Math.abs(v.playbackRate - 1) > 0.01) {
       if (this.anchored) this.unlock();
+      this.lastWall = -1; // re-probe progress when playback resumes
       return;
     }
+
+    // Stall detection: while supposedly playing, if the playhead isn't advancing in real time the
+    // element is rebuffering (it can do so without going paused). Go silent and wait — resyncing in
+    // place here would re-cut and replay the chunk over the frozen playhead, looping one audio frame.
+    const wall = cxt.currentTime;
+    if (this.lastWall >= 0) {
+      const wallDelta = wall - this.lastWall;
+      const mediaDelta = cur - this.lastMedia;
+      if (wallDelta > 0.005 && mediaDelta < 0.25 * wallDelta) {
+        if (this.anchored) this.unlock();
+        this.lastWall = wall; this.lastMedia = cur;
+        return;
+      }
+    }
+    this.lastWall = wall; this.lastMedia = cur;
 
     if (!this.anchored) {
       this.lockTo(cur);
@@ -205,7 +226,7 @@ export class WebAudioController {
       // Resync only on a real divergence (e.g. audio vs video hardware-clock drift). The audio sample
       // sounding now is at media time (cxt.currentTime - anchorCtx) + anchorMedia; compare to the
       // picture. Steady play stays well under MAX_DRIFT, so we never re-cut already-scheduled audio.
-      const audioMediaNow = (cxt.currentTime - this.anchorCtx) + this.anchorMedia;
+      const audioMediaNow = (wall - this.anchorCtx) + this.anchorMedia;
       if (Math.abs(audioMediaNow - cur) > MAX_DRIFT) this.lockTo(cur);
     }
     this.pump(cur);

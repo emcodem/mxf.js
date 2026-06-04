@@ -1,4 +1,4 @@
-class M {
+class C {
   constructor() {
     this.listeners = /* @__PURE__ */ new Map();
   }
@@ -29,8 +29,8 @@ class M {
     this.listeners.clear();
   }
 }
-const T = 2, B = 0.25, w = 3, A = 6, E = 0.75;
-class S extends M {
+const T = 2, B = 0.25, w = 3, A = 6, D = 0.75;
+class S extends C {
   constructor(e, t = !1) {
     super(), this.mediaSource = null, this.objectURL = null, this.sourceBuffers = /* @__PURE__ */ new Map(), this.queues = /* @__PURE__ */ new Map(), this.processing = /* @__PURE__ */ new Map(), this.video = e, this.debug = t;
   }
@@ -205,17 +205,17 @@ class S extends M {
     this.video.src = "", this.mediaSource = null, this.sourceBuffers.clear(), this.queues.clear(), this.removeAllListeners();
   }
 }
-const D = 40, P = 0.25, N = 0.08, I = 2, U = 30;
-class q {
+const E = 40, P = 0.25, N = 0.08, I = 2, U = 30;
+class W {
   constructor(e, t) {
-    this.video = e, this.onAudioInfo = t, this.cxt = null, this.timer = null, this.anchored = !1, this.anchorCtx = 0, this.anchorMedia = 0, this.runId = 0, this.store = [], this.channelCount = 0, this.active = [0, 1], this.editRateNumerator = 25, this.editRateDenominator = 1;
+    this.video = e, this.onAudioInfo = t, this.cxt = null, this.timer = null, this.anchored = !1, this.anchorCtx = 0, this.anchorMedia = 0, this.runId = 0, this.lastWall = -1, this.lastMedia = 0, this.store = [], this.channelCount = 0, this.active = [0, 1], this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
   setEditRate(e, t) {
     this.editRateNumerator = e, this.editRateDenominator = t;
   }
   /** Create the AudioContext (PCM that MSE can't play is routed here). Pinned to the source rate. */
   createContext(e) {
-    this.cxt = new AudioContext({ sampleRate: e }), this.timer || (this.timer = setInterval(() => this.tick(), D));
+    this.cxt = new AudioContext({ sampleRate: e }), this.timer || (this.timer = setInterval(() => this.tick(), E));
   }
   hasContext() {
     return this.cxt !== null;
@@ -315,14 +315,22 @@ class q {
     if (!e) return;
     const t = this.video, s = t.currentTime;
     if (this.evict(s), t.paused || t.seeking || Math.abs(t.playbackRate - 1) > 0.01) {
-      this.anchored && this.unlock();
+      this.anchored && this.unlock(), this.lastWall = -1;
       return;
     }
-    if (!this.anchored)
+    const i = e.currentTime;
+    if (this.lastWall >= 0) {
+      const r = i - this.lastWall, a = s - this.lastMedia;
+      if (r > 5e-3 && a < 0.25 * r) {
+        this.anchored && this.unlock(), this.lastWall = i, this.lastMedia = s;
+        return;
+      }
+    }
+    if (this.lastWall = i, this.lastMedia = s, !this.anchored)
       this.lockTo(s);
     else {
-      const i = e.currentTime - this.anchorCtx + this.anchorMedia;
-      Math.abs(i - s) > N && this.lockTo(s);
+      const r = i - this.anchorCtx + this.anchorMedia;
+      Math.abs(r - s) > N && this.lockTo(s);
     }
     this.pump(s);
   }
@@ -391,7 +399,7 @@ class q {
     }), this.cxt = null, this.anchored = !1, this.channelCount = 0;
   }
 }
-class L {
+class q {
   constructor(e, t, s, i) {
     this.video = e, this.requestPreview = t, this.settle = s, this.resume = i, this.active = !1, this.cycle = 0, this.latestFrame = null, this.seq = 0, this.watchdog = null, this.wasPlaying = !1, this.suppressSeeking = !1, this.hasStream = !1, this.duration = 0, this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
@@ -506,7 +514,7 @@ function v(n, e, t) {
   const r = s % e, a = Math.floor(s / e) % 60, o = Math.floor(s / (e * 60)) % 60;
   return { hours: Math.floor(s / (e * 3600)) % 24, minutes: o, seconds: a, frames: r, dropFrame: i, base: e };
 }
-function C(n) {
+function M(n) {
   const e = k(n.base, n.dropFrame) ? ";" : ":";
   return `${g(n.hours)}:${g(n.minutes)}:${g(n.seconds)}${e}${g(n.frames)}`;
 }
@@ -515,17 +523,17 @@ function V(n, e = 0) {
   const t = (n[0] & 15) + (n[0] >> 4 & 3) * 10, s = (n[0] & 64) !== 0, i = (n[1] & 15) + (n[1] >> 4 & 7) * 10, r = (n[2] & 15) + (n[2] >> 4 & 7) * 10;
   return { hours: (n[3] & 15) + (n[3] >> 4 & 3) * 10, minutes: r, seconds: i, frames: t, dropFrame: s, base: e };
 }
-const W = {
+const L = {
   startBufferSeconds: 10,
   maxBufferSeconds: 30,
   pcmAudioMode: "auto",
   seekMode: "accurate",
-  resumeBufferSeconds: E,
+  resumeBufferSeconds: D,
   debug: !1
 };
-class O extends M {
+class O extends C {
   constructor(e, t = {}) {
-    super(), this.worker = null, this.mseController = null, this.manifest = null, this.nextFetchFrame = 0, this.framesPerChunk = 50, this.rampChunkFrames = 50, this.fetchPending = !1, this.bufferFull = !1, this.editRateNumerator = 25, this.editRateDenominator = 1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.playIntent = !1, this.isBuffering = !1, this.startupGating = !1, this.manifestTimecodes = [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.rvfcHandle = 0, this.destroyed = !1, this.video = e, this.config = { ...W, ...t }, this.audio = new q(this.video, (s) => this.emit("audio-info", s)), this.scrub = new L(
+    super(), this.worker = null, this.mseController = null, this.manifest = null, this.nextFetchFrame = 0, this.framesPerChunk = 50, this.rampChunkFrames = 50, this.fetchPending = !1, this.bufferFull = !1, this.editRateNumerator = 25, this.editRateDenominator = 1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.playIntent = !1, this.isBuffering = !1, this.startupGating = !1, this.manifestTimecodes = [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.rvfcHandle = 0, this.destroyed = !1, this.video = e, this.config = { ...L, ...t }, this.audio = new W(this.video, (s) => this.emit("audio-info", s)), this.scrub = new q(
       this.video,
       (s, i) => {
         var r;
@@ -570,7 +578,7 @@ class O extends M {
       i.editUnit <= e && (!t || i.editUnit > t.editUnit) && (t = i);
     if (!t) return null;
     const s = t.frameCount + (e - t.editUnit);
-    return C(v(s, t.base, t.dropFrame));
+    return M(v(s, t.base, t.dropFrame));
   }
   /** Build the full timecode bundle (system + computed package TCs) for a rendered edit unit. */
   computeTimecodeBundle(e) {
@@ -579,7 +587,7 @@ class O extends M {
     s !== null && t.push({ source: "system", text: s, reliable: !0 });
     const i = ((u = this.manifest) == null ? void 0 : u.indexMode) !== "none", r = this.editRateNumerator / this.editRateDenominator;
     for (const h of this.manifestTimecodes) {
-      const c = h.editRateDenominator > 0 ? h.editRateNumerator / h.editRateDenominator : r, l = r > 0 ? Math.round(e * (c / r)) : e, f = C(v(h.position + l, h.base, h.dropFrame));
+      const c = h.editRateDenominator > 0 ? h.editRateNumerator / h.editRateDenominator : r, l = r > 0 ? Math.round(e * (c / r)) : e, f = M(v(h.position + l, h.base, h.dropFrame));
       t.push({ source: h.source, text: f, reliable: i });
     }
     const a = { system: 0, material: 1, source: 2, file: 3 };
@@ -952,7 +960,7 @@ class O extends M {
 export {
   O as MxfPlayer,
   V as decodeSmpte12mBcd,
-  C as formatTimecode,
+  M as formatTimecode,
   v as frameCountToTimecode,
   $ as timecodeToFrameCount
 };
