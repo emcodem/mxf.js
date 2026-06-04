@@ -144,7 +144,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // directly) as play intent so the buffer gate + buffering indicator apply to it too. NOTE: we do
     // NOT clear playIntent on 'pause' — the gate pauses the element itself while buffering, and that
     // must not be read as the user pausing; only the pause() method clears intent.
-    this.video.addEventListener('play', () => { this.playIntent = true; });
+    // Resume the PCM AudioContext here too: this fires within the user gesture for element-initiated
+    // play (native controls / a direct video.play()), so audio unlocks even when play() isn't used.
+    this.video.addEventListener('play', () => { this.playIntent = true; this.audio.resume(); });
 
     // Per-rendered-frame timecode: requestVideoFrameCallback's mediaTime is the EXACT composited
     // frame's time, so the timecode never lags the picture. Self-reschedules; timeupdate is the
@@ -285,7 +287,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     if (this.previewParked && this.manifest) this.initiateSeek(this.video.currentTime, 'accurate');
     this.playIntent = true;
     this.startupGating = true;   // gate this start on the buffer (cleared once 'playing' fires)
-    // PCM audio plays via Web Audio; resume the context on user gesture.
+    // PCM audio plays via Web Audio, slaved to the <video> clock: resume the context on this user
+    // gesture. The scheduler follows the element's own state (it gates on !paused), so audio won't
+    // sound during the buffer gate that holds the element paused, and starts when the picture does.
     this.audio.resume();
     // Don't blindly video.play() into an empty/thin buffer (the source of the cold-start stutter and
     // the "frozen for 2 s after a seek" feeling). maybeResumePlayback() shows the first decoded frame
@@ -296,6 +300,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   pause(): void {
     this.playIntent = false;
     this.video.pause();
+    this.audio.onSeek();   // stop audio at once — the playhead is frozen
     this.audio.suspend();
     this.setBuffering(false);
   }
@@ -322,6 +327,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // abandoned fetch won't post segmentDone, so clear fetchPending — endScrub's seek re-arms it.
     this.worker?.postMessage({ type: 'cancelPrefetch' } as WorkerCommand);
     this.fetchPending = false;
+    // Stop forward audio at once so the pre-scrub sound can't keep playing while the picture jumps
+    // around on previews; the scheduler re-locks on endScrub's accurate settle.
+    this.audio.onSeek();
     this.scrub.beginScrub();
   }
 
@@ -738,10 +746,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     );
     this.pendingSeeks++;
 
-    // Stop audio scheduled for the old position and drop the anchor so the next chunk re-locks to
-    // the new playhead — otherwise audio keeps playing at the pre-seek offset.
-    this.audio.flush();
-    this.audio.resetAnchor();
+    // Stop audio scheduled for the old position and drop the anchor so the scheduler re-locks to the
+    // new playhead — otherwise audio keeps playing at the pre-seek offset.
+    this.audio.onSeek();
 
     const cmd: WorkerCommand = { type: 'seek', targetFrame: this.seekTargetFrame };
     this.worker!.postMessage(cmd);
