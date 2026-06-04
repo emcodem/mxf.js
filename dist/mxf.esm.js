@@ -29,7 +29,7 @@ class v {
     this.listeners.clear();
   }
 }
-const x = 2, R = 6;
+const x = 2, R = 0.25, F = 3, T = 6;
 class S extends v {
   constructor(e, t = !1) {
     super(), this.mediaSource = null, this.objectURL = null, this.sourceBuffers = /* @__PURE__ */ new Map(), this.queues = /* @__PURE__ */ new Map(), this.processing = /* @__PURE__ */ new Map(), this.video = e, this.debug = t;
@@ -70,7 +70,7 @@ class S extends v {
    * enough to remove.
    */
   trimBackBuffer(e) {
-    const t = e - R;
+    const t = e - T;
     if (!(t <= 0))
       for (const [s, i] of this.sourceBuffers) {
         if (i.buffered.length === 0) continue;
@@ -190,7 +190,7 @@ class S extends v {
     this.video.src = "", this.mediaSource = null, this.sourceBuffers.clear(), this.queues.clear(), this.removeAllListeners();
   }
 }
-class F {
+class B {
   constructor(e, t) {
     this.video = e, this.onAudioInfo = t, this.cxt = null, this.startTime = null, this.channelCount = 0, this.active = [0, 1], this.scheduled = [], this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
@@ -324,7 +324,7 @@ class F {
     this.scheduled = e;
   }
 }
-class T {
+class y {
   constructor(e, t, s) {
     this.video = e, this.requestPreview = t, this.settle = s, this.active = !1, this.cycle = 0, this.latestFrame = null, this.seq = 0, this.watchdog = null, this.wasPlaying = !1, this.suppressSeeking = !1, this.hasStream = !1, this.duration = 0, this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
@@ -410,16 +410,16 @@ class T {
     this.watchdog !== null && (clearTimeout(this.watchdog), this.watchdog = null);
   }
 }
-const B = {
+const P = {
   startBufferSeconds: 10,
   maxBufferSeconds: 30,
   pcmAudioMode: "auto",
   seekMode: "accurate",
   debug: !1
 };
-class y extends v {
+class D extends v {
   constructor(e, t = {}) {
-    super(), this.worker = null, this.mseController = null, this.manifest = null, this.nextFetchFrame = 0, this.framesPerChunk = 50, this.fetchPending = !1, this.bufferFull = !1, this.editRateNumerator = 25, this.editRateDenominator = 1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.video = e, this.config = { ...B, ...t }, this.audio = new F(this.video, (s) => this.emit("audio-info", s)), this.scrub = new T(
+    super(), this.worker = null, this.mseController = null, this.manifest = null, this.nextFetchFrame = 0, this.framesPerChunk = 50, this.rampChunkFrames = 50, this.fetchPending = !1, this.bufferFull = !1, this.editRateNumerator = 25, this.editRateDenominator = 1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.video = e, this.config = { ...P, ...t }, this.audio = new B(this.video, (s) => this.emit("audio-info", s)), this.scrub = new y(
       this.video,
       (s, i) => {
         var r;
@@ -596,7 +596,7 @@ class y extends v {
     const t = e.pictureDescriptor, s = e.soundDescriptor;
     this.editRateNumerator = e.editRateNumerator, this.editRateDenominator = e.editRateDenominator, this.audio.setEditRate(e.editRateNumerator, e.editRateDenominator), this.scrub.setStream(e.duration, e.editRateNumerator, e.editRateDenominator);
     const i = e.editRateNumerator / e.editRateDenominator;
-    this.framesPerChunk = Math.ceil(i * x), this.manifest = {
+    this.framesPerChunk = Math.ceil(i * x), this.rampChunkFrames = Math.max(F, Math.ceil(i * R)), this.manifest = {
       duration: e.duration,
       editRateNumerator: e.editRateNumerator,
       editRateDenominator: e.editRateDenominator,
@@ -634,8 +634,8 @@ class y extends v {
     };
     this.seqBase += 2, this.worker.postMessage(s);
   }
-  fetchNextChunk(e = this.framesPerChunk) {
-    var a;
+  fetchNextChunk(e) {
+    var o;
     if (this.scrub.isActive || this.previewParked || this.bufferFull || this.fetchPending || !this.manifest) return;
     const t = this.video.currentTime, s = this.editRateNumerator / this.editRateDenominator;
     if (this.nextFetchFrame / s - t >= this.config.maxBufferSeconds) return;
@@ -643,17 +643,25 @@ class y extends v {
       this.manifest.duration * this.editRateNumerator / this.editRateDenominator
     );
     if (this.nextFetchFrame >= r) {
-      (a = this.mseController) == null || a.endOfStream();
+      (o = this.mseController) == null || o.endOfStream();
       return;
     }
+    const n = e ?? this.nextRampChunk();
     this.fetchPending = !0;
-    const n = {
+    const a = {
       type: "fetchSegment",
       startFrame: this.nextFetchFrame,
-      frameCount: e,
+      frameCount: n,
       seqBase: this.seqBase
     };
-    this.seqBase += 2, this.nextFetchFrame += e, this.worker.postMessage(n);
+    this.seqBase += 2, this.nextFetchFrame += n, this.worker.postMessage(a);
+  }
+  /** Return the current cold-start ramp size, then grow it ×2 toward framesPerChunk. A fresh load
+   *  ramps ~0.25 s → 0.5 s → 1 s → 2 s so the first paint is fast without a big first download, then
+   *  settles at the full chunk. Reset per file in onManifest. */
+  nextRampChunk() {
+    const e = this.rampChunkFrames;
+    return this.rampChunkFrames = Math.min(this.framesPerChunk, this.rampChunkFrames * 2), e;
   }
   onVideoSeeking() {
     if (!this.manifest || this.scrub.consumeSuppressedSeeking()) return;
@@ -695,6 +703,6 @@ class y extends v {
   }
 }
 export {
-  y as MxfPlayer
+  D as MxfPlayer
 };
 //# sourceMappingURL=mxf.esm.js.map

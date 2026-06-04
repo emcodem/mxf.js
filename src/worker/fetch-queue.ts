@@ -31,8 +31,14 @@ export class FetchQueue {
   /**
    * @param run Executes one job, receiving an AbortSignal that fires when the job is superseded.
    *   The queue awaits it to completion before starting the next.
+   * @param onSupersede Optional hook fired inside supersede(), so a worker that keeps read-ahead
+   *   state outside the queue (e.g. a speculative byte prefetch) can abort it in the same choke point
+   *   that drops queued/in-flight jobs.
    */
-  constructor(private readonly run: (job: FetchJob, signal: AbortSignal) => Promise<void>) {}
+  constructor(
+    private readonly run: (job: FetchJob, signal: AbortSignal) => Promise<void>,
+    private readonly onSupersede?: () => void,
+  ) {}
 
   /** The live generation. An in-flight job whose captured gen differs has been superseded. */
   get currentGeneration(): number {
@@ -58,6 +64,7 @@ export class FetchQueue {
     this.generation++;
     this.queue.length = 0;
     this.currentAbort?.abort(); // cancel the in-flight read so it doesn't download to completion
+    this.onSupersede?.();       // let the worker abort any speculative read-ahead it owns
     return this.generation;
   }
 

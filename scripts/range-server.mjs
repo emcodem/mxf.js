@@ -36,7 +36,12 @@ const MIME = {
   '.txt': 'text/plain; charset=utf-8',
 };
 
-const CHUNK = 64 * 1024; // throttle pacing granularity
+const CHUNK = 64 * 1024; // read granularity
+// Minimum sleep granule for the deadline pacer. setTimeout below ~1 ms is clamped by Node (and fires
+// late under load), so pacing per 64 KB chunk would floor any rate at ~64 KB/1 ms ≈ 512 Mbit and tax
+// every read — a 1G/10G rate could never simulate a fast line. We sleep only when ahead of schedule
+// by at least this much, keeping low rates accurate and high rates near-transparent.
+const PACE_MIN_MS = 4;
 
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -62,6 +67,13 @@ async function streamRange(res, filePath, start, end, bytesPerSec) {
     return;
   }
 
+  // Deadline-based pacing: track cumulative bytes against a wall-clock start and sleep only when
+  // ahead of the ideal schedule by ≥PACE_MIN_MS. A per-chunk setTimeout(bytes/rate) would clamp to
+  // Node's ~1 ms timer floor on every 64 KB, capping any rate at ~512 Mbit and taxing every read —
+  // so high settings (1G/10G) behaved no faster than ~512 Mbit. This keeps low rates accurate and
+  // high rates near-transparent.
+  const t0 = performance.now();
+  let sent = 0;
   try {
     for await (const chunk of stream) {
       if (aborted) return;
@@ -70,7 +82,9 @@ async function streamRange(res, filePath, start, end, bytesPerSec) {
         await new Promise((resolve) => { res.once('drain', resolve); res.once('close', resolve); });
         if (aborted) return;
       }
-      await delay((chunk.length / bytesPerSec) * 1000);
+      sent += chunk.length;
+      const ahead = (sent / bytesPerSec) * 1000 - (performance.now() - t0);
+      if (ahead >= PACE_MIN_MS) await delay(ahead);
     }
     res.end();
   } catch {

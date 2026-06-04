@@ -3,7 +3,7 @@ import { MseController } from './mse/mse-controller.js';
 import { WebAudioController } from './audio/web-audio-controller.js';
 import { ScrubController } from './scrub-controller.js';
 import { WorkerCommand, WorkerEvent } from './worker/worker-messages.js';
-import { CHUNK_DURATION_SECONDS } from './core/constants.js';
+import { CHUNK_DURATION_SECONDS, FIRST_CHUNK_DURATION_SECONDS, MIN_CHUNK_FRAMES } from './core/constants.js';
 
 export interface MxfConfig {
   /** Seconds of content to buffer before starting playback */
@@ -54,6 +54,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private readonly audio: WebAudioController;
   private nextFetchFrame = 0;
   private framesPerChunk = 50;   // fetch ~2 seconds at 25fps
+  // Cold-start ramp: the first forward fetches start small (fast first paint on a thin line) and
+  // grow ×2 up to framesPerChunk. Seeded in onManifest; consumed only by default fetchNextChunk().
+  private rampChunkFrames = 50;
   private fetchPending = false;
   // Set when the SourceBuffer is full and nothing behind the playhead can be evicted (the forward
   // buffer alone is over quota — e.g. high-bitrate AVC-Intra). Blocks fetching until the playhead
@@ -347,6 +350,8 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
     const fps = event.editRateNumerator / event.editRateDenominator;
     this.framesPerChunk = Math.ceil(fps * CHUNK_DURATION_SECONDS);
+    // Reset the cold-start ramp for this file: first fetch ≈ FIRST_CHUNK_DURATION_SECONDS of frames.
+    this.rampChunkFrames = Math.max(MIN_CHUNK_FRAMES, Math.ceil(fps * FIRST_CHUNK_DURATION_SECONDS));
 
     this.manifest = {
       duration: event.duration,
@@ -423,7 +428,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.worker!.postMessage(cmd);
   }
 
-  private fetchNextChunk(frameCount = this.framesPerChunk): void {
+  private fetchNextChunk(explicitFrames?: number): void {
     // Suspend normal forward fetching while scrubbing — previews drive the buffer instead, and a
     // normal fetch from nextFetchFrame would compete with them on the shared decoder/encoder.
     if (this.scrub.isActive) return;
@@ -453,6 +458,11 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       return;
     }
 
+    // Resolve the chunk size only now that we're committed to posting — an explicit size (the seek
+    // path) bypasses the ramp; a default forward fetch consumes and grows it. Computing it here (not
+    // as a default arg) means the early-return guards above don't burn ramp steps.
+    const frameCount = explicitFrames ?? this.nextRampChunk();
+
     this.fetchPending = true;
     const cmd: WorkerCommand = {
       type: 'fetchSegment',
@@ -463,6 +473,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.seqBase += 2;
     this.nextFetchFrame += frameCount;
     this.worker!.postMessage(cmd);
+  }
+
+  /** Return the current cold-start ramp size, then grow it ×2 toward framesPerChunk. A fresh load
+   *  ramps ~0.25 s → 0.5 s → 1 s → 2 s so the first paint is fast without a big first download, then
+   *  settles at the full chunk. Reset per file in onManifest. */
+  private nextRampChunk(): number {
+    const n = this.rampChunkFrames;
+    this.rampChunkFrames = Math.min(this.framesPerChunk, this.rampChunkFrames * 2);
+    return n;
   }
 
   private onVideoSeeking(): void {

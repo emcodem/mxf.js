@@ -15,6 +15,11 @@ import { parseRate } from './scripts/range-server.mjs';
 //   latency (ms) is paid once per request BEFORE the response; rate=0 (or absent) = unthrottled.
 const MEDIA_DIR = path.resolve(process.env.MXF_MEDIA_DIR ?? 'C:/temp/mxf.js');
 const THROTTLE_CHUNK = 64 * 1024;
+// Minimum sleep granule for the deadline pacer. setTimeout below ~1 ms is clamped by Node (and fires
+// late under load), so pacing per 64 KB chunk would floor any rate at ~64 KB/1 ms ≈ 512 Mbit and tax
+// every read — a 1G/10G knob could never simulate a fast line. We instead sleep only when genuinely
+// ahead of schedule by at least this much, keeping low rates accurate and high rates near-transparent.
+const PACE_MIN_MS = 4;
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Live network-sim overrides, settable at runtime via POST /__latency, so the demo's knobs can
@@ -26,11 +31,19 @@ let liveBytesPerSec: number | null = null;
 // Pipe a read stream to the response, optionally pacing to `bytesPerSec` (0 = no throttle).
 // Honours backpressure and bails if the client aborts (a superseded seek/scrub), so a cancelled
 // read doesn't keep pacing a dead socket. Mirrors range-server.mjs's streamRange.
+//
+// Pacing is DEADLINE-based, not per-chunk: we track cumulative bytes against a wall-clock start and
+// sleep only when ahead of the ideal schedule by ≥PACE_MIN_MS. A per-chunk `setTimeout(bytes/rate)`
+// would clamp to Node's ~1 ms timer floor on every 64 KB, capping any configured rate at ~512 Mbit
+// and adding a fixed per-read tax — so 1G/10G settings behaved no better than ~512 Mbit. This keeps
+// low rates accurate while making high rates near-transparent (rare, coarse sleeps).
 async function pipeThrottled(stream: any, res: any, bytesPerSec: number) {
   if (!bytesPerSec) { stream.pipe(res); return; }
   let aborted = false;
   const onClose = () => { aborted = true; stream.destroy(); };
   res.on('close', onClose);
+  const t0 = performance.now();
+  let sent = 0;
   try {
     for await (const chunk of stream) {
       if (aborted) return;
@@ -38,7 +51,9 @@ async function pipeThrottled(stream: any, res: any, bytesPerSec: number) {
         await new Promise((resolve) => { res.once('drain', resolve); res.once('close', resolve); });
         if (aborted) return;
       }
-      await delay((chunk.length / bytesPerSec) * 1000);
+      sent += chunk.length;
+      const ahead = (sent / bytesPerSec) * 1000 - (performance.now() - t0);
+      if (ahead >= PACE_MIN_MS) await delay(ahead);
     }
     res.end();
   } catch {

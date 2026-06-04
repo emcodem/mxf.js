@@ -41,6 +41,15 @@ export const SEQ_HARD_CAP = 64 * 1024 * 1024;
 // ── Playback buffering (mxf-player.ts, mse-controller.ts) ────────────────────
 /** Target media duration per fetched chunk (frames = ceil(fps * this)). */
 export const CHUNK_DURATION_SECONDS = 2;
+/** Target media duration of the FIRST cold-start fetch, so play-to-first-frame is fast on thin
+ *  lines. The full CHUNK_DURATION_SECONDS chunk (~2 s ≈ 12.5 MB for 50 Mbit XDCAM) would block
+ *  first paint on ~2 s of download; the cold-start fetch ramps from this up to the full size. */
+export const FIRST_CHUNK_DURATION_SECONDS = 0.25;
+/** Floor on any ramped chunk, independent of frame rate. 3 is the IBBP (XDCAM HD Long-GOP) decode
+ *  minimum: I + enough following coded frames to flush the held display-0 anchor out (the
+ *  intervening B's need their backward P reference). For real XDCAM HD rates this floor never binds
+ *  — ceil(fps*FIRST_CHUNK_DURATION_SECONDS) is ≥7 @25p / ≥13 @50i — it only guards low fps. */
+export const MIN_CHUNK_FRAMES = 3;
 /** Seconds of already-played media to keep behind the playhead before evicting. */
 export const BACK_BUFFER_SECONDS = 6;
 

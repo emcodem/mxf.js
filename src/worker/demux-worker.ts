@@ -60,10 +60,38 @@ let longGopBoundaryPending = true;
 // side effect of no-index scans, so a seek can resume near the target instead of rescanning from 0.
 let sparseKf: SparseKeyframeIndex | null = null;
 
+// Speculative read-ahead (MPEG-2 forward-play only): the byte-fetch of the NEXT contiguous chunk is
+// kicked off right before the current chunk's (event-loop-blocking) decode, so its download runs on
+// the network thread DURING the decode instead of after it. Without it the worker reads then decodes
+// SERIALLY, leaving the network idle through every decode — so on a bandwidth-constrained line
+// download+decode is ~break-even and the forward buffer can't grow (sustained play stutters). Keyed by
+// (startFrame, frameCount, gen); a mismatch (ramp step, seek) is a cheap miss → normal read; supersede
+// aborts it. Confined to the MPEG-2 transcode path (where decode dominates); H.264 remux is unaffected.
+let speculativePrefetch:
+  | { startFrame: number; frameCount: number; gen: number; abort: AbortController; promise: Promise<EssenceFrame[]> }
+  | null = null;
+
+/** Read a contiguous run of raw essence frames (exact, no keyframe snap) — the MPEG-2 read phase,
+ *  used for the speculative read-ahead (a fresh EssenceExtractor + signal, independent of any job). */
+async function readRawFrames(startFrame: number, frameCount: number, signal: AbortSignal): Promise<EssenceFrame[]> {
+  const extractor = new EssenceExtractor(loader!, mxfFile!.getBootstrap()!, signal);
+  const frames: EssenceFrame[] = [];
+  for await (const frame of extractor.fetchFrames(BigInt(startFrame), frameCount, true)) frames.push(frame);
+  return frames;
+}
+
+/** Abort + drop any in-flight speculative read-ahead (on supersede, or before a fresh non-matching read). */
+function abortSpeculation(): void {
+  if (speculativePrefetch) { speculativePrefetch.abort.abort(); speculativePrefetch = null; }
+}
+
 // Serializes fetches (one at a time) and lets a seek discard superseded work — see FetchQueue.
 // run executes one job by delegating to handleFetchSegment (hoisted, so referencing it here is fine).
-const fetchQ = new FetchQueue((job, signal) =>
-  handleFetchSegment(job.startFrame, job.frameCount, job.seqBase, job.gen, job.stretchToFrames, job.previewSeq, signal),
+// onSupersede aborts the speculative read-ahead in the same choke point that drops queued jobs.
+const fetchQ = new FetchQueue(
+  (job, signal) =>
+    handleFetchSegment(job.startFrame, job.frameCount, job.seqBase, job.gen, job.stretchToFrames, job.previewSeq, signal),
+  abortSpeculation,
 );
 // seqBase pool for internally-scheduled scrub-preview decodes (kept apart from the player's seqBase).
 let scrubSeqBase = 1_000_000;
@@ -88,6 +116,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
   longGop = null;
   longGopBoundaryPending = true;
   sparseKf = null;
+  abortSpeculation();
   scrubSegmentCache.clear();
 
   try {
@@ -126,12 +155,19 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
     // MPEG-2 path: transcode to H.264 so MSE / native video element can play
     // -----------------------------------------------------------------------
     if (pd?.codec === 'mpeg2') {
-      const extractor = new EssenceExtractor(loader_, bootstrap);
+      // Find the first video frame for the probe-decode. The index path fetches the WHOLE requested
+      // range in one HTTP read before yielding (essence-extractor.ts), so the old `fetchFrames(0n, 50)`
+      // pulled ~50 edit units (~2 s of bytes on a thin line) just to grab frame 0 — then the cold-start
+      // ramp re-reads frame 0 anyway. Standard OP1a/D-10 puts the first picture element in edit unit 0,
+      // so read just the first edit unit or two; escalate to the wide scan only if pathological
+      // interleaving hides it, keeping the common case a tiny read.
       let firstVideoFrame: EssenceFrame | null = null;
-      // Fetch up to 50 frames — in OP1a interleaved files audio frames may
-      // precede video frames within the same edit unit batch.
-      for await (const frame of extractor.fetchFrames(0n, 50)) {
-        if (frame.trackType === 'video') { firstVideoFrame = frame; break; }
+      for (const probeCount of [2, 50]) {
+        const extractor = new EssenceExtractor(loader_, bootstrap);
+        for await (const frame of extractor.fetchFrames(0n, probeCount)) {
+          if (frame.trackType === 'video') { firstVideoFrame = frame; break; }
+        }
+        if (firstVideoFrame) break;
       }
       if (!firstVideoFrame) {
         postError('MPEG-2: no video frames found in first 50 edit units', true);
@@ -372,9 +408,24 @@ async function handleFetchSegment(
       // already decoded. Long-GOP also fetches exact (from the snapped keyframe). Seeks land on a
       // keyframe anyway, where exact and snapped agree.
       const exact = !!mpeg2Pipeline || !!longGop;
-      const frames: EssenceFrame[] = [];
-      for await (const frame of extractor.fetchFrames(BigInt(fetchStart), fetchCount, exact)) {
-        frames.push(frame);
+
+      // MPEG-2 forward play: if the previous segment speculatively prefetched THIS exact chunk, its
+      // bytes are already downloading/done — await that instead of starting the read serially after
+      // the previous decode. Otherwise read fresh (and drop any non-matching speculation).
+      const specHit = !!mpeg2Pipeline && !!speculativePrefetch
+        && speculativePrefetch.startFrame === fetchStart
+        && speculativePrefetch.frameCount === fetchCount
+        && speculativePrefetch.gen === gen;
+      let frames: EssenceFrame[];
+      if (specHit) {
+        frames = await speculativePrefetch!.promise;
+        speculativePrefetch = null;
+      } else {
+        abortSpeculation();
+        frames = [];
+        for await (const frame of extractor.fetchFrames(BigInt(fetchStart), fetchCount, exact)) {
+          frames.push(frame);
+        }
       }
 
       // A seek arrived while we were reading bytes: the decoder has been reset to a new
@@ -384,6 +435,20 @@ async function handleFetchSegment(
 
       videoFrames = frames.filter(f => f.trackType === 'video');
       audioFrames = frames.filter(f => f.trackType === 'audio');
+
+      // Kick off the NEXT contiguous chunk's read NOW — before the decode below — so its download runs
+      // on the network thread DURING this segment's decode (which otherwise blocks the event loop and
+      // idles the network). Forward MPEG-2 only; skip at EOF (short read) and for previews / stretched
+      // keyframe fetches (non-contiguous and superseded constantly).
+      if (mpeg2Pipeline && !isScrubPreview && stretchToFrames === 0 && videoFrames.length === fetchCount) {
+        const nextStart = fetchStart + fetchCount;
+        const ab = new AbortController();
+        const promise = readRawFrames(nextStart, fetchCount, ab.signal);
+        // Detached handler so an abort before a job claims this promise isn't an unhandled rejection;
+        // a claiming job still awaits `promise` and handles its own errors via the outer try/catch.
+        promise.catch(() => {});
+        speculativePrefetch = { startFrame: nextStart, frameCount: fetchCount, gen, abort: ab, promise };
+      }
     }
 
     // -----------------------------------------------------------------------
