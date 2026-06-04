@@ -4,6 +4,8 @@ A JavaScript **MXF demuxer + player** that runs entirely in the browser — no s
 
 Think of it as `hls.js`, but the source container is MXF.
 
+**▶ Live demo: [emcodem.github.io/mxf.js/demo](https://emcodem.github.io/mxf.js/demo/index.html)** — open a local MXF with the file picker. (The demo's *Load URL* default and the latency/bandwidth simulator rely on the local dev server's `/media` route, so those only work via `npm run dev`.)
+
 ```
 HTTP Range / File API ──► Web Worker ──► demux ──► remux / transcode (fMP4) ──► MSE ──► <video>
                                                                                └─ PCM ─► Web Audio
@@ -109,7 +111,7 @@ player.setAudioChannels([0, 1]);   // route source channels 1 & 2 → stereo L/R
 player.setAudioChannels([]);       // mute
 ```
 
-A runnable demo is in [`demo/index.html`](demo/index.html) (`npm run dev`, then open the page).
+A runnable demo is in [`demo/index.html`](demo/index.html) (`npm run dev`, then open the page), or try the [hosted version on GitHub Pages](https://emcodem.github.io/mxf.js/demo/index.html).
 
 ---
 
