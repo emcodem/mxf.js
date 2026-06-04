@@ -9,6 +9,18 @@ export interface ManifestData {
   tracks: MxfTrack[];
   pictureDescriptor: PictureDescriptor | null;
   soundDescriptor: SoundDescriptor | null;
+  /**
+   * Active picture dimensions to DISPLAY — the real frame size, not the descriptor's per-field
+   * StoredHeight (e.g. 720×576, not 720×288). 0 when unknown. Pair with `aspectRatio` for the shape.
+   */
+  displayWidth: number;
+  displayHeight: number;
+  /**
+   * Display aspect ratio (DAR) parsed from the MXF descriptor (e.g. `{num:16,den:9}`), or null for
+   * square pixels. The picture is already rendered at this shape (a `pasp` box carries it into MSE);
+   * this field lets the UI label it — e.g. show `${displayWidth}×${displayHeight}` plus `16:9`.
+   */
+  aspectRatio: { num: number; den: number } | null;
   /** Seeking strategy this file supports: 'cbg' | 'vbe' | 'none'. */
   indexMode: IndexMode;
   /** True for H.264 Long-GOP (XAVC-L) streams (B-frame reorder applied on fetch). */

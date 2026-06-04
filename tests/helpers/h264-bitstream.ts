@@ -31,6 +31,17 @@ export interface SpsFields {
   picOrderCntType?: number;
   log2MaxPicOrderCntLsb?: number;  // actual value (>= 4), type 0
   frameMbsOnly?: boolean;
+  /** chroma_format_idc for high profiles (1=4:2:0, 2=4:2:2). Default 1. */
+  chromaFormatIdc?: number;
+  /** pic_width_in_mbs_minus1 (default 119 → 1920). */
+  picWidthInMbsMinus1?: number;
+  /** pic_height_in_map_units_minus1 (default 67). For frame_mbs_only=0, coded height = 2·(v+1)·16. */
+  picHeightInMapUnitsMinus1?: number;
+  /** When any crop offset is set, the SPS emits the post-frame_mbs_only fields + frame_cropping. */
+  cropLeft?: number;
+  cropRight?: number;
+  cropTop?: number;
+  cropBottom?: number;
 }
 
 /** Build an SPS NAL (header byte 0x67) carrying the given POC-relevant fields. */
@@ -48,7 +59,7 @@ export function buildSps(f: SpsFields = {}): Uint8Array {
   w.ue(0);              // seq_parameter_set_id
   const isHigh = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].includes(profileIdc);
   if (isHigh) {
-    w.ue(1);            // chroma_format_idc = 1 (4:2:0)
+    w.ue(f.chromaFormatIdc ?? 1); // chroma_format_idc (default 1 = 4:2:0)
     w.ue(0);            // bit_depth_luma_minus8
     w.ue(0);            // bit_depth_chroma_minus8
     w.u1(0);            // qpprime_y_zero_transform_bypass_flag
@@ -66,10 +77,18 @@ export function buildSps(f: SpsFields = {}): Uint8Array {
   }
   w.ue(2);              // max_num_ref_frames
   w.u1(0);              // gaps_in_frame_num_value_allowed_flag
-  w.ue(119);            // pic_width_in_mbs_minus1  (1920)
-  w.ue(67);             // pic_height_in_map_units_minus1 (1088)
+  w.ue(f.picWidthInMbsMinus1 ?? 119);            // pic_width_in_mbs_minus1  (default 1920)
+  w.ue(f.picHeightInMapUnitsMinus1 ?? 67);       // pic_height_in_map_units_minus1
   w.u1(frameMbsOnly ? 1 : 0);
-  // (parser stops here)
+  // POC parsing stops here; the display-dimension parse continues through frame_cropping. Emit those
+  // fields only when a crop is requested (keeps existing fixtures byte-identical via zero-extension).
+  const cropL = f.cropLeft ?? 0, cropR = f.cropRight ?? 0, cropT = f.cropTop ?? 0, cropB = f.cropBottom ?? 0;
+  if (cropL || cropR || cropT || cropB) {
+    if (!frameMbsOnly) w.u1(0); // mb_adaptive_frame_field_flag
+    w.u1(0);                    // direct_8x8_inference_flag
+    w.u1(1);                    // frame_cropping_flag
+    w.ue(cropL); w.ue(cropR); w.ue(cropT); w.ue(cropB);
+  }
   const payload = w.bytes();
   const out = new Uint8Array(payload.length + 1);
   out[0] = 0x67;        // nal_ref_idc=3, type=7 (SPS)

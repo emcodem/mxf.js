@@ -3,7 +3,7 @@ import { EssenceFrame } from '../essence/essence-extractor.js';
 import { isAnnexB, annexBtoAVCC, extractSPSPPS, parseSPSCodedDimensions } from '../essence/avc-tools.js';
 import {
   ftyp, moov, mvhd, trak, tkhd, mdia, vmhd, smhd, stbl, stsd,
-  avc1, mp4v, mp4a, sowt, mvex, trex, moof, mdat, traf, TrunSample,
+  avc1, mp4v, mp4a, sowt, mvex, trex, moof, mdat, traf, pasp, TrunSample,
 } from './mp4-boxes.js';
 
 // Track IDs
@@ -32,6 +32,11 @@ export class Mp4Fragmenter {
   private videoCodec: 'h264' | 'mpeg2' | 'unknown' = 'unknown';
   private transcodeWidth = 0;
   private transcodeHeight = 0;
+  // Display (active, post-crop) dimensions for the transcode path — used only to derive the pixel
+  // aspect ratio (pasp). The coded height may be MB-padded (e.g. 1088 for a 1080 picture); the DAR
+  // refers to the active picture, so the pasp must be computed from these, not the coded dims.
+  private transcodeDisplayWidth = 0;
+  private transcodeDisplayHeight = 0;
 
   constructor(metadata: MxfMetadata) {
     this.metadata = metadata;
@@ -85,6 +90,17 @@ export class Mp4Fragmenter {
         if (dims) { w = dims.width; h = dims.height; }
       }
 
+      // Pixel aspect ratio (anamorphic display). The MXF AspectRatio item is the DISPLAY aspect
+      // ratio (e.g. 16:9); the pixel grid may be 4:3 (SD 720×576/608, XDCAM-EX 1440×1080). Derive
+      // the pasp sample ratio from the DAR and the active (display) dimensions so the <video> shows
+      // the right shape. Computed from display dims (transcode path supplies them; native H.264
+      // falls back to the coded avc1 dims — all real AVC content here is already square). Absent or
+      // ~square AR ⇒ no pasp box ⇒ 1:1, the previous behaviour.
+      const dispW = this.transcodeDisplayWidth || w;
+      const dispH = this.transcodeDisplayHeight || h;
+      const par = pixelAspectRatio(pd.aspectRatioNum, pd.aspectRatioDen, dispW, dispH);
+      const paspBox = par ? pasp(par.h, par.v) : undefined;
+
       let codecBox: Uint8Array;
       if (this.videoCodec === 'h264') {
         if (this.spsNALUs.length === 0 || this.ppsNALUs.length === 0) {
@@ -95,9 +111,9 @@ export class Mp4Fragmenter {
           // first keyframe; surface that it couldn't rather than guessing.
           throw new Error('Cannot build H.264 init segment: SPS/PPS unavailable (extraction from the first keyframe failed)');
         }
-        codecBox = avc1(w, h, this.spsNALUs, this.ppsNALUs);
+        codecBox = avc1(w, h, this.spsNALUs, this.ppsNALUs, paspBox);
       } else {
-        codecBox = mp4v(w, h);
+        codecBox = mp4v(w, h, paspBox);
       }
 
       const videoStbl = stbl(stsd(codecBox));
@@ -246,12 +262,14 @@ export class Mp4Fragmenter {
   /** Switch to H.264 transcode mode: overrides codec and sets display dimensions from the
    *  MPEG-2 elementary stream (more reliable than the MXF descriptor stored dimensions). The
    *  transcoder emits a single SPS/PPS pair. */
-  enableTranscodeMode(sps: Uint8Array, pps: Uint8Array, width = 0, height = 0): void {
+  enableTranscodeMode(sps: Uint8Array, pps: Uint8Array, width = 0, height = 0, displayWidth = 0, displayHeight = 0): void {
     this.videoCodec = 'h264';
     this.spsNALUs = [sps];
     this.ppsNALUs = [pps];
     this.transcodeWidth = width;
     this.transcodeHeight = height;
+    this.transcodeDisplayWidth = displayWidth;
+    this.transcodeDisplayHeight = displayHeight;
   }
 
   /**
@@ -316,6 +334,32 @@ export class Mp4Fragmenter {
     if (this.spsNALUs.length === 0 || this.ppsNALUs.length === 0) return null;
     return { sps: this.spsNALUs, pps: this.ppsNALUs };
   }
+}
+
+/**
+ * Derive the pixel (sample) aspect ratio for a `pasp` box from the MXF Display Aspect Ratio and the
+ * active picture dimensions:  SAR = DAR ÷ (W/H) = (darNum·H)/(darDen·W), reduced to lowest terms.
+ * This matches ffmpeg's reported SAR (720×576 @16:9 → 64:45, 1440×1080 @16:9 → 4:3, 1920×1080 @16:9
+ * → 1:1). Returns null — meaning "emit no pasp, render 1:1" — when the AR is absent/invalid or the
+ * result is within ~2% of square. The square tolerance both keeps genuinely-square content clean and
+ * absorbs coded-vs-display height rounding (e.g. a 1088-coded / 1080-display 16:9 frame → 1:1, not
+ * 136:135). No real-world non-square SAR (the closest are 12:11≈1.09 and 10:11≈0.91) falls inside it.
+ */
+function pixelAspectRatio(darNum: number, darDen: number, width: number, height: number): { h: number; v: number } | null {
+  if (darNum <= 0 || darDen <= 0 || width <= 0 || height <= 0) return null;
+  let hSp = darNum * height;
+  let vSp = darDen * width;
+  const g = gcd(hSp, vSp);
+  hSp = Math.round(hSp / g);
+  vSp = Math.round(vSp / g);
+  if (Math.abs(hSp / vSp - 1) < 0.02) return null; // square (incl. coded-vs-display padding)
+  return { h: hSp, v: vSp };
+}
+
+function gcd(a: number, b: number): number {
+  a = Math.abs(a); b = Math.abs(b);
+  while (b) { const t = b; b = a % b; a = t; }
+  return a || 1;
 }
 
 function getSampleRateIndex(sampleRate: number): number {

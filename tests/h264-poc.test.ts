@@ -70,6 +70,30 @@ describe('parseSpsPocInfo', () => {
     expect(info.frameMbsOnlyFlag).toBe(true);
     expect(info.separateColourPlaneFlag).toBe(false);
   });
+
+  it('display dims equal coded dims when there is no frame_cropping', () => {
+    const info = parseSpsPocInfo(buildSps({ frameMbsOnly: true }))!; // 1920×1088 coded
+    expect([info.codedWidth, info.codedHeight]).toEqual([1920, 1088]);
+    expect([info.displayWidth, info.displayHeight]).toEqual([1920, 1088]);
+  });
+
+  it('crops 1088→1080 for interlaced 4:2:2 (cropUnitY = SubHeightC·2 = 2)', () => {
+    // 1080i: frame_mbs_only=0, pic_height_in_map_units_minus1=33 → coded height (2)·(34)·16 = 1088.
+    // 4:2:2 → SubHeightC=1, cropUnitY = 1·(2-0) = 2; cropBottom 4 → 1088 − 2·4 = 1080.
+    const info = parseSpsPocInfo(buildSps({
+      profileIdc: 122, chromaFormatIdc: 2, frameMbsOnly: false,
+      picHeightInMapUnitsMinus1: 33, cropBottom: 4,
+    }))!;
+    expect(info.codedHeight).toBe(1088);
+    expect(info.displayHeight).toBe(1080);
+    expect(info.displayWidth).toBe(info.codedWidth);
+  });
+
+  it('crops width for progressive 4:2:0 (cropUnitX = SubWidthC = 2)', () => {
+    const info = parseSpsPocInfo(buildSps({ frameMbsOnly: true, cropRight: 4 }))!;
+    expect(info.displayWidth).toBe(info.codedWidth - 8); // 2·4
+    expect(info.displayHeight).toBe(info.codedHeight);
+  });
 });
 
 describe('parsePpsPocInfo', () => {

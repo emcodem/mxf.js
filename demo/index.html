@@ -397,10 +397,12 @@
         fps = data.editRateNumerator / data.editRateDenominator;
         const pd = data.pictureDescriptor;
         const sd = data.soundDescriptor;
+        // Display dims (real frame, not the per-field StoredHeight) + DAR from the manifest.
+        const ar = data.aspectRatio ? ` (${data.aspectRatio.num}:${data.aspectRatio.den})` : '';
         metaEl.textContent =
           `Duration: ${data.duration.toFixed(2)}s | ` +
           `FPS: ${fps.toFixed(2)} | ` +
-          `Video: ${pd?.codec ?? 'unknown'} ${pd?.width}×${pd?.height} | ` +
+          `Video: ${pd?.codec ?? 'unknown'} ${data.displayWidth}×${data.displayHeight}${ar} | ` +
           `Audio: ${sd?.codec ?? 'unknown'} ${sd?.sampleRate}Hz ${sd?.channelCount}ch`;
         log(`Manifest loaded: ${data.duration.toFixed(2)}s, ${data.tracks.length} tracks`);
         seekBar.max = data.duration;

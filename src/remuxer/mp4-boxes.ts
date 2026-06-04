@@ -197,8 +197,15 @@ export function avcC(spsList: Uint8Array[], ppsList: Uint8Array[]): Uint8Array {
   return box('avcC', new Uint8Array(parts));
 }
 
-// avc1 — AVC sample entry
-export function avc1(width: number, height: number, spsList: Uint8Array[], ppsList: Uint8Array[]): Uint8Array {
+// pasp — Pixel Aspect Ratio box (ISO 14496-12 §12.1.4). hSpacing:vSpacing is the sample (pixel)
+// aspect ratio; a non-1:1 value makes the renderer scale the picture for anamorphic display (e.g. a
+// 720×576 4:3-stored frame shown 16:9 carries pasp 64:45). Omitted entirely for square pixels.
+export function pasp(hSpacing: number, vSpacing: number): Uint8Array {
+  return box('pasp', u32BE(hSpacing), u32BE(vSpacing));
+}
+
+// avc1 — AVC sample entry. An optional pasp box (pixel aspect ratio) is appended after avcC.
+export function avc1(width: number, height: number, spsList: Uint8Array[], ppsList: Uint8Array[], paspBox?: Uint8Array): Uint8Array {
   return box('avc1',
     new Uint8Array(6),      // reserved
     u16BE(1),               // data reference index
@@ -213,11 +220,12 @@ export function avc1(width: number, height: number, spsList: Uint8Array[], ppsLi
     u16BE(0x0018),          // depth
     u16BE(0xffff),          // pre-defined = int(16) -1
     avcC(spsList, ppsList),
+    ...(paspBox ? [paspBox] : []),
   );
 }
 
 // mp4v — MPEG-4 Visual sample entry (used for MPEG-2 in fmp4 container)
-export function mp4v(width: number, height: number): Uint8Array {
+export function mp4v(width: number, height: number, paspBox?: Uint8Array): Uint8Array {
   return box('mp4v',
     new Uint8Array(6),
     u16BE(1),
@@ -231,6 +239,7 @@ export function mp4v(width: number, height: number): Uint8Array {
     new Uint8Array(32),
     u16BE(0x0018),
     u16BE(0xffff),          // pre-defined = int(16) -1
+    ...(paspBox ? [paspBox] : []),
   );
 }
 

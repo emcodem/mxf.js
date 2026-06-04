@@ -45,6 +45,12 @@ export type WorkerEvent =
       tracks: MxfTrack[];
       pictureDescriptor: PictureDescriptor | null;
       soundDescriptor: SoundDescriptor | null;
+      /** Active picture dimensions to DISPLAY (the real frame, not the per-field StoredHeight in the
+       *  descriptor — e.g. 720×576, not 720×288). 0 when unknown. */
+      displayWidth: number;
+      displayHeight: number;
+      /** Display aspect ratio (DAR) from the MXF descriptor (e.g. {num:16,den:9}); null = square pixels. */
+      aspectRatio: { num: number; den: number } | null;
       videoCodecSupported: boolean;
       pcmMseSupported: boolean;
       /** Codec the worker will actually deliver to MSE (may differ from pictureDescriptor.codec). */

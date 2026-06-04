@@ -11,6 +11,13 @@ export interface PictureDescriptor {
   storedHeight: number;
   frameRateNumerator: number;
   frameRateDenominator: number;
+  /**
+   * Display Aspect Ratio (DAR) from the MXF AspectRatio item (tag 0x320E), e.g. 16/9. This is how
+   * the active picture should be SHOWN, independent of the pixel grid — 4:3-stored anamorphic SD
+   * (720×576/608) and XDCAM-EX (1440×1080) carry 16:9 here. 0/0 when absent (→ display square, 1:1).
+   */
+  aspectRatioNum: number;
+  aspectRatioDen: number;
   /** SPS NALU (without start code), if found in descriptor */
   spsNALU: Uint8Array | null;
   /** PPS NALU (without start code), if found in descriptor */

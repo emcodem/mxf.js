@@ -29,7 +29,7 @@ class v {
     this.listeners.clear();
   }
 }
-const x = 2, y = 0.25, w = 3, B = 6, F = 0.75;
+const R = 2, x = 0.25, w = 3, B = 6, F = 0.75;
 class S extends v {
   constructor(e, t = !1) {
     super(), this.mediaSource = null, this.objectURL = null, this.sourceBuffers = /* @__PURE__ */ new Map(), this.queues = /* @__PURE__ */ new Map(), this.processing = /* @__PURE__ */ new Map(), this.video = e, this.debug = t;
@@ -304,23 +304,23 @@ class T {
     const t = this.cxt, s = t.currentTime, i = s - e.bufStartContextTime;
     if (i >= e.duration - 1e-3) return !1;
     const { samples: r, channelCount: a, sampleRate: n } = e, o = Math.floor(r.length / a), h = this.active.filter((u) => u < a), l = [], m = [];
-    h.forEach((u, d) => (d % 2 === 0 ? l : m).push(u)), h.length === 1 && (m.length = 0, m.push(h[0]));
-    const g = t.createBuffer(2, o, n), k = (u, d) => {
-      if (d.length === 0) return;
-      const C = 1 / d.length;
+    h.forEach((u, c) => (c % 2 === 0 ? l : m).push(u)), h.length === 1 && (m.length = 0, m.push(h[0]));
+    const g = t.createBuffer(2, o, n), k = (u, c) => {
+      if (c.length === 0) return;
+      const C = 1 / c.length;
       for (let p = 0; p < o; p++) {
         let b = 0;
-        const M = p * a;
-        for (const R of d) b += r[M + R];
+        const y = p * a;
+        for (const M of c) b += r[y + M];
         u[p] = b * C;
       }
     };
     k(g.getChannelData(0), l), k(g.getChannelData(1), m);
-    const c = t.createBufferSource();
-    return c.buffer = g, c.connect(t.destination), i <= 0 ? c.start(e.bufStartContextTime) : c.start(s, i), c.onended = () => {
+    const d = t.createBufferSource();
+    return d.buffer = g, d.connect(t.destination), i <= 0 ? d.start(e.bufStartContextTime) : d.start(s, i), d.onended = () => {
       const u = this.scheduled.indexOf(e);
       u >= 0 && this.scheduled.splice(u, 1);
-    }, e.source = c, !0;
+    }, e.source = d, !0;
   }
   /**
    * Re-mix and reschedule all still-playing / future audio with the current channel selection, so a
@@ -475,6 +475,17 @@ class A extends v {
     var e;
     return ((e = this.manifest) == null ? void 0 : e.indexMode) ?? null;
   }
+  /** Active picture dimensions of the loaded video (the real frame, not the per-field StoredHeight),
+   *  or null before the manifest arrives. Pair with {@link aspectRatio} for the displayed shape. */
+  get videoDimensions() {
+    return this.manifest ? { width: this.manifest.displayWidth, height: this.manifest.displayHeight } : null;
+  }
+  /** Display aspect ratio (DAR) of the loaded video, e.g. `{num:16,den:9}`, or null for square
+   *  pixels / before the manifest. The picture is already rendered at this shape. */
+  get aspectRatio() {
+    var e;
+    return ((e = this.manifest) == null ? void 0 : e.aspectRatio) ?? null;
+  }
   play() {
     this.previewParked && this.manifest && this.initiateSeek(this.video.currentTime, "accurate"), this.playIntent = !0, this.startupGating = !0, this.audio.resume(), this.maybeResumePlayback();
   }
@@ -625,13 +636,16 @@ class A extends v {
     const t = e.pictureDescriptor, s = e.soundDescriptor;
     this.editRateNumerator = e.editRateNumerator, this.editRateDenominator = e.editRateDenominator, this.audio.setEditRate(e.editRateNumerator, e.editRateDenominator), this.scrub.setStream(e.duration, e.editRateNumerator, e.editRateDenominator);
     const i = e.editRateNumerator / e.editRateDenominator;
-    this.framesPerChunk = Math.ceil(i * x), this.rampChunkFrames = Math.max(w, Math.ceil(i * y)), this.startupGating = !0, this.manifest = {
+    this.framesPerChunk = Math.ceil(i * R), this.rampChunkFrames = Math.max(w, Math.ceil(i * x)), this.startupGating = !0, this.manifest = {
       duration: e.duration,
       editRateNumerator: e.editRateNumerator,
       editRateDenominator: e.editRateDenominator,
       tracks: e.tracks,
       pictureDescriptor: t,
       soundDescriptor: s,
+      displayWidth: e.displayWidth,
+      displayHeight: e.displayHeight,
+      aspectRatio: e.aspectRatio,
       indexMode: e.indexMode,
       longGop: e.longGop
     };

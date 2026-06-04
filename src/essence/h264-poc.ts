@@ -39,6 +39,10 @@ export interface SpsPocInfo {
    *  frame height even when the MXF descriptor stores the per-field height. */
   codedWidth: number;
   codedHeight: number;
+  /** Display (cropped) luma dimensions — the coded size minus frame_cropping, i.e. the active
+   *  picture (e.g. 1920×1080 from a 1920×1088 coded frame). Equals coded dims when no cropping. */
+  displayWidth: number;
+  displayHeight: number;
 }
 
 export interface PpsPocInfo {
@@ -124,8 +128,9 @@ export function parseSpsPocInfo(spsNALU: Uint8Array): SpsPocInfo | null {
     const spsId = r.ue();
 
     let separateColourPlaneFlag = false;
+    let chromaFormatIdc = 1; // default 4:2:0 when not signalled (non-high profiles)
     if (HIGH_PROFILES.has(profileIdc)) {
-      const chromaFormatIdc = r.ue();
+      chromaFormatIdc = r.ue();
       if (chromaFormatIdc === 3) separateColourPlaneFlag = r.u1() === 1;
       r.ue();   // bit_depth_luma_minus8
       r.ue();   // bit_depth_chroma_minus8
@@ -165,6 +170,29 @@ export function parseSpsPocInfo(spsNALU: Uint8Array): SpsPocInfo | null {
     const codedWidth = (picWidthInMbsMinus1 + 1) * 16;
     const codedHeight = (2 - (frameMbsOnlyFlag ? 1 : 0)) * (picHeightInMapUnitsMinus1 + 1) * 16;
 
+    // Continue past frame_mbs_only_flag to read frame_cropping → the active (display) dimensions.
+    // Wrapped so a parse miss here never loses the coded dims/POC fields already captured above.
+    let displayWidth = codedWidth;
+    let displayHeight = codedHeight;
+    try {
+      if (!frameMbsOnlyFlag) r.u1();   // mb_adaptive_frame_field_flag
+      r.u1();                          // direct_8x8_inference_flag
+      if (r.u1()) {                    // frame_cropping_flag
+        const cropL = r.ue(), cropR = r.ue(), cropT = r.ue(), cropB = r.ue();
+        // SubWidthC/SubHeightC per chroma_format_idc (H.264 §6.2, Table 6-1). Monochrome (0) and
+        // separate colour planes use luma-grid crop units.
+        const mono = chromaFormatIdc === 0 || separateColourPlaneFlag;
+        const subW = mono ? 1 : (chromaFormatIdc === 3 ? 1 : 2);              // 4:4:4→1, else 2
+        const subH = mono ? 1 : (chromaFormatIdc === 1 ? 2 : 1);             // 4:2:0→2, else 1
+        const cropUnitX = subW;
+        const cropUnitY = subH * (frameMbsOnlyFlag ? 1 : 2);
+        displayWidth  = codedWidth  - cropUnitX * (cropL + cropR);
+        displayHeight = codedHeight - cropUnitY * (cropT + cropB);
+        if (displayWidth <= 0 || displayWidth > codedWidth)   displayWidth = codedWidth;
+        if (displayHeight <= 0 || displayHeight > codedHeight) displayHeight = codedHeight;
+      }
+    } catch { /* keep coded dims as display dims */ }
+
     return {
       spsId,
       profileIdc,
@@ -179,6 +207,8 @@ export function parseSpsPocInfo(spsNALU: Uint8Array): SpsPocInfo | null {
       separateColourPlaneFlag,
       codedWidth,
       codedHeight,
+      displayWidth,
+      displayHeight,
     };
   } catch {
     return null;

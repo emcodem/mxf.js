@@ -193,7 +193,9 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       // 1088); declaring 1080 in the avc1 box while the SPS says "display = coded = 1088" makes
       // Chrome's MSE parser flag a mismatch and fire a SourceBuffer error. codedHeight keeps the
       // container consistent with the SPS.
-      fragmenter!.enableTranscodeMode(pipeline.sps, pipeline.pps, pipeline.codedWidth, pipeline.codedHeight);
+      // Pass the display (active) dims too — the fragmenter derives the pixel aspect ratio (pasp)
+      // from them and the descriptor's DAR, so anamorphic SD/XDCAM-EX renders at the right shape.
+      fragmenter!.enableTranscodeMode(pipeline.sps, pipeline.pps, pipeline.codedWidth, pipeline.codedHeight, pipeline.displayWidth, pipeline.displayHeight);
 
       // PCM audio uses Web Audio — skip audio track from moov entirely. Chrome MSE rejects init
       // segments containing unknown codec sample entries (sowt) even in a video-only SourceBuffer.
@@ -213,6 +215,10 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
         tracks: metadata.packages.flatMap(p => p.tracks),
         pictureDescriptor: pd,
         soundDescriptor: sd,
+        // Display dims from the elementary stream (active picture), not the per-field descriptor.
+        displayWidth: pipeline.displayWidth,
+        displayHeight: pipeline.displayHeight,
+        aspectRatio: pd?.aspectRatioNum && pd?.aspectRatioDen ? { num: pd.aspectRatioNum, den: pd.aspectRatioDen } : null,
         videoCodecSupported: true,
         pcmMseSupported: false,
         // Codec string from the actual SPS bytes so it matches the constraint byte in the avcC box
@@ -235,6 +241,10 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
     // -----------------------------------------------------------------------
     let videoCodecSupported = true;
     let pendingVideoInit: { codec: string; description: Uint8Array; width: number; height: number } | null = null;
+    // Display dims for the manifest. Default to the descriptor's stored dims; H.264 overrides below
+    // with the SPS-coded frame size (the descriptor's StoredHeight is per-field for interlaced AVC).
+    let videoDisplayWidth = pd?.storedWidth ?? 0;
+    let videoDisplayHeight = pd?.storedHeight ?? 0;
 
     if (pd?.codec === 'h264') {
       // The init segment's avc1/avcC box is built from the SPS/PPS in the FIRST video frame (it must
@@ -255,6 +265,9 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
             // Parse POC syntax from the in-band parameter sets so the fetch path can reorder B-frames.
             spsPocInfo = parseSpsPocInfo(sps[0]);
             ppsFlagMap = buildPpsPocMap(pps);
+            // The SPS gives the real picture size (active/cropped, e.g. 1920×1080), unlike the
+            // descriptor's per-field StoredHeight (544). Surface it as the manifest display size.
+            if (spsPocInfo) { videoDisplayWidth = spsPocInfo.displayWidth; videoDisplayHeight = spsPocInfo.displayHeight; }
             if (videoMode === 'webcodecs') {
               const desc = buildAVCDecoderConfigRecord(sps, pps);
               const p = sps[0][1], c = sps[0][2], l = sps[0][3];
@@ -311,6 +324,9 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       tracks: metadata.packages.flatMap(p => p.tracks),
       pictureDescriptor: pd,
       soundDescriptor: sd,
+      displayWidth: videoDisplayWidth,
+      displayHeight: videoDisplayHeight,
+      aspectRatio: pd?.aspectRatioNum && pd?.aspectRatioDen ? { num: pd.aspectRatioNum, den: pd.aspectRatioDen } : null,
       videoCodecSupported,
       pcmMseSupported: false,
       resolvedVideoCodec: pd?.codec ?? 'unknown',

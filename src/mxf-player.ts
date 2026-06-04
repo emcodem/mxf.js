@@ -162,6 +162,19 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     return this.manifest?.indexMode ?? null;
   }
 
+  /** Active picture dimensions of the loaded video (the real frame, not the per-field StoredHeight),
+   *  or null before the manifest arrives. Pair with {@link aspectRatio} for the displayed shape. */
+  get videoDimensions(): { width: number; height: number } | null {
+    if (!this.manifest) return null;
+    return { width: this.manifest.displayWidth, height: this.manifest.displayHeight };
+  }
+
+  /** Display aspect ratio (DAR) of the loaded video, e.g. `{num:16,den:9}`, or null for square
+   *  pixels / before the manifest. The picture is already rendered at this shape. */
+  get aspectRatio(): { num: number; den: number } | null {
+    return this.manifest?.aspectRatio ?? null;
+  }
+
   play(): void {
     // If parked on a fast preview, re-establish a clean accurate decode at the current position
     // before playing forward so playback starts from a proper frame with correct timestamps.
@@ -421,6 +434,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       tracks: event.tracks,
       pictureDescriptor: pd,
       soundDescriptor: sd,
+      displayWidth: event.displayWidth,
+      displayHeight: event.displayHeight,
+      aspectRatio: event.aspectRatio,
       indexMode: event.indexMode,
       longGop: event.longGop,
     };

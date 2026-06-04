@@ -154,9 +154,12 @@ export function parseHeaderMetadata(
     // (XAVC, D-10) without mis-parsing index/essence as sets. Header-metadata sets are keyed
     // 06 0E 2B 34 .. 0D 01 01 01 .. (byte10 === 0x01); Index Table Segments and partition packs are
     // 0D 01 02 01 (byte10 === 0x02) and Generic Container essence is 0D 01 03 01 (byte10 === 0x03).
-    // Everything else (incl. dark/unknown sets) is still parsed as before — only these explicit
-    // boundaries end the metadata region.
-    if (k[8] === 0x0d && k[9] === 0x01 && k[10] !== 0x01) break;
+    // Descriptive Metadata sets are 0D 01 04 01 (byte10 === 0x04) and ARE header metadata — they can
+    // be interleaved among the structural sets (e.g. an SD MPEG-2 file with DM static tracks places
+    // them before the essence descriptor). So only byte10 0x02/0x03 ends the metadata region; an
+    // earlier `byte10 !== 0x01` test broke on the first DM set and dropped every descriptor/package
+    // after it (→ video=undefined). Everything else (incl. dark/unknown sets) is still parsed.
+    if (k[8] === 0x0d && k[9] === 0x01 && (k[10] === 0x02 || k[10] === 0x03)) break;
 
     const localItems = parseLocalTagItems(buffer, pkt.valueOffset, pkt.valueLength);
     remapDynamicTags(localItems, primer); // resolve any dynamic local tags to canonical ones
@@ -190,7 +193,7 @@ export function parseHeaderMetadata(
         ulMatchClass(cls, CLASS_MPEGVID_DESCRIPTOR) ||
         ulMatchClass(cls, CLASS_AVC_DESCRIPTOR)) {
       pictureDescriptor = parsePictureDescriptorFromSet(set);
-      if (debug) console.log(`[mxf.js] found picture descriptor: codec=${pictureDescriptor.codec} ${pictureDescriptor.storedWidth}x${pictureDescriptor.storedHeight}`);
+      if (debug) console.log(`[mxf.js] found picture descriptor: codec=${pictureDescriptor.codec} ${pictureDescriptor.storedWidth}x${pictureDescriptor.storedHeight} AR=${pictureDescriptor.aspectRatioNum||'-'}/${pictureDescriptor.aspectRatioDen||'-'}`);
     }
 
     // Detect a sound descriptor by the presence of audio local tags rather than by descriptor
@@ -250,6 +253,7 @@ function parsePictureDescriptorFromSet(set: RawSet): PictureDescriptor {
   const height = set.localItems.get(0x3202);
   const sr = set.localItems.get(0x3001);
   const pec = set.localItems.get(0x3201);
+  const ar = set.localItems.get(0x320e); // AspectRatio (DAR) — Rational(int32 num, int32 den)
 
   // Also check for SampleRate stored as rational
   let frameRateNum = 25, frameRateDen = 1;
@@ -257,6 +261,14 @@ function parsePictureDescriptorFromSet(set: RawSet): PictureDescriptor {
     frameRateNum = i32BE(sr);
     frameRateDen = new DataView(sr.buffer, sr.byteOffset, sr.byteLength).getInt32(4, false);
     if (frameRateDen <= 0) frameRateDen = 1;
+  }
+
+  // AspectRatio is optional: parse it when present and well-formed, else leave 0/0 (→ square pixels).
+  let aspectRatioNum = 0, aspectRatioDen = 0;
+  if (ar && ar.length >= 8) {
+    const n = i32BE(ar);
+    const d = new DataView(ar.buffer, ar.byteOffset, ar.byteLength).getInt32(4, false);
+    if (n > 0 && d > 0) { aspectRatioNum = n; aspectRatioDen = d; }
   }
 
   return {
@@ -267,6 +279,8 @@ function parsePictureDescriptorFromSet(set: RawSet): PictureDescriptor {
     storedHeight: height && height.length >= 4 ? u32BE(height) : 0,
     frameRateNumerator:   frameRateNum,
     frameRateDenominator: frameRateDen,
+    aspectRatioNum,
+    aspectRatioDen,
     spsNALU: null,
     ppsNALU: null,
     pictureEssenceCodingUL: pec ?? null,
