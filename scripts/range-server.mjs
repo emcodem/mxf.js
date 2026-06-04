@@ -206,7 +206,7 @@ export async function startRangeServer({ dir, port = 0, latencyMs = 0, bytesPerS
 // ---------------------------------------------------------------------------
 
 /** Parse `100m`/`2g`/`500k` byte-rate suffixes into bytes/sec. Plain numbers pass through. */
-function parseRate(v) {
+export function parseRate(v) {
   if (v == null) return 0;
   const m = /^(\d+(?:\.\d+)?)\s*([kmg]?)b?$/i.exec(String(v).trim());
   if (!m) return parseInt(v, 10) || 0;

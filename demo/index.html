@@ -32,8 +32,22 @@
   <div class="controls">
     <input type="file" id="fileInput" accept=".mxf,.MXF">
     <span style="color:#666">or</span>
-    <input type="text" id="urlInput" placeholder="https://example.com/clip.mxf" value="http://localhost:8000/vistek.mxf">
+    <input type="text" id="urlInput" placeholder="https://example.com/clip.mxf" value="/media/vistek.mxf">
     <button id="loadUrl">Load URL</button>
+    <!-- NOTE: latency/bandwidth simulation ONLY works when the file is served by the Vite dev
+         server (the same-origin /media middleware + /__latency endpoint in vite.config.ts). It has
+         no effect on local files opened via the file picker (File API, no network) or on .mxf URLs
+         served by any other server. -->
+    <label style="color:#888; font-size:13px;">latency
+      <input type="number" id="simLatency" value="0" min="0" step="10" style="width:64px;"> ms</label>
+    <label style="color:#888; font-size:13px;">bandwidth
+      <input type="number" id="simRate" value="0" min="0" step="1" placeholder="0 = ∞"
+             title="Megabits per second. 0 = unlimited. e.g. 10 = 10 Mbit/s ≈ 1.25 MB/s" style="width:64px;"> Mbit/s</label>
+  </div>
+  <div style="color:#666; font-size:12px; margin:-8px 0 16px;">
+    latency &amp; bandwidth only work against the built-in <code>/media/…</code> simulator, which is the
+    Vite dev server itself — i.e. only when this demo is served via <code>npm run dev</code>. They have no
+    effect on local files (file picker) or on <code>.mxf</code> URLs served by any other server.
   </div>
 
   <div id="meta"></div>
@@ -219,7 +233,27 @@
       player.loadFile(file);
     });
 
-    document.getElementById('loadUrl').addEventListener('click', () => {
+    // Push the latency/bandwidth knobs to the dev server's live /__latency control so a change
+    // applies IMMEDIATELY to in-flight playback (it governs every subsequent /media read) — no
+    // reload needed. Same-origin Vite endpoint; see the mxf-media plugin in vite.config.ts.
+    async function applyNetSim() {
+      const ms = parseInt(document.getElementById('simLatency').value, 10) || 0;
+      // The UI is in Mbit/s (how bandwidth is normally quoted); the server throttles in bytes/sec.
+      const mbit = parseFloat(document.getElementById('simRate').value) || 0;   // 0 = unlimited
+      const bytesPerSec = mbit > 0 ? Math.round(mbit * 1e6 / 8) : 0;            // Mbit/s → bytes/sec
+      try {
+        await fetch(`/__latency?ms=${ms}&rate=${bytesPerSec}`, { method: 'POST' });
+        log(`net-sim → latency ${ms} ms, bandwidth ${mbit > 0 ? mbit + ' Mbit/s' : '∞'} (live)`);
+      } catch (e) {
+        log(`net-sim update failed: ${e.message}`);
+      }
+    }
+    // Live: changing either knob takes effect on the next range read, mid-playback.
+    document.getElementById('simLatency').addEventListener('change', applyNetSim);
+    document.getElementById('simRate').addEventListener('change', applyNetSim);
+
+    document.getElementById('loadUrl').addEventListener('click', async () => {
+      await applyNetSim();  // make sure the server has the current knobs before the first fetch
       const url = document.getElementById('urlInput').value.trim();
       if (!url) return;
       log(`Loading URL: ${url}`);
