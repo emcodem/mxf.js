@@ -47,6 +47,8 @@ export class ScrubController {
     private readonly requestPreview: (targetFrame: number, seq: number) => void,
     /** Settle accurately on the released position (decode preceding keyframe → exact frame). */
     private readonly settle: (timeSeconds: number) => void,
+    /** Resume normal playback (gated on the buffer) if the scrub began while playing. */
+    private readonly resume: () => void,
   ) {}
 
   /** True while a scrub is in progress (beginScrub→endScrub). */
@@ -112,7 +114,9 @@ export class ScrubController {
     this.suppressSeeking = target !== this.video.currentTime;
     this.video.currentTime = target;
     this.settle(target);
-    if (this.wasPlaying) this.video.play().catch(() => {});
+    // Resume via the player's gated play() (not video.play() directly) so the post-seek buffer fill
+    // shows a "buffering" indicator and starts cleanly instead of stalling silently at the new spot.
+    if (this.wasPlaying) this.resume();
   }
 
   /**

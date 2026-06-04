@@ -48,7 +48,10 @@ async function pipeThrottled(stream: any, res: any, bytesPerSec: number) {
     for await (const chunk of stream) {
       if (aborted) return;
       if (!res.write(chunk)) {
-        await new Promise((resolve) => { res.once('drain', resolve); res.once('close', resolve); });
+        await new Promise((resolve) => {
+          const done = () => { res.off('drain', done); res.off('close', done); resolve(undefined); };
+          res.once('drain', done); res.once('close', done);
+        });
         if (aborted) return;
       }
       sent += chunk.length;

@@ -18,7 +18,14 @@ export interface ManifestData {
 export interface MxfPlayerEvents {
   manifest: ManifestData;
   error: { message: string; fatal: boolean };
-  buffering: { bufferedSeconds: number };
+  /**
+   * Fired when the player's buffering STATE changes (not on every tick). `buffering: true` means
+   * playback is held/stalled waiting for more data — the first picture may already be visible, but
+   * the playhead is not advancing — so the UI should show a "Buffering…" indicator. `buffering:
+   * false` means playback is running (or able to). `bufferedSeconds` is the buffered-ahead amount at
+   * the moment of the transition.
+   */
+  buffering: { buffering: boolean; bufferedSeconds: number };
   timeupdate: { currentTime: number; duration: number };
   playing: void;
   seeking: { targetTime: number };

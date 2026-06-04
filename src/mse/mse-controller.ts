@@ -9,6 +9,9 @@ export interface MseControllerEvents {
   /** An append failed with QuotaExceededError and no behind-playhead data can be freed, i.e. the
    *  forward buffer is full — the player should stop fetching until the playhead advances. */
   bufferfull: void;
+  /** A queued op finished (updateend) so `video.buffered` now reflects it — the player re-evaluates
+   *  whether enough is buffered to (re)start held playback. */
+  appended: { track: TrackType };
 }
 
 type QueueOp =
@@ -63,6 +66,8 @@ export class MseController extends EventEmitter<MseControllerEvents> {
 
     sb.addEventListener('updateend', () => {
       this.processing.set(type, false);
+      // buffered ranges are now updated — let the player re-check its playback-resume buffer gate.
+      this.emit('appended', { track: type });
       this.drainQueue(type);
     });
     sb.addEventListener('error', () => {

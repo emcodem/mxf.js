@@ -3,7 +3,7 @@ import { MseController } from './mse/mse-controller.js';
 import { WebAudioController } from './audio/web-audio-controller.js';
 import { ScrubController } from './scrub-controller.js';
 import { WorkerCommand, WorkerEvent } from './worker/worker-messages.js';
-import { CHUNK_DURATION_SECONDS, FIRST_CHUNK_DURATION_SECONDS, MIN_CHUNK_FRAMES } from './core/constants.js';
+import { CHUNK_DURATION_SECONDS, FIRST_CHUNK_DURATION_SECONDS, MIN_CHUNK_FRAMES, RESUME_BUFFER_SECONDS } from './core/constants.js';
 
 export interface MxfConfig {
   /** Seconds of content to buffer before starting playback */
@@ -22,6 +22,13 @@ export interface MxfConfig {
    * of this setting; endScrub() then settles on an accurate frame.
    */
   seekMode?: 'keyframe' | 'accurate';
+  /**
+   * Seconds of media that must be buffered ahead before (re)starting playback after a cold start, a
+   * seek, or a stall. The first decoded picture is shown immediately (with `buffering: true`) while
+   * this fills, then playback begins. Smaller = snappier resume but more likely to re-buffer on a
+   * thin/decode-bound source; larger = slower resume but smoother once playing. Default 0.75.
+   */
+  resumeBufferSeconds?: number;
   debug?: boolean;
 }
 
@@ -30,6 +37,7 @@ const DEFAULT_CONFIG: Required<MxfConfig> = {
   maxBufferSeconds: 30,
   pcmAudioMode: 'auto',
   seekMode: 'accurate',
+  resumeBufferSeconds: RESUME_BUFFER_SECONDS,
   debug: false,
 };
 
@@ -82,6 +90,19 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   // here (it would double-emit the I-frame with a shifted timestamp). Any new seek — including the
   // accurate settle from endScrub() or play() — clears this and re-establishes a clean decode.
   private previewParked = false;
+  // True between play() and pause() — the user wants playback. Distinct from video.paused: while
+  // buffering at startup / after a seek / after a stall, we keep the element paused (showing the
+  // first decoded picture) even though playIntent is true, then start it once enough is buffered.
+  private playIntent = false;
+  // Current buffering state (playback held/stalled for data). Surfaced via the `buffering` event and
+  // the `buffering` getter; only emitted on change (see setBuffering).
+  private isBuffering = false;
+  // One-shot buffer gate, armed on cold start / play() / seek and cleared once playback actually
+  // starts ('playing'). While armed, the element is held paused until RESUME_BUFFER_SECONDS is
+  // buffered (kills the cold-start stutter + the silent post-seek freeze). Once playback is running
+  // we do NOT re-pause on every micro-underrun — that oscillates against itself; mid-playback stalls
+  // are surfaced as the buffering indicator only and the element recovers natively.
+  private startupGating = false;
 
   constructor(video: HTMLVideoElement, config: MxfConfig = {}) {
     super();
@@ -92,11 +113,23 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       this.video,
       (targetFrame, seq) => this.worker?.postMessage({ type: 'scrubPreview', targetFrame, seq } as WorkerCommand),
       (timeSeconds) => this.initiateSeek(timeSeconds, 'accurate'),
+      () => this.play(),
     );
 
     this.video.addEventListener('seeking', () => this.onVideoSeeking());
     this.video.addEventListener('seeked', () => this.onVideoSeeked());
     this.video.addEventListener('timeupdate', () => this.onTimeUpdate());
+    // Buffering / stall handling. 'waiting' = the element ran out of buffered data mid-playback; we
+    // pause it and re-buffer to RESUME_BUFFER_SECONDS before resuming, turning a native stutter
+    // (resume-on-one-frame) into one clean gated resume. 'playing' = playback (re)started.
+    this.video.addEventListener('waiting', () => this.onVideoWaiting());
+    this.video.addEventListener('playing', () => { this.startupGating = false; this.setBuffering(false); });
+    this.video.addEventListener('canplay', () => this.maybeResumePlayback());
+    // Treat any element-initiated play (e.g. <video autoplay>, or a consumer calling video.play()
+    // directly) as play intent so the buffer gate + buffering indicator apply to it too. NOTE: we do
+    // NOT clear playIntent on 'pause' — the gate pauses the element itself while buffering, and that
+    // must not be read as the user pausing; only the pause() method clears intent.
+    this.video.addEventListener('play', () => { this.playIntent = true; });
   }
 
   get currentTime(): number {
@@ -112,6 +145,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   }
 
   /**
+   * True when playback is held/stalled waiting for more data (the first picture may be visible but
+   * the playhead isn't advancing). Mirrors the `buffering` event; poll this or listen to the event
+   * to drive a "Buffering…" indicator.
+   */
+  get buffering(): boolean {
+    return this.isBuffering;
+  }
+
+  /**
    * Which seeking strategy the loaded file supports, or null before the manifest arrives:
    * 'cbg' (constant-byte-count math), 'vbe' (per-frame index entries), or 'none' (growing/live —
    * approximate offset-percentage seeking). Useful for tailoring UI (e.g. exact vs approximate seek).
@@ -124,14 +166,21 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // If parked on a fast preview, re-establish a clean accurate decode at the current position
     // before playing forward so playback starts from a proper frame with correct timestamps.
     if (this.previewParked && this.manifest) this.initiateSeek(this.video.currentTime, 'accurate');
-    this.video.play().catch(() => {});
+    this.playIntent = true;
+    this.startupGating = true;   // gate this start on the buffer (cleared once 'playing' fires)
     // PCM audio plays via Web Audio; resume the context on user gesture.
     this.audio.resume();
+    // Don't blindly video.play() into an empty/thin buffer (the source of the cold-start stutter and
+    // the "frozen for 2 s after a seek" feeling). maybeResumePlayback() shows the first decoded frame
+    // and a buffering indicator, fills to RESUME_BUFFER_SECONDS, then starts playback.
+    this.maybeResumePlayback();
   }
 
   pause(): void {
+    this.playIntent = false;
     this.video.pause();
     this.audio.suspend();
+    this.setBuffering(false);
   }
 
   /** Seek to a time in seconds. The <video> 'seeking' event drives the worker fetch. */
@@ -239,6 +288,11 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     });
     // Back-pressure: the forward buffer is over quota — stop fetching until the playhead advances.
     this.mseController.on('bufferfull', () => { this.bufferFull = true; this.fetchPending = false; });
+    // A video append finished (buffered ranges updated): if we're holding playback for the buffer
+    // gate (cold start / post-seek / post-stall), re-evaluate whether there's now enough to resume.
+    this.mseController.on('appended', ({ track }) => {
+      if (track === 'video' && this.playIntent && this.video.paused) this.maybeResumePlayback();
+    });
   }
 
   private createWorker(): Worker {
@@ -271,6 +325,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
         if (event.nextFrame !== undefined && !this.scrub.isActive && !this.previewParked) {
           this.nextFetchFrame = event.nextFrame;
         }
+        // A segment just landed: if we're holding playback for buffer (cold start / post-seek /
+        // post-stall), re-evaluate whether there's now enough to start. The append is asynchronous,
+        // so re-check on the MSE 'updateend' too — but this covers the common case immediately.
+        if (this.playIntent && this.video.paused) this.maybeResumePlayback();
         break;
 
       case 'audioSegment':
@@ -352,6 +410,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.framesPerChunk = Math.ceil(fps * CHUNK_DURATION_SECONDS);
     // Reset the cold-start ramp for this file: first fetch ≈ FIRST_CHUNK_DURATION_SECONDS of frames.
     this.rampChunkFrames = Math.max(MIN_CHUNK_FRAMES, Math.ceil(fps * FIRST_CHUNK_DURATION_SECONDS));
+    // Arm the one-shot buffer gate for the very first playback, so an autoplaying <video> is held to
+    // RESUME_BUFFER_SECONDS (showing "buffering") instead of stuttering through the thin cold buffer.
+    this.startupGating = true;
 
     this.manifest = {
       duration: event.duration,
@@ -508,6 +569,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private initiateSeek(targetTime: number, mode: 'keyframe' | 'accurate'): void {
     if (!this.manifest) return;
     this.fetchPending = true; // pause fetching until the last outstanding seek resolves
+    // Re-arm the one-shot buffer gate: the target region is (likely) unbuffered, so the resume after
+    // this seek should hold for the buffer + show "buffering" rather than stall silently.
+    this.startupGating = true;
     this.activeSeekMode = mode;
     // A new seek supersedes any parked preview; this seek will define the next decode start.
     this.previewParked = false;
@@ -553,8 +617,71 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       }
     }
 
-    this.emit('buffering', { bufferedSeconds: aheadSeconds });
     this.emit('timeupdate', { currentTime, duration: this.duration });
+  }
+
+  /** Buffered-ahead seconds of video at the current playhead (0 if unknown). */
+  private bufferedAhead(): number {
+    return this.mseController?.getBufferedAhead('video', this.video.currentTime) ?? 0;
+  }
+
+  /** Update + emit the buffering state, but only when it actually changes. */
+  private setBuffering(buffering: boolean): void {
+    if (this.isBuffering === buffering) return;
+    this.isBuffering = buffering;
+    this.emit('buffering', { buffering, bufferedSeconds: this.bufferedAhead() });
+  }
+
+  /**
+   * Single decision point for starting/holding playback. Called from play(), after each appended
+   * video segment, on 'canplay', and from the stall handler. If the user wants to play and the
+   * element is paused: start it once at least RESUME_BUFFER_SECONDS is buffered ahead (or we've
+   * fetched to EOF / are within that of the end); otherwise hold, show "buffering", and keep
+   * fetching. The first decoded picture is already painted by the paused element, so the viewer sees
+   * the frame immediately while the buffer fills — no cold-start stutter, no silent post-seek freeze.
+   */
+  private maybeResumePlayback(): void {
+    if (!this.playIntent || !this.manifest) return;
+    if (this.scrub.isActive) return;          // the scrub controller owns the element while scrubbing
+    if (!this.video.paused) { this.setBuffering(false); return; }
+
+    const fps = this.editRateNumerator / this.editRateDenominator;
+    const totalFrames = Math.round(this.manifest.duration * fps);
+    const fetchedToEof = this.nextFetchFrame >= totalFrames;
+    const remaining = Math.max(0, this.manifest.duration - this.video.currentTime);
+    const target = Math.min(this.config.resumeBufferSeconds, Math.max(0, remaining - 0.05));
+
+    if (this.bufferedAhead() >= target || fetchedToEof) {
+      // Disarm the one-shot gate on the play ATTEMPT, not on the 'playing' event: if the element
+      // can't immediately sustain (a decode-bound source stalls right after the buffered range),
+      // 'playing' may never fire, and a still-armed gate would force-pause→replay in a tight loop.
+      // After this single attempt, mid-playback stalls are surfaced via the indicator only.
+      this.startupGating = false;
+      this.setBuffering(false);
+      this.video.play().catch(() => {});
+    } else {
+      this.setBuffering(true);
+      this.fetchNextChunk();
+    }
+  }
+
+  /**
+   * The element ran out of buffered data mid-playback ('waiting'). Rather than let it resume the
+   * instant a single frame arrives (which produces the stutter), pause it and re-buffer through
+   * maybeResumePlayback() so it resumes once cleanly. Ignored while scrubbing / parked on a preview
+   * (those manage the element themselves) or when the user has paused.
+   */
+  private onVideoWaiting(): void {
+    if (!this.playIntent || this.scrub.isActive || this.previewParked) return;
+    this.setBuffering(true);
+    // Only the one-shot startup gate forcibly holds the element (cold start / post-seek): re-buffer
+    // to RESUME_BUFFER_SECONDS, then resume once. A mid-playback underrun (gate already cleared) just
+    // shows the indicator and lets the element recover on its own — forcibly pausing on every
+    // micro-underrun oscillates play/pause and makes the stutter worse.
+    if (this.startupGating) {
+      this.video.pause();
+      this.maybeResumePlayback();
+    }
   }
 
   private log(msg: string): void {
@@ -577,6 +704,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.seekTargetFrame = 0;
     this.activeSeekMode = 'accurate';
     this.previewParked = false;
+    this.playIntent = false;
+    this.isBuffering = false;
+    this.startupGating = false;
     this.scrub.reset();
   }
 

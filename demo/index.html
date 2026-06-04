@@ -24,6 +24,17 @@
     .warn { color: #fa8; }
     .err  { color: #f44; }
     #meta { font-family: monospace; font-size: 12px; color: #aaa; margin-bottom: 12px; min-height: 20px; }
+    #bufferingOverlay {
+      position: absolute; top: 12px; left: 12px; display: none; align-items: center; gap: 8px;
+      padding: 6px 12px; border-radius: 6px; background: rgba(0,0,0,0.65); color: #eee;
+      font: 600 13px/1 system-ui, sans-serif; pointer-events: none;
+    }
+    #bufferingOverlay.show { display: inline-flex; }
+    .spinner {
+      width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #4af;
+      border-radius: 50%; animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
@@ -51,13 +62,23 @@
   </div>
 
   <div id="meta"></div>
-  <video id="video" autoplay muted></video>
+  <div id="videoWrap" style="position:relative; max-width:960px;">
+    <video id="video" autoplay muted></video>
+    <div id="bufferingOverlay">
+      <span class="spinner"></span> Buffering…
+    </div>
+  </div>
 
   <div class="playback" id="playback">
     <button id="playBtn" disabled>&#9654;</button>
     <span class="time" id="timeCurrent">0:00</span>
     <input type="range" id="seekBar" min="0" max="100" step="0.1" value="0">
     <span class="time" id="timeDuration">0:00</span>
+  </div>
+
+  <div style="color:#666; font-size:12px; max-width:960px; margin:4px 0 12px;">
+    Keys: <code>Space</code> play/pause · <code>J</code>/<code>L</code> rewind/forward (press to speed up) ·
+    <code>K</code> stop · <code>←</code>/<code>→</code> frame step · <code>↑</code>/<code>↓</code> ±10s
   </div>
 
   <div id="audioChannels" style="display:none; margin:8px 0; font:13px/1.6 system-ui,sans-serif;">
@@ -80,8 +101,10 @@
     const timeDur  = document.getElementById('timeDuration');
     const audioChannelsEl = document.getElementById('audioChannels');
     const channelBoxesEl  = document.getElementById('channelBoxes');
+    const bufferingOverlay = document.getElementById('bufferingOverlay');
     let player = null;
     let seeking = false;
+    let fps = 25;   // updated from the manifest; used for frame-step (arrow) keys
 
     // E2E test hook: enabled only with ?e2e=1. Exposes the player and a high-res event log so the
     // latency/perf tests can drive the player directly and timestamp manifest/timeupdate/buffering
@@ -131,7 +154,9 @@
     }
 
     function initPlayer() {
+      resetSpeed();
       player?.destroy();
+      bufferingOverlay.classList.remove('show');
       playback.style.display = 'none';
       audioChannelsEl.style.display = 'none';
       channelBoxesEl.innerHTML = '';
@@ -143,12 +168,12 @@
       player = new MxfPlayer(video, { debug: true, startBufferSeconds: 3, maxBufferSeconds: 8, seekMode: 'accurate' });
 
       player.on('manifest', (data) => {
-        const fps = (data.editRateNumerator / data.editRateDenominator).toFixed(2);
+        fps = data.editRateNumerator / data.editRateDenominator;
         const pd = data.pictureDescriptor;
         const sd = data.soundDescriptor;
         metaEl.textContent =
           `Duration: ${data.duration.toFixed(2)}s | ` +
-          `FPS: ${fps} | ` +
+          `FPS: ${fps.toFixed(2)} | ` +
           `Video: ${pd?.codec ?? 'unknown'} ${pd?.width}×${pd?.height} | ` +
           `Audio: ${sd?.codec ?? 'unknown'} ${sd?.sampleRate}Hz ${sd?.channelCount}ch`;
         log(`Manifest loaded: ${data.duration.toFixed(2)}s, ${data.tracks.length} tracks`);
@@ -168,6 +193,13 @@
 
       player.on('error', ({ message, fatal }) => {
         log(`${fatal ? 'FATAL' : 'Error'}: ${message}`, fatal ? 'err' : 'warn');
+      });
+
+      // Show a "Buffering…" overlay whenever playback is held/stalled for data (cold start, after a
+      // seek, or a mid-playback underrun). The first decoded picture is already visible underneath.
+      player.on('buffering', ({ buffering, bufferedSeconds }) => {
+        bufferingOverlay.classList.toggle('show', buffering);
+        if (buffering) log(`Buffering… (${bufferedSeconds.toFixed(2)}s ahead)`, 'warn');
       });
 
       player.on('codec-unsupported', ({ codec, reason }) => {
@@ -194,12 +226,14 @@
 
     playBtn.addEventListener('click', () => {
       if (!player) return;
+      resetSpeed();          // the play button is normal 1× transport — cancel any J/L fast motion
       if (player.paused) { player.play(); } else { player.pause(); }
       syncPlayBtn();
     });
 
     function startScrub() {
       if (!player || seeking) return;
+      resetSpeed();          // cancel J/L fast motion before scrubbing (endScrub resumes at 1×)
       seeking = true;
       player.beginScrub();   // subsequent seeks become fast I-frame-only previews
     }
@@ -222,6 +256,102 @@
         player.endScrub(t);  // accurate settle at the released position + resume
       } else {
         player.seek(t);      // keyboard/click seek without a drag
+      }
+    });
+
+    // ── Keyboard transport (JKL editing convention) ──────────────────────────────────────────
+    //   Space      play/pause (resets speed to 1×)
+    //   J / L      fast rewind / fast forward — press repeatedly to climb the speed ladder
+    //   K          pause and reset speed to 1×
+    //   ← / →      step one frame back / forward (pauses)
+    //   ↑ / ↓      skip +10s / −10s
+    // Forward fast-play uses native video.playbackRate. Rewind isn't supported by MSE playbackRate,
+    // so it's driven by a timer that steps currentTime backwards proportionally to wall-clock.
+    const SPEED_LADDER = [1, 2, 4, 8, 16];
+    let jklDir = null;        // 'fwd' | 'rev' | null
+    let jklSpeedIdx = 0;      // index into SPEED_LADDER
+    let rewindTimer = null;
+
+    function stopRewind() {
+      if (rewindTimer !== null) { clearInterval(rewindTimer); rewindTimer = null; }
+    }
+    function resetSpeed() {
+      stopRewind();
+      jklDir = null;
+      jklSpeedIdx = 0;
+      if (player) video.playbackRate = 1;
+    }
+    function fastForward() {
+      if (!player) return;
+      stopRewind();
+      jklSpeedIdx = (jklDir === 'fwd') ? Math.min(jklSpeedIdx + 1, SPEED_LADDER.length - 1) : 0;
+      jklDir = 'fwd';
+      const speed = SPEED_LADDER[jklSpeedIdx];
+      video.playbackRate = speed;
+      if (player.paused) player.play();
+      log(`⏩ forward ${speed}×`);
+      syncPlayBtn();
+    }
+    function fastRewind() {
+      if (!player) return;
+      jklSpeedIdx = (jklDir === 'rev') ? Math.min(jklSpeedIdx + 1, SPEED_LADDER.length - 1) : 0;
+      jklDir = 'rev';
+      const speed = SPEED_LADDER[jklSpeedIdx];
+      video.playbackRate = 1;
+      player.pause();           // native playback is forward-only; we drive currentTime ourselves
+      stopRewind();
+      const stepMs = 125;
+      rewindTimer = setInterval(() => {
+        // Yield immediately if we're no longer in rewind mode, or if something started forward
+        // playback (Space / play button / a programmatic play): otherwise the timer keeps yanking
+        // currentTime backwards and pausing the element, which reads as a freeze ("press play,
+        // nothing happens"). Whoever exits rewind owns the play state from here.
+        if (jklDir !== 'rev' || !video.paused) { stopRewind(); jklDir = null; jklSpeedIdx = 0; return; }
+        const t = video.currentTime - speed * (stepMs / 1000);
+        if (t <= 0) { resetSpeed(); player.seek(0); return; }   // hit the start: stop (stays paused)
+        player.seek(t);
+      }, stepMs);
+      log(`⏪ rewind ${speed}×`);
+      syncPlayBtn();
+    }
+    function stepFrame(dir) {
+      if (!player) return;
+      resetSpeed();
+      player.pause();
+      player.seek(player.currentTime + dir / fps);
+    }
+    function skipSeconds(delta) {
+      if (!player) return;
+      resetSpeed();             // a ±10s jump returns to normal 1× transport (cancels J/L fast motion)
+      player.seek(player.currentTime + delta);
+    }
+
+    document.addEventListener('keydown', (e) => {
+      // Don't hijack keys while typing in the URL/latency/bandwidth inputs.
+      const tag = (e.target.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) return;
+      if (!player || playBtn.disabled) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      switch (e.key) {
+        case ' ':
+          e.preventDefault();
+          resetSpeed();
+          if (player.paused) player.play(); else player.pause();
+          syncPlayBtn();
+          break;
+        case 'j': case 'J': e.preventDefault(); fastRewind(); break;
+        case 'l': case 'L': e.preventDefault(); fastForward(); break;
+        case 'k': case 'K':
+          e.preventDefault();
+          resetSpeed();
+          player.pause();
+          syncPlayBtn();
+          break;
+        case 'ArrowLeft':  e.preventDefault(); stepFrame(-1); break;
+        case 'ArrowRight': e.preventDefault(); stepFrame(1);  break;
+        case 'ArrowUp':    e.preventDefault(); skipSeconds(10);  break;
+        case 'ArrowDown':  e.preventDefault(); skipSeconds(-10); break;
       }
     });
 

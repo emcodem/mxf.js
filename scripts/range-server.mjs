@@ -78,8 +78,13 @@ async function streamRange(res, filePath, start, end, bytesPerSec) {
     for await (const chunk of stream) {
       if (aborted) return;
       if (!res.write(chunk)) {
-        // backpressure: wait for the socket to drain (or the client to vanish) before continuing
-        await new Promise((resolve) => { res.once('drain', resolve); res.once('close', resolve); });
+        // backpressure: wait for the socket to drain (or the client to vanish) before continuing.
+        // Remove BOTH listeners when either fires — otherwise the losing listener (usually 'close')
+        // leaks one per backpressure cycle, tripping MaxListenersExceededWarning during a scrub.
+        await new Promise((resolve) => {
+          const done = () => { res.off('drain', done); res.off('close', done); resolve(undefined); };
+          res.once('drain', done); res.once('close', done);
+        });
         if (aborted) return;
       }
       sent += chunk.length;

@@ -52,6 +52,11 @@ export const FIRST_CHUNK_DURATION_SECONDS = 0.25;
 export const MIN_CHUNK_FRAMES = 3;
 /** Seconds of already-played media to keep behind the playhead before evicting. */
 export const BACK_BUFFER_SECONDS = 6;
+/** Minimum buffered-ahead seconds required before (re)starting playback after a cold start, a seek,
+ *  or a stall. Small so resume stays responsive (the first picture is shown as soon as it decodes,
+ *  while still "buffering"), but large enough that playback doesn't immediately re-stall and stutter
+ *  on a thin/decode-bound source. Surfaced to the UI via the `buffering` event while the gate holds. */
+export const RESUME_BUFFER_SECONDS = 0.75;
 
 // ── Scrub preview (demux-worker.ts) ──────────────────────────────────────────
 /** Max cached scrub-preview segments (LRU, keyed by GOP-head keyframe edit unit). */
