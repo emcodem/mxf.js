@@ -35,6 +35,40 @@
       border-radius: 50%; animation: spin 0.7s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Debug timeline ───────────────────────────────────────────────────────────────────── */
+    #debugPanel { margin-top: 20px; border: 1px solid #333; border-radius: 8px; background: #0a0a0a; }
+    .debug-bar {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 8px 12px; border-bottom: 1px solid #222; font: 12px/1.4 system-ui, sans-serif; color: #aaa;
+    }
+    .debug-bar strong { color: #4af; font-size: 13px; }
+    .debug-bar label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
+    .debug-bar button { padding: 4px 10px; font-size: 12px; font-weight: 600; }
+    #debugLog {
+      font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 11.5px; line-height: 1.5;
+      padding: 8px 12px; max-height: 360px; overflow-y: auto; white-space: pre; tab-size: 2;
+    }
+    #debugLog .row { display: flex; gap: 8px; }
+    #debugLog .t   { color: #555; min-width: 64px; text-align: right; }
+    #debugLog .tag { min-width: 46px; font-weight: 700; }
+    #debugLog .lbl { min-width: 210px; color: #ddd; }
+    #debugLog .det { color: #888; flex: 0 0 auto; }
+    #debugLog .vst { color: #4a5; margin-left: auto; opacity: 0.65; }
+    /* category colours */
+    .cat-USER .tag { color: #fb4; }   /* raw user input            */
+    .cat-CMD  .tag { color: #4cf; }   /* player API method call    */
+    .cat-EVT  .tag { color: #6e6; }   /* player event (reaction)   */
+    .cat-VID  .tag { color: #c8f; }   /* native <video> event      */
+    .cat-MSG  .tag { color: #888; }   /* friendly log line         */
+    .cat-ERR  .tag { color: #f55; }
+    .cat-ERR  .lbl { color: #f88; }
+    /* per-category filtering */
+    #debugLog.hide-USER .cat-USER,
+    #debugLog.hide-CMD  .cat-CMD,
+    #debugLog.hide-EVT  .cat-EVT,
+    #debugLog.hide-VID  .cat-VID,
+    #debugLog.hide-MSG  .cat-MSG { display: none; }
   </style>
 </head>
 <body>
@@ -88,6 +122,25 @@
 
   <div id="log"></div>
 
+  <div id="debugPanel">
+    <div class="debug-bar">
+      <strong>Debug timeline</strong>
+      <span style="color:#666">filter:</span>
+      <label><input type="checkbox" class="dbgFilter" data-cat="USER" checked> user input</label>
+      <label><input type="checkbox" class="dbgFilter" data-cat="CMD"  checked> player cmd</label>
+      <label><input type="checkbox" class="dbgFilter" data-cat="EVT"  checked> player event</label>
+      <label><input type="checkbox" class="dbgFilter" data-cat="VID"  checked> video event</label>
+      <label><input type="checkbox" class="dbgFilter" data-cat="MSG"  checked> messages</label>
+      <span style="flex:1"></span>
+      <span id="dbgCount" style="color:#666"></span>
+      <button id="dbgPause">Pause</button>
+      <button id="dbgCopy">Copy</button>
+      <button id="dbgDownload">Download</button>
+      <button id="dbgClear">Clear</button>
+    </div>
+    <div id="debugLog"></div>
+  </div>
+
   <script type="module">
     import { MxfPlayer } from '../dist/mxf.esm.js';
 
@@ -105,6 +158,176 @@
     let player = null;
     let seeking = false;
     let fps = 25;   // updated from the manifest; used for frame-step (arrow) keys
+
+    // ── Debug timeline ────────────────────────────────────────────────────────────────────────
+    // Captures, on one correlated timeline: raw USER input (keys/clicks/drags), the player CMD it
+    // triggers (API method calls, wrapped), the player's EVT reactions, the native <video> events,
+    // and friendly MSG lines — each stamped with a session-relative time and a snapshot of the
+    // <video> state at that instant. The point: when a manual test misbehaves, this shows exactly
+    // what was done and how the player reacted, so the bug can be located. Copy/Download to share.
+    const debugLogEl = document.getElementById('debugLog');
+    const dbgCountEl = document.getElementById('dbgCount');
+    const dbg = { t0: performance.now(), entries: [], paused: false, max: 4000 };
+
+    function dnow() { return ((performance.now() - dbg.t0) / 1000).toFixed(3); }
+
+    // Compact snapshot of the live <video> state appended to every debug line.
+    function vstate() {
+      if (!video) return '';
+      const READY = ['nothing', 'metadata', 'curr', 'future', 'enough'];   // readyState 0..4
+      let buf = '';
+      try {
+        const r = [];
+        for (let i = 0; i < video.buffered.length; i++)
+          r.push(`${video.buffered.start(i).toFixed(1)}-${video.buffered.end(i).toFixed(1)}`);
+        buf = r.join(',') || '∅';
+      } catch { buf = '?'; }
+      const ahead = bufferedAheadOf(video.currentTime);
+      return `ct=${video.currentTime.toFixed(3)} ${video.paused ? 'PAUSED' : 'play'} ` +
+             `rs=${READY[video.readyState] ?? video.readyState} rate=${video.playbackRate} ` +
+             `ahead=${ahead === null ? '?' : ahead.toFixed(2)}s buf=[${buf}]` +
+             (seeking ? ' SCRUB' : '') + (jklDir ? ` ${jklDir}${SPEED_LADDER[jklSpeedIdx]}x` : '');
+    }
+
+    // Seconds of contiguous buffered video ahead of t (null if t isn't inside a buffered range).
+    function bufferedAheadOf(t) {
+      try {
+        for (let i = 0; i < video.buffered.length; i++)
+          if (t >= video.buffered.start(i) - 0.05 && t < video.buffered.end(i))
+            return video.buffered.end(i) - t;
+      } catch {}
+      return null;
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+    }
+
+    // DOM rendering is BATCHED into one requestAnimationFrame flush (one append + one scrollTop, i.e.
+    // one forced layout, per frame). Logging per-event synchronously appended a row and read/wrote
+    // scrollTop every call — during rapid input (frame-step fires ~5 events per keypress) that's ~160
+    // forced layouts/sec on the main thread, which starves the compositor and visibly freezes the
+    // <video>. The snapshot (vstate) is still captured at event time; only the painting is deferred.
+    const dbgPending = [];
+    let dbgFlushScheduled = false;
+    function dbgLog(cat, label, detail = '') {
+      const entry = { t: dnow(), cat, label, detail: String(detail), v: vstate() };
+      dbg.entries.push(entry);
+      if (dbg.entries.length > dbg.max) dbg.entries.shift();
+      if (dbg.paused) return;
+      dbgPending.push(entry);
+      if (dbgPending.length > 2000) dbgPending.shift();   // bound if rAF is paused (tab hidden)
+      if (!dbgFlushScheduled) { dbgFlushScheduled = true; requestAnimationFrame(dbgFlushRows); }
+    }
+    function dbgFlushRows() {
+      dbgFlushScheduled = false;
+      if (!dbgPending.length) return;
+      const frag = document.createDocumentFragment();
+      for (const entry of dbgPending) {
+        const row = document.createElement('div');
+        row.className = `row cat-${entry.cat}`;
+        row.innerHTML =
+          `<span class="t">+${entry.t}</span>` +
+          `<span class="tag">${entry.cat}</span>` +
+          `<span class="lbl">${escapeHtml(entry.label)}</span>` +
+          `<span class="det">${escapeHtml(entry.detail)}</span>` +
+          `<span class="vst">${escapeHtml(entry.v)}</span>`;
+        frag.appendChild(row);
+      }
+      dbgPending.length = 0;
+      debugLogEl.appendChild(frag);
+      while (debugLogEl.childElementCount > 1200) debugLogEl.firstChild.remove();
+      debugLogEl.scrollTop = debugLogEl.scrollHeight;   // single forced layout per frame
+      if (dbgCountEl) dbgCountEl.textContent = `${dbg.entries.length} events`;
+    }
+
+    // Wrap the player's public methods so every API call lands on the timeline as a CMD, with its
+    // arguments summarised — regardless of whether the demo, a key handler, or the scrub controller
+    // fired it. Then attach EVT listeners for every player event (the reactions).
+    function instrumentPlayer(p) {
+      const fmtArgs = {
+        seek:    a => `${(+a[0]).toFixed(3)}s`,
+        scrubTo: a => `${(+a[0]).toFixed(3)}s`,
+        endScrub:a => a[0] === undefined ? '(current)' : `${(+a[0]).toFixed(3)}s`,
+        setAudioChannels: a => `[${(a[0] || []).map(c => c + 1).join(',')}]`,
+        loadFile: a => a[0]?.name ?? '',
+        loadUrl:  a => a[0] ?? '',
+      };
+      for (const name of ['play', 'pause', 'seek', 'beginScrub', 'scrubTo', 'endScrub',
+                          'setAudioChannels', 'loadFile', 'loadUrl']) {
+        const orig = p[name].bind(p);
+        p[name] = (...args) => {
+          dbgLog('CMD', `player.${name}()`, fmtArgs[name] ? fmtArgs[name](args) : '');
+          return orig(...args);
+        };
+      }
+      p.on('manifest',  d => dbgLog('EVT', 'manifest', `${d.duration.toFixed(2)}s index=${d.indexMode} longGop=${d.longGop}`));
+      p.on('seeking',   d => dbgLog('EVT', 'seeking', `target=${d.targetTime.toFixed(3)}s`));
+      p.on('seeked',    d => dbgLog('EVT', 'seeked', `actual=${d.actualTime?.toFixed?.(3) ?? '?'}s`));
+      p.on('playing',   () => dbgLog('EVT', 'playing'));
+      p.on('buffering', d => dbgLog('EVT', `buffering=${d.buffering}`, `${d.bufferedSeconds.toFixed(2)}s ahead`));
+      p.on('timeupdate', d => dbgTimeupdate(d.currentTime));
+      p.on('audio-info', d => dbgLog('EVT', 'audio-info', `${d.channelCount}ch active=[${d.activeChannels.map(c => c + 1).join(',')}]`));
+      p.on('codec-unsupported', d => dbgLog('EVT', 'codec-unsupported', `${d.codec}: ${d.reason}`));
+      p.on('error',     d => dbgLog('ERR', `error${d.fatal ? ' (FATAL)' : ''}`, d.message));
+      p.on('destroyed', () => dbgLog('EVT', 'destroyed'));
+    }
+
+    // timeupdate fires ~4×/s — coalesce so it doesn't bury the interesting lines: log only when the
+    // playhead jumped (a seek/scrub landed) or once per ~0.5 s of steady advance.
+    let lastTuTime = -1, lastTuLogged = -1;
+    function dbgTimeupdate(ct) {
+      const jumped = lastTuTime >= 0 && Math.abs(ct - lastTuTime) > 0.5;
+      if (jumped || lastTuLogged < 0 || Math.abs(ct - lastTuLogged) >= 0.5) {
+        dbgLog('EVT', 'timeupdate', jumped ? `JUMP from ${lastTuTime.toFixed(3)}s` : '');
+        lastTuLogged = ct;
+      }
+      lastTuTime = ct;
+    }
+
+    // Native <video> events — the ground truth of what the element actually did. Attached once (the
+    // element persists across loads). 'timeupdate' is omitted (the player's coalesced one covers it).
+    for (const ev of ['play', 'pause', 'seeking', 'seeked', 'waiting', 'playing', 'canplay',
+                      'canplaythrough', 'stalled', 'ratechange', 'ended', 'durationchange',
+                      'emptied', 'loadedmetadata', 'error']) {
+      video.addEventListener(ev, () => {
+        let extra = '';
+        if (ev === 'ratechange') extra = `${video.playbackRate}x`;
+        if (ev === 'error' && video.error) extra = `code=${video.error.code} ${video.error.message || ''}`;
+        dbgLog('VID', `video.${ev}`, extra);
+      });
+    }
+
+    // Debug-panel controls.
+    document.querySelectorAll('.dbgFilter').forEach(cb => {
+      cb.addEventListener('change', () => debugLogEl.classList.toggle(`hide-${cb.dataset.cat}`, !cb.checked));
+    });
+    document.getElementById('dbgPause').addEventListener('click', (e) => {
+      dbg.paused = !dbg.paused;
+      e.target.textContent = dbg.paused ? 'Resume' : 'Pause';
+      if (!dbg.paused) dbgLog('MSG', '— capture resumed —');
+    });
+    document.getElementById('dbgClear').addEventListener('click', () => {
+      dbg.entries.length = 0; dbgPending.length = 0; debugLogEl.innerHTML = ''; dbg.t0 = performance.now();
+      lastTuTime = lastTuLogged = -1;
+      if (dbgCountEl) dbgCountEl.textContent = '';
+    });
+    function dbgAsText() {
+      return dbg.entries.map(e =>
+        `+${e.t.padStart(8)}  ${e.cat.padEnd(4)}  ${e.label.padEnd(24)} ${e.detail.padEnd(22)} │ ${e.v}`).join('\n');
+    }
+    document.getElementById('dbgCopy').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(dbgAsText()); dbgLog('MSG', '— timeline copied to clipboard —'); }
+      catch (err) { dbgLog('ERR', 'clipboard copy failed', err.message); }
+    });
+    document.getElementById('dbgDownload').addEventListener('click', () => {
+      const blob = new Blob([dbgAsText()], { type: 'text/plain' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `mxf-debug-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
 
     // E2E test hook: enabled only with ?e2e=1. Exposes the player and a high-res event log so the
     // latency/perf tests can drive the player directly and timestamp manifest/timeupdate/buffering
@@ -146,6 +369,8 @@
       line.textContent = `[${new Date().toISOString().slice(11,23)}] ${msg}`;
       logEl.appendChild(line);
       logEl.scrollTop = logEl.scrollHeight;
+      // Mirror friendly log lines onto the debug timeline so they're interleaved with the raw events.
+      dbgLog(cls === 'err' ? 'ERR' : 'MSG', msg);
     }
 
     function syncPlayBtn() {
@@ -166,6 +391,7 @@
       timeDur.textContent = '0:00';
 
       player = new MxfPlayer(video, { debug: true, startBufferSeconds: 3, maxBufferSeconds: 8, seekMode: 'accurate' });
+      instrumentPlayer(player);   // wrap API + attach event listeners onto the debug timeline
 
       player.on('manifest', (data) => {
         fps = data.editRateNumerator / data.editRateDenominator;
@@ -187,7 +413,7 @@
       player.on('timeupdate', ({ currentTime, duration }) => {
         timeCur.textContent = fmt(currentTime);
         timeDur.textContent = fmt(duration);
-        if (!seeking) seekBar.value = currentTime;
+        if (!seeking && !kbScrubbing) seekBar.value = currentTime;
         syncPlayBtn();
       });
 
@@ -197,9 +423,20 @@
 
       // Show a "Buffering…" overlay whenever playback is held/stalled for data (cold start, after a
       // seek, or a mid-playback underrun). The first decoded picture is already visible underneath.
+      // The overlay is debounced: a resume often blips buffering true→false within a few ms (the
+      // element briefly re-seeks onto the decoded range start), which would flash the overlay. Only
+      // show it if buffering persists past BUFFER_OVERLAY_DELAY_MS; hide immediately when it clears.
+      const BUFFER_OVERLAY_DELAY_MS = 180;
+      let bufferOverlayTimer = null;
       player.on('buffering', ({ buffering, bufferedSeconds }) => {
-        bufferingOverlay.classList.toggle('show', buffering);
-        if (buffering) log(`Buffering… (${bufferedSeconds.toFixed(2)}s ahead)`, 'warn');
+        if (buffering) {
+          if (bufferOverlayTimer === null)
+            bufferOverlayTimer = setTimeout(() => { bufferOverlayTimer = null; bufferingOverlay.classList.add('show'); }, BUFFER_OVERLAY_DELAY_MS);
+          log(`Buffering… (${bufferedSeconds.toFixed(2)}s ahead)`, 'warn');
+        } else {
+          if (bufferOverlayTimer !== null) { clearTimeout(bufferOverlayTimer); bufferOverlayTimer = null; }
+          bufferingOverlay.classList.remove('show');
+        }
       });
 
       player.on('codec-unsupported', ({ codec, reason }) => {
@@ -226,6 +463,8 @@
 
     playBtn.addEventListener('click', () => {
       if (!player) return;
+      dbgLog('USER', `click: play button`, player.paused ? '→ play' : '→ pause');
+      endKbScrub();          // settle any keyboard-skip scrub session first
       resetSpeed();          // the play button is normal 1× transport — cancel any J/L fast motion
       if (player.paused) { player.play(); } else { player.pause(); }
       syncPlayBtn();
@@ -233,6 +472,8 @@
 
     function startScrub() {
       if (!player || seeking) return;
+      endKbScrub();          // a slider grab supersedes any keyboard-skip scrub session
+      dbgLog('USER', 'scrub start (grab slider)', `${parseFloat(seekBar.value).toFixed(2)}s`);
       resetSpeed();          // cancel J/L fast motion before scrubbing (endScrub resumes at 1×)
       seeking = true;
       player.beginScrub();   // subsequent seeks become fast I-frame-only previews
@@ -252,9 +493,11 @@
       if (!player) return;
       const t = parseFloat(seekBar.value);
       if (seeking) {
+        dbgLog('USER', 'scrub release', `${t.toFixed(2)}s`);
         seeking = false;
         player.endScrub(t);  // accurate settle at the released position + resume
       } else {
+        dbgLog('USER', 'slider seek (no drag)', `${t.toFixed(2)}s`);
         player.seek(t);      // keyboard/click seek without a drag
       }
     });
@@ -283,6 +526,7 @@
     }
     function fastForward() {
       if (!player) return;
+      endKbScrub();
       stopRewind();
       jklSpeedIdx = (jklDir === 'fwd') ? Math.min(jklSpeedIdx + 1, SPEED_LADDER.length - 1) : 0;
       jklDir = 'fwd';
@@ -294,6 +538,7 @@
     }
     function fastRewind() {
       if (!player) return;
+      endKbScrub();
       jklSpeedIdx = (jklDir === 'rev') ? Math.min(jklSpeedIdx + 1, SPEED_LADDER.length - 1) : 0;
       jklDir = 'rev';
       const speed = SPEED_LADDER[jklSpeedIdx];
@@ -314,16 +559,64 @@
       log(`⏪ rewind ${speed}×`);
       syncPlayBtn();
     }
+    // Frame-step (←/→) is EXACT (one frame, no keyframe preview). Key-repeat is coalesced through one
+    // rAF: rapid presses accumulate into a single target and we issue at most one seek per frame, so
+    // each stepped frame gets a paint opportunity instead of seeks piling up and the compositor
+    // dropping intermediate frames (looks like a freeze while holding the key). The seek itself is the
+    // cheap in-buffer fast path when the frame is already buffered.
+    let stepTarget = null;
+    let stepRaf = null;
     function stepFrame(dir) {
       if (!player) return;
+      endKbScrub();             // leave any keyboard-skip scrub session before exact frame-stepping
       resetSpeed();
       player.pause();
-      player.seek(player.currentTime + dir / fps);
+      const base = stepTarget != null ? stepTarget : player.currentTime;
+      stepTarget = Math.max(0, Math.min(base + dir / fps, player.duration));
+      if (stepRaf == null) stepRaf = requestAnimationFrame(applyStep);
     }
+    function applyStep() {
+      stepRaf = null;
+      if (stepTarget == null || !player) return;
+      const t = stepTarget; stepTarget = null;
+      player.seek(t);
+    }
+    // ── Keyboard ±10s skip via the scrub pump ──────────────────────────────────────────────────
+    // A discrete seek into unbuffered media forces a full keyframe→target decode + a buffering hold,
+    // so MASHING ↑/↓ kept re-seeking before each decode finished → perpetual "Buffering…". Instead we
+    // drive ↑/↓ through the SAME fast keyframe-preview + single-flight pump the slider uses: each
+    // press reports the new target (instant GOP-head preview, rapid presses coalesce to the latest),
+    // and a short idle timer ends the scrub to settle on the exact frame and resume. Feels like
+    // scrubbing instead of a chain of buffering stalls.
+    let kbScrubbing = false;
+    let kbScrubTimer = null;
+    let kbScrubTarget = 0;
+    const KB_SCRUB_SETTLE_MS = 350;   // settle this long after the last skip keypress
+
     function skipSeconds(delta) {
       if (!player) return;
-      resetSpeed();             // a ±10s jump returns to normal 1× transport (cancels J/L fast motion)
-      player.seek(player.currentTime + delta);
+      // Indexless files have no keyframe map for previews — fall back to a plain accurate seek.
+      if (player.indexMode === 'none') { resetSpeed(); player.seek(player.currentTime + delta); return; }
+      if (seeking) return;       // a slider drag owns the scrub session — ignore keyboard skip
+      resetSpeed();              // cancel any J/L fast motion
+      const base = kbScrubbing ? kbScrubTarget : player.currentTime;
+      kbScrubTarget = Math.max(0, Math.min(base + delta, player.duration));
+      if (!kbScrubbing) { kbScrubbing = true; player.beginScrub(); }
+      seekBar.value = kbScrubTarget;          // thumb follows the accumulated target, not the preview
+      timeCur.textContent = fmt(kbScrubTarget);
+      player.scrubTo(kbScrubTarget);          // coalesced fast preview at the latest target
+      if (kbScrubTimer) clearTimeout(kbScrubTimer);
+      kbScrubTimer = setTimeout(endKbScrub, KB_SCRUB_SETTLE_MS);
+    }
+    // Settle the keyboard scrub session now (exact-frame decode + resume to prior play state). Called
+    // by the idle timer and eagerly by any other transport action so a pending settle can't fire late
+    // and override it.
+    function endKbScrub() {
+      if (kbScrubTimer) { clearTimeout(kbScrubTimer); kbScrubTimer = null; }
+      if (!kbScrubbing) return;
+      kbScrubbing = false;
+      dbgLog('USER', 'skip settle', `${kbScrubTarget.toFixed(2)}s`);
+      player.endScrub(kbScrubTarget);
     }
 
     document.addEventListener('keydown', (e) => {
@@ -333,9 +626,14 @@
       if (!player || playBtn.disabled) return;
       if (e.ctrlKey || e.metaKey || e.altKey) return;
 
+      const KEY_NAMES = { ' ': 'Space', j: 'J', J: 'J', l: 'L', L: 'L', k: 'K', K: 'K',
+        ArrowLeft: '← step-back', ArrowRight: '→ step-fwd', ArrowUp: '↑ +10s', ArrowDown: '↓ −10s' };
+      if (KEY_NAMES[e.key]) dbgLog('USER', `key: ${KEY_NAMES[e.key]}`);
+
       switch (e.key) {
         case ' ':
           e.preventDefault();
+          endKbScrub();
           resetSpeed();
           if (player.paused) player.play(); else player.pause();
           syncPlayBtn();
@@ -344,6 +642,7 @@
         case 'l': case 'L': e.preventDefault(); fastForward(); break;
         case 'k': case 'K':
           e.preventDefault();
+          endKbScrub();
           resetSpeed();
           player.pause();
           syncPlayBtn();
@@ -358,6 +657,7 @@
     document.getElementById('fileInput').addEventListener('change', (e) => {
       const file = e.target.files[0];
       if (!file) return;
+      dbgLog('USER', 'pick file', file.name);
       log(`Loading file: ${file.name} (${(file.size / 1e6).toFixed(1)} MB)`);
       initPlayer();
       player.loadFile(file);
@@ -386,6 +686,7 @@
       await applyNetSim();  // make sure the server has the current knobs before the first fetch
       const url = document.getElementById('urlInput').value.trim();
       if (!url) return;
+      dbgLog('USER', 'click: Load URL', url);
       log(`Loading URL: ${url}`);
       initPlayer();
       player.loadUrl(url);

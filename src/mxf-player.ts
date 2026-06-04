@@ -558,7 +558,33 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       this.scrub.scrubTo(targetTime);
       return;
     }
+    // Cheap in-buffer seek (frame-step, rewind, click within the already-buffered region while
+    // paused): the requested frame is already buffered and the element paints it immediately. Doing a
+    // full worker seek here would re-transcode keyframe→target, reset the forward-fetch frontier
+    // backward and abort the in-flight prefetch — which collapses the forward buffer and freezes
+    // playback after a burst of frame-steps. So skip all worker work; the frontier (nextFetchFrame)
+    // is preserved and forward fetching continues seamlessly from the end of the same range. Limited
+    // to the paused element so a seek during playback still flushes/re-locks audio normally.
+    if (this.video.paused && !this.previewParked && this.isSeekServedByBuffer(targetTime)) return;
     this.initiateSeek(targetTime, this.config.seekMode);
+  }
+
+  /**
+   * True when `targetTime` is already buffered contiguously up to (or past) the forward-fetch
+   * frontier, so a seek there needs no worker work: the element paints the frame from the existing
+   * buffer, and when playback later drains to the end of that range, forward fetching resumes exactly
+   * there (nextFetchFrame) with no gap. If the containing range ends before the frontier (a gap
+   * between here and where we'd resume fetching), this returns false and a real seek is required.
+   */
+  private isSeekServedByBuffer(targetTime: number): boolean {
+    if (!this.mseController || !this.manifest) return false;
+    const ahead = this.mseController.getBufferedAhead('video', targetTime);
+    if (ahead <= 0) return false;                     // target isn't inside any buffered range
+    const fps = this.editRateNumerator / this.editRateDenominator;
+    const totalFrames = Math.round(this.manifest.duration * fps);
+    if (this.nextFetchFrame >= totalFrames) return true;   // everything to EOF already requested
+    const rangeEnd = targetTime + ahead;              // end of the buffered range containing target
+    return rangeEnd >= this.nextFetchFrame / fps - 0.5;
   }
 
   private onVideoSeeked(): void {
@@ -603,6 +629,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       // Evict already-played media so the resident buffer stays bounded, and release the buffer-full
       // back-pressure now the playhead has advanced (trimming may have freed room).
       this.mseController?.trimBackBuffer(currentTime);
+      // Drop orphan ranges left far ahead by abandoned seeks (heavy ±10s skipping / scrub previews)
+      // — well beyond where forward fetch fills, so never the active region.
+      this.mseController?.trimForwardOrphans(currentTime, this.config.maxBufferSeconds + 5);
       this.bufferFull = false;
     }
     const aheadSeconds = this.mseController?.getBufferedAhead('video', currentTime) ?? 0;

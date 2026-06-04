@@ -78,6 +78,21 @@ class S extends v {
         t > r + 0.5 && this.evict(s, r, t);
       }
   }
+  /**
+   * Evict buffered ranges that start more than `keepAheadSeconds` beyond `currentTime` on every
+   * track. Heavy seeking (repeated ±N s skips, scrub previews) scatters small orphan ranges far
+   * ahead of the playhead that back-buffer trimming never reaches (it only removes behind). Forward
+   * fetching never fills past the buffer-ahead target, so any range starting well beyond it is an
+   * abandoned-seek leftover — safe to drop, keeping the resident buffer bounded during heavy seeking.
+   */
+  trimForwardOrphans(e, t) {
+    const s = e + t;
+    for (const [i, r] of this.sourceBuffers)
+      for (let a = r.buffered.length - 1; a >= 0; a--) {
+        const n = r.buffered.start(a);
+        n > s && this.evict(i, n, r.buffered.end(a));
+      }
+  }
   drainQueue(e) {
     if (this.processing.get(e)) return;
     const t = this.queues.get(e), s = this.sourceBuffers.get(e);
@@ -684,7 +699,21 @@ class A extends v {
       this.scrub.scrubTo(e);
       return;
     }
-    this.initiateSeek(e, this.config.seekMode);
+    this.video.paused && !this.previewParked && this.isSeekServedByBuffer(e) || this.initiateSeek(e, this.config.seekMode);
+  }
+  /**
+   * True when `targetTime` is already buffered contiguously up to (or past) the forward-fetch
+   * frontier, so a seek there needs no worker work: the element paints the frame from the existing
+   * buffer, and when playback later drains to the end of that range, forward fetching resumes exactly
+   * there (nextFetchFrame) with no gap. If the containing range ends before the frontier (a gap
+   * between here and where we'd resume fetching), this returns false and a real seek is required.
+   */
+  isSeekServedByBuffer(e) {
+    if (!this.mseController || !this.manifest) return !1;
+    const t = this.mseController.getBufferedAhead("video", e);
+    if (t <= 0) return !1;
+    const s = this.editRateNumerator / this.editRateDenominator, i = Math.round(this.manifest.duration * s);
+    return this.nextFetchFrame >= i ? !0 : e + t >= this.nextFetchFrame / s - 0.5;
   }
   onVideoSeeked() {
     this.scrub.onVideoSeeked();
@@ -698,10 +727,10 @@ class A extends v {
     this.worker.postMessage(s);
   }
   onTimeUpdate() {
-    var s, i;
+    var s, i, r;
     if (!this.manifest) return;
     const e = this.video.currentTime;
-    this.scrub.isActive || ((s = this.mseController) == null || s.trimBackBuffer(e), this.bufferFull = !1), (((i = this.mseController) == null ? void 0 : i.getBufferedAhead("video", e)) ?? 0) < this.config.startBufferSeconds && (this.previewParked && !this.video.paused && !this.scrub.isActive ? this.initiateSeek(e, "accurate") : this.fetchNextChunk()), this.emit("timeupdate", { currentTime: e, duration: this.duration });
+    this.scrub.isActive || ((s = this.mseController) == null || s.trimBackBuffer(e), (i = this.mseController) == null || i.trimForwardOrphans(e, this.config.maxBufferSeconds + 5), this.bufferFull = !1), (((r = this.mseController) == null ? void 0 : r.getBufferedAhead("video", e)) ?? 0) < this.config.startBufferSeconds && (this.previewParked && !this.video.paused && !this.scrub.isActive ? this.initiateSeek(e, "accurate") : this.fetchNextChunk()), this.emit("timeupdate", { currentTime: e, duration: this.duration });
   }
   /** Buffered-ahead seconds of video at the current playhead (0 if unknown). */
   bufferedAhead() {

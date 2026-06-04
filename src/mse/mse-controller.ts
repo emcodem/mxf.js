@@ -107,6 +107,24 @@ export class MseController extends EventEmitter<MseControllerEvents> {
     }
   }
 
+  /**
+   * Evict buffered ranges that start more than `keepAheadSeconds` beyond `currentTime` on every
+   * track. Heavy seeking (repeated ±N s skips, scrub previews) scatters small orphan ranges far
+   * ahead of the playhead that back-buffer trimming never reaches (it only removes behind). Forward
+   * fetching never fills past the buffer-ahead target, so any range starting well beyond it is an
+   * abandoned-seek leftover — safe to drop, keeping the resident buffer bounded during heavy seeking.
+   */
+  trimForwardOrphans(currentTime: number, keepAheadSeconds: number): void {
+    const cutoff = currentTime + keepAheadSeconds;
+    for (const [type, sb] of this.sourceBuffers) {
+      // Snapshot ranges first (evict() queues removes; buffered won't change until updateend).
+      for (let i = sb.buffered.length - 1; i >= 0; i--) {
+        const start = sb.buffered.start(i);
+        if (start > cutoff) this.evict(type, start, sb.buffered.end(i));
+      }
+    }
+  }
+
   private drainQueue(type: TrackType): void {
     if (this.processing.get(type)) return;
     const queue = this.queues.get(type);
