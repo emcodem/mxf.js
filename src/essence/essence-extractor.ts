@@ -2,8 +2,9 @@ import { ILoader } from '../loader/loader.js';
 import { MxfBootstrap } from '../mxf-file.js';
 import { KLVIterator } from '../core/klv.js';
 import { decodeBerLength } from '../core/ber.js';
-import { isPictureEssence, isSoundEssence, isAes3Sound, isPartitionPack, isFill } from '../core/ul.js';
+import { isPictureEssence, isSoundEssence, isAes3Sound, isPartitionPack, isFill, isSystemItem } from '../core/ul.js';
 import { resolveFrameOffset, resolveExactFrameOffset, IndexTableSegment } from '../parser/index-table.js';
+import { parseSystemItemTimecode, Timecode } from '../parser/timecode.js';
 import { SEQ_WINDOW, SEQ_HARD_CAP } from '../core/constants.js';
 
 export interface EssenceFrame {
@@ -15,6 +16,12 @@ export interface EssenceFrame {
   dts: bigint;
   isKeyframe: boolean;
   data: ArrayBuffer;
+  /**
+   * Video only: the per-frame SMPTE 12M timecode parsed from this content package's System Item
+   * (when present). This is the authoritative per-frame source timecode and may be discontinuous
+   * ("jump"); absent when the file has no system item or its layout isn't recognised (best effort).
+   */
+  systemTimecode?: Timecode;
   /** Audio only: true when the sound element is AES3-wrapped (SMPTE 331M / D-10) rather than plain PCM. */
   aes3?: boolean;
   /**
@@ -37,11 +44,18 @@ export class EssenceExtractor {
   private videoTrackKey: Uint8Array | null = null;
   /** Optional cancellation signal; aborting it cancels in-flight reads (seek/scrub supersession). */
   private readonly signal?: AbortSignal;
+  /** Rounded timecode base (frames/sec) for decoding System Item SMPTE 12M timecodes. */
+  private readonly tcBase: number;
 
   constructor(loader: ILoader, bootstrap: MxfBootstrap, signal?: AbortSignal) {
     this.loader = loader;
     this.bootstrap = bootstrap;
     this.signal = signal;
+    // Rounded timecode base for System Item decode. Defensive against a bootstrap without metadata
+    // (some unit-test fixtures stub only the fields they exercise).
+    const n = bootstrap.metadata?.editRateNumerator ?? 0;
+    const d = bootstrap.metadata?.editRateDenominator ?? 0;
+    this.tcBase = d > 0 ? Math.round(n / d) : 0;
   }
 
   /**
@@ -134,7 +148,7 @@ export class EssenceExtractor {
     fromByteOffset?: bigint
   ): AsyncGenerator<EssenceFrame> {
     const fileSize = await this.loader.fileSize;
-    const state = { editUnit: startFrame, videoFramesSeen: 0 };
+    const state = { editUnit: startFrame, videoFramesSeen: 0, pendingSystemTc: null as Timecode | null };
 
     let window = SEQ_WINDOW;
     let carry: Uint8Array | null = null;
@@ -202,7 +216,7 @@ export class EssenceExtractor {
     frameCount: number,
     bufferAbs: number
   ): AsyncGenerator<EssenceFrame> {
-    const state = { editUnit: startFrame, videoFramesSeen: 0 };
+    const state = { editUnit: startFrame, videoFramesSeen: 0, pendingSystemTc: null as Timecode | null };
     yield* this.emitFromBuffer(buffer, 0, state, frameCount, bufferAbs);
   }
 
@@ -216,7 +230,7 @@ export class EssenceExtractor {
   private *emitFromBuffer(
     buffer: ArrayBuffer,
     startOffset: number,
-    state: { editUnit: bigint; videoFramesSeen: number },
+    state: { editUnit: bigint; videoFramesSeen: number; pendingSystemTc: Timecode | null },
     frameCount: number,
     bufferAbs: number
   ): Generator<EssenceFrame, number> {
@@ -228,6 +242,20 @@ export class EssenceExtractor {
       if (!pkt) return pktStart; // incomplete trailing KLV begins here
 
       if (isPartitionPack(pkt.key) || isFill(pkt.key)) continue;
+
+      // System Item: carries this content package's per-frame timecode. It precedes the picture
+      // element in the package, so stash the TC and attach it to the next emitted picture frame. A
+      // package can have MORE than one system KLV (e.g. XAVC writes a System Metadata Pack that
+      // carries the timecode PLUS a second pack that doesn't) — keep the first valid TC of the
+      // package and don't let a later TC-less pack clobber it (pendingSystemTc is reset to null when
+      // the picture frame consumes it, so the guard is per-package).
+      if (isSystemItem(pkt.key)) {
+        if (state.pendingSystemTc === null) {
+          const sysVal = new Uint8Array(buffer, pkt.valueOffset, pkt.valueLength);
+          state.pendingSystemTc = parseSystemItemTimecode(sysVal, this.tcBase);
+        }
+        continue;
+      }
 
       const isVideo = isPictureEssence(pkt.key);
       const isAudio = isSoundEssence(pkt.key);
@@ -248,6 +276,11 @@ export class EssenceExtractor {
 
       const data = buffer.slice(pkt.valueOffset, pkt.valueOffset + pkt.valueLength);
 
+      // Hand the stashed system-item TC to this picture frame, then clear it so it can't leak onto
+      // a later package's video element (audio elements don't consume it).
+      const systemTimecode = isVideo ? (state.pendingSystemTc ?? undefined) : undefined;
+      if (isVideo) state.pendingSystemTc = null;
+
       yield {
         trackType: isVideo ? 'video' : 'audio',
         editUnit: state.editUnit,
@@ -255,6 +288,7 @@ export class EssenceExtractor {
         dts: state.editUnit,
         isKeyframe: isVideo, // refined via index flags at seek time
         data,
+        systemTimecode,
         aes3: !isVideo && isAes3Sound(pkt.key),
         byteOffset: BigInt(bufferAbs + pktStart),
       };

@@ -1,8 +1,9 @@
-import { EventEmitter, MxfPlayerEvents, ManifestData } from './events.js';
+import { EventEmitter, MxfPlayerEvents, ManifestData, TimecodeBundle, TimecodeSource } from './events.js';
 import { MseController } from './mse/mse-controller.js';
 import { WebAudioController } from './audio/web-audio-controller.js';
 import { ScrubController } from './scrub-controller.js';
-import { WorkerCommand, WorkerEvent } from './worker/worker-messages.js';
+import { WorkerCommand, WorkerEvent, ManifestTimecode, TimecodeAnchor } from './worker/worker-messages.js';
+import { frameCountToTimecode, formatTimecode } from './parser/timecode.js';
 import { CHUNK_DURATION_SECONDS, FIRST_CHUNK_DURATION_SECONDS, MIN_CHUNK_FRAMES, RESUME_BUFFER_SECONDS } from './core/constants.js';
 
 export interface MxfConfig {
@@ -104,6 +105,20 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   // are surfaced as the buffering indicator only and the element recovers natively.
   private startupGating = false;
 
+  // ── Timecode ────────────────────────────────────────────────────────────────
+  // Computed package start timecodes (material/file/source), from the manifest. Per-frame System
+  // Item timecode arrives as sparse anchors (presentation editUnit → absolute frame count), kept
+  // sorted by editUnit; a rendered frame's system TC is the nearest preceding anchor + offset. Both
+  // are reset per file in onManifest.
+  private manifestTimecodes: ManifestTimecode[] = [];
+  private systemAnchors: TimecodeAnchor[] = [];
+  // The last edit unit a `timecode` event was emitted for (dedupe — both rVFC and timeupdate feed it).
+  private lastTimecodeEditUnit = -1;
+  private currentTimecodeBundle: TimecodeBundle | null = null;
+  // requestVideoFrameCallback handle (0 = not scheduled / unsupported → timeupdate drives it).
+  private rvfcHandle = 0;
+  private destroyed = false;
+
   constructor(video: HTMLVideoElement, config: MxfConfig = {}) {
     super();
     this.video = video;
@@ -130,6 +145,95 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // NOT clear playIntent on 'pause' — the gate pauses the element itself while buffering, and that
     // must not be read as the user pausing; only the pause() method clears intent.
     this.video.addEventListener('play', () => { this.playIntent = true; });
+
+    // Per-rendered-frame timecode: requestVideoFrameCallback's mediaTime is the EXACT composited
+    // frame's time, so the timecode never lags the picture. Self-reschedules; timeupdate is the
+    // fallback (and covers paused/seek-settle and browsers without rVFC). Dedup by edit unit.
+    this.startVideoFrameCallback();
+  }
+
+  private startVideoFrameCallback(): void {
+    const v = this.video as HTMLVideoElement & {
+      requestVideoFrameCallback?: (cb: (now: number, meta: { mediaTime: number }) => void) => number;
+    };
+    if (typeof v.requestVideoFrameCallback !== 'function') return; // timeupdate drives it instead
+    const cb = (_now: number, meta: { mediaTime: number }): void => {
+      if (this.destroyed) return;
+      this.updateTimecode(meta.mediaTime);
+      this.rvfcHandle = v.requestVideoFrameCallback!(cb);
+    };
+    this.rvfcHandle = v.requestVideoFrameCallback(cb);
+  }
+
+  /**
+   * Resolve the timecode bundle for the frame at `timeSeconds` and emit `timecode` on change. Fed by
+   * both rVFC (mediaTime, exact) and timeupdate (currentTime, fallback); deduped by edit unit so the
+   * two never double-emit. The edit unit is `round(time × fps)` — exact for any rendered frame
+   * because every fMP4 sample timestamp is edit-unit-derived.
+   */
+  private updateTimecode(timeSeconds: number): void {
+    if (!this.manifest) return;
+    const fps = this.editRateNumerator / this.editRateDenominator;
+    if (!(fps > 0)) return;
+    const editUnit = Math.max(0, Math.round(timeSeconds * fps));
+    if (editUnit === this.lastTimecodeEditUnit) return;
+    this.lastTimecodeEditUnit = editUnit;
+    const bundle = this.computeTimecodeBundle(editUnit);
+    this.currentTimecodeBundle = bundle;
+    this.emit('timecode', bundle);
+  }
+
+  /** System Item timecode at a presentation edit unit: nearest preceding anchor + linear offset. */
+  private systemTimecodeAt(editUnit: number): string | null {
+    let best: TimecodeAnchor | null = null;
+    for (const a of this.systemAnchors) {
+      if (a.editUnit <= editUnit && (!best || a.editUnit > best.editUnit)) best = a;
+    }
+    if (!best) return null;
+    const fc = best.frameCount + (editUnit - best.editUnit);
+    return formatTimecode(frameCountToTimecode(fc, best.base, best.dropFrame));
+  }
+
+  /** Build the full timecode bundle (system + computed package TCs) for a rendered edit unit. */
+  private computeTimecodeBundle(editUnit: number): TimecodeBundle {
+    const all: TimecodeBundle['all'] = [];
+
+    const sys = this.systemTimecodeAt(editUnit);
+    if (sys !== null) all.push({ source: 'system', text: sys, reliable: true });
+
+    // Computed package TCs are exact only when the absolute edit unit is exact (indexed modes).
+    const computedReliable = this.manifest?.indexMode !== 'none';
+    const fps = this.editRateNumerator / this.editRateDenominator;
+    for (const tc of this.manifestTimecodes) {
+      const tcRate = tc.editRateDenominator > 0 ? tc.editRateNumerator / tc.editRateDenominator : fps;
+      // Map the video edit unit onto the timecode track's own rate (usually 1:1).
+      const offset = fps > 0 ? Math.round(editUnit * (tcRate / fps)) : editUnit;
+      const text = formatTimecode(frameCountToTimecode(tc.position + offset, tc.base, tc.dropFrame));
+      all.push({ source: tc.source, text, reliable: computedReliable });
+    }
+
+    // Priority order for display: system → material → source → file.
+    const rank: Record<TimecodeSource, number> = { system: 0, material: 1, source: 2, file: 3 };
+    all.sort((a, b) => rank[a.source] - rank[b.source]);
+    const primary = all.length ? { source: all[0].source, text: all[0].text } : null;
+    return { editUnit, primary, all };
+  }
+
+  /** The most recently computed timecode bundle for the frame on screen (null before playback). */
+  get currentTimecode(): TimecodeBundle | null {
+    return this.currentTimecodeBundle;
+  }
+
+  /** Merge fresh System Item anchors, keeping the list sorted/deduped by edit unit and bounded. */
+  private mergeSystemAnchors(anchors: TimecodeAnchor[]): void {
+    for (const a of anchors) {
+      const i = this.systemAnchors.findIndex(x => x.editUnit === a.editUnit);
+      if (i >= 0) this.systemAnchors[i] = a; else this.systemAnchors.push(a);
+    }
+    this.systemAnchors.sort((x, y) => x.editUnit - y.editUnit);
+    // Anchors are sparse (≈1 per segment for continuous TC), but bound growth over long sessions.
+    const MAX = 4096;
+    if (this.systemAnchors.length > MAX) this.systemAnchors.splice(0, this.systemAnchors.length - MAX);
   }
 
   get currentTime(): number {
@@ -333,6 +437,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
       case 'videoSegment':
         this.mseController?.appendSegment('video', event.data);
+        if (event.systemTcAnchors?.length) this.mergeSystemAnchors(event.systemTcAnchors);
         // Long-GOP fetches are GOP-aligned and may cover more frames than requested; adopt the
         // worker's reported next start so forward fetches stay keyframe-aligned and tile exactly.
         if (event.nextFrame !== undefined && !this.scrub.isActive && !this.previewParked) {
@@ -427,6 +532,12 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // RESUME_BUFFER_SECONDS (showing "buffering") instead of stuttering through the thin cold buffer.
     this.startupGating = true;
 
+    // Reset timecode state for the new file.
+    this.manifestTimecodes = event.timecodes ?? [];
+    this.systemAnchors = [];
+    this.lastTimecodeEditUnit = -1;
+    this.currentTimecodeBundle = null;
+
     this.manifest = {
       duration: event.duration,
       editRateNumerator: event.editRateNumerator,
@@ -439,6 +550,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       aspectRatio: event.aspectRatio,
       indexMode: event.indexMode,
       longGop: event.longGop,
+      timecodes: event.timecodes ?? [],
     };
 
     // Use the resolved output codec for the MIME type (e.g. 'h264' for transcoded MPEG-2).
@@ -663,6 +775,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     }
 
     this.emit('timeupdate', { currentTime, duration: this.duration });
+    // Fallback timecode update (rVFC drives it per-frame where available; this covers paused/seek
+    // settle and browsers without rVFC). Deduped by edit unit so it never double-emits with rVFC.
+    this.updateTimecode(currentTime);
   }
 
   /** Buffered-ahead seconds of video at the current playhead (0 if unknown). */
@@ -752,10 +867,20 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.playIntent = false;
     this.isBuffering = false;
     this.startupGating = false;
+    this.manifestTimecodes = [];
+    this.systemAnchors = [];
+    this.lastTimecodeEditUnit = -1;
+    this.currentTimecodeBundle = null;
     this.scrub.reset();
   }
 
   destroy(): void {
+    this.destroyed = true;
+    const v = this.video as HTMLVideoElement & { cancelVideoFrameCallback?: (h: number) => void };
+    if (this.rvfcHandle && typeof v.cancelVideoFrameCallback === 'function') {
+      v.cancelVideoFrameCallback(this.rvfcHandle);
+    }
+    this.rvfcHandle = 0;
     this.destroyInternal();
     this.removeAllListeners();
     this.emit('destroyed', undefined as unknown as void);

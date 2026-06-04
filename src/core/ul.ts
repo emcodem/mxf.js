@@ -167,6 +167,16 @@ export function isSoundEssence(key: Uint8Array): boolean {
 }
 
 /**
+ * True for a Generic Container **System Item** — the per-content-package element that carries the
+ * frame's SMPTE 12M timecode (among system metadata). Byte 12 is the item-type: 0x04 for the
+ * CP-compatible system item (SMPTE 326M, used by D-10) and 0x14 for the GC system item (SMPTE
+ * 405M/385M, used by XDCAM/XAVC). Both share the GC essence prefix (bytes [8..11] = 0D 01 03 01).
+ */
+export function isSystemItem(key: Uint8Array): boolean {
+  return isGenericContainerElement(key) && (key[12] === 0x04 || key[12] === 0x14);
+}
+
+/**
  * True if a sound essence element is AES3-wrapped (SMPTE 331M, used by D-10): the element is a
  * 4-byte header followed by interleaved 8-channel 32-bit AES3 subframe words (the 24-bit sample
  * sits in bits 4–27). The element-type byte (key[14]) is 0x10 for AES3 vs 0x03 for plain BWF/PCM;

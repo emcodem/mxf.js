@@ -1,6 +1,23 @@
 import { MxfTrack } from './parser/metadata.js';
 import { PictureDescriptor, SoundDescriptor } from './parser/descriptor.js';
 import type { IndexMode } from './mxf-file.js';
+import type { ManifestTimecode } from './worker/worker-messages.js';
+
+export type { ManifestTimecode } from './worker/worker-messages.js';
+
+/** Where a timecode came from: per-frame System Item, or a computed package start timecode. */
+export type TimecodeSource = 'system' | 'material' | 'file' | 'source';
+
+/**
+ * The timecode(s) for the frame currently on screen. `primary` is the highest-priority available
+ * (system → material → source → file); `all` lists every source with its formatted value and a
+ * `reliable` flag (computed package timecodes are unreliable in 'none'/percentage index mode).
+ */
+export interface TimecodeBundle {
+  editUnit: number;
+  primary: { source: TimecodeSource; text: string } | null;
+  all: { source: TimecodeSource; text: string; reliable: boolean }[];
+}
 
 export interface ManifestData {
   duration: number;
@@ -25,6 +42,8 @@ export interface ManifestData {
   indexMode: IndexMode;
   /** True for H.264 Long-GOP (XAVC-L) streams (B-frame reorder applied on fetch). */
   longGop: boolean;
+  /** Computed start timecodes from the Material / File / Source package timecode tracks. */
+  timecodes: ManifestTimecode[];
 }
 
 export interface MxfPlayerEvents {
@@ -39,6 +58,12 @@ export interface MxfPlayerEvents {
    */
   buffering: { buffering: boolean; bufferedSeconds: number };
   timeupdate: { currentTime: number; duration: number };
+  /**
+   * Fired when the timecode of the frame on screen changes (driven by requestVideoFrameCallback
+   * where available, else by timeupdate). Carries the per-frame System Item timecode and the
+   * computed package timecodes — see {@link TimecodeBundle}. Always matches the rendered frame.
+   */
+  timecode: TimecodeBundle;
   playing: void;
   seeking: { targetTime: number };
   seeked: { actualTime: number };

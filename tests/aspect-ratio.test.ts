@@ -23,6 +23,7 @@ function metadata(pd: PictureDescriptor): MxfMetadata {
     duration: 100n,
     editRateNumerator: 25, editRateDenominator: 1,
     packages: [],
+    timecodes: [],
     pictureDescriptor: pd,
     soundDescriptor: null,
     operationalPattern: null,

@@ -17,8 +17,9 @@ import type { ReorderInputFrame } from '../essence/reorder-resolver.js';
 import { SparseKeyframeIndex } from '../essence/sparse-keyframe-index.js';
 import { selectNoIndexLongGopRun, NOINDEX_GOP_LOOKAHEAD } from './longgop-noindex.js';
 import { decodePcmElements } from '../audio/pcm.js';
-import { WorkerCommand, WorkerEvent } from './worker-messages.js';
+import { WorkerCommand, WorkerEvent, TimecodeAnchor } from './worker-messages.js';
 import type { EssenceFrame } from '../essence/essence-extractor.js';
+import { timecodeToFrameCount, Timecode } from '../parser/timecode.js';
 import { ScrubSegmentCache } from './scrub-segment-cache.js';
 import { FetchQueue } from './fetch-queue.js';
 import { Mpeg2Pipeline } from './mpeg2-pipeline.js';
@@ -102,6 +103,35 @@ const scrubSegmentCache = new ScrubSegmentCache();
 
 function post(event: WorkerEvent, transferables: Transferable[] = []): void {
   self.postMessage(event, transferables);
+}
+
+/**
+ * Compress per-frame System Item timecodes into the minimal set of anchors: keep the first, then
+ * keep only frames whose timecode breaks linear continuation from the previous kept anchor (a
+ * "jump", or a base/drop-frame change). A continuous segment → one anchor; the player interpolates
+ * the rest. `pairs` are (presentation edit unit, timecode) — undefined timecodes are dropped.
+ */
+function buildTcAnchors(pairs: { editUnit: number; tc?: Timecode }[]): TimecodeAnchor[] {
+  const sorted = pairs.filter(p => p.tc).sort((a, b) => a.editUnit - b.editUnit);
+  const anchors: TimecodeAnchor[] = [];
+  let prev: TimecodeAnchor | null = null;
+  for (const p of sorted) {
+    const tc = p.tc!;
+    const fc = timecodeToFrameCount(tc);
+    if (prev && prev.base === tc.base && prev.dropFrame === tc.dropFrame &&
+        fc === prev.frameCount + (p.editUnit - prev.editUnit)) continue; // linear → skip
+    prev = { editUnit: p.editUnit, frameCount: fc, base: tc.base, dropFrame: tc.dropFrame };
+    anchors.push(prev);
+  }
+  return anchors;
+}
+
+/** Pack the parsed package timecodes for the manifest (bigint position → number for the wire). */
+function manifestTimecodes(metadata: { timecodes: { source: 'material'|'file'|'source'; position: bigint; base: number; dropFrame: boolean; editRateNumerator: number; editRateDenominator: number }[] }) {
+  return metadata.timecodes.map(t => ({
+    source: t.source, position: Number(t.position), base: t.base, dropFrame: t.dropFrame,
+    editRateNumerator: t.editRateNumerator, editRateDenominator: t.editRateDenominator,
+  }));
 }
 
 function postError(message: string, fatal = false): void {
@@ -213,6 +243,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
         editRateNumerator: storedEditRateNumerator,
         editRateDenominator: storedEditRateDenominator,
         tracks: metadata.packages.flatMap(p => p.tracks),
+        timecodes: manifestTimecodes(metadata),
         pictureDescriptor: pd,
         soundDescriptor: sd,
         // Display dims from the elementary stream (active picture), not the per-field descriptor.
@@ -322,6 +353,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       editRateNumerator: storedEditRateNumerator,
       editRateDenominator: storedEditRateDenominator,
       tracks: metadata.packages.flatMap(p => p.tracks),
+      timecodes: manifestTimecodes(metadata),
       pictureDescriptor: pd,
       soundDescriptor: sd,
       displayWidth: videoDisplayWidth,
@@ -509,8 +541,18 @@ async function handleFetchSegment(
         }
         if (seg) {
           if (workerDebug) console.log('[worker] videoSegment', seg.length, 'bytes,', chunks.length, 'chunks, first chunk keyframe:', chunks[0]?.isKeyframe, 'first chunk editUnit:', chunks[0] ? Number(chunks[0].editUnit) : -1, keyframePreview ? `(keyframe preview, stretch ${stretchToFrames}f)` : '');
+          // The decoder's display reorder isn't tracked per-frame here, so emit a single base anchor:
+          // the earliest source TC (displays first in a forward GOP) at the first displayed edit unit.
+          // Exact for continuous timecode; best-effort across a mid-segment jump (next segment re-anchors).
+          let tcAnchors: TimecodeAnchor[] | undefined;
+          const tcs = videoFrames.map(f => f.systemTimecode).filter((t): t is Timecode => !!t);
+          if (tcs.length > 0 && chunks.length > 0) {
+            let ref = tcs[0], minFc = timecodeToFrameCount(tcs[0]);
+            for (const t of tcs) { const fc = timecodeToFrameCount(t); if (fc < minFc) { minFc = fc; ref = t; } }
+            tcAnchors = [{ editUnit: Number(chunks[0].editUnit), frameCount: minFc, base: ref.base, dropFrame: ref.dropFrame }];
+          }
           post(
-            { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: startFrame },
+            { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: startFrame, systemTcAnchors: tcAnchors },
             [seg.buffer],
           );
         }
@@ -548,8 +590,18 @@ async function handleFetchSegment(
         if (seg) {
           if (workerDebug) console.log(`[longgop] fetch ${fetchStart}..${lgNextFrame - 1} (req ${startFrame}+${frameCount})${isBoundary ? ' [boundary, leading-B drop]' : ''}: ${videoFrames.length} AUs → ${resolved.length} samples`);
           if (isScrubPreview) scrubSegmentCache.set(startFrame, seg.slice());
+          // System-item TC anchors: key by the source frame's STORAGE edit unit, NOT its presentation
+          // pts. The System Item sits in the content package in storage (decode) order, so its TC value
+          // is a function of the storage position — for XAVC-L it counts linearly in storage order
+          // (verify-meta: 00,00,01,01,02,02… on xavc_l_1080p50). Pairing that storage-linear clock to
+          // the reordered presentation pts scrambles it (B-frame reorder), so stepping through display
+          // order showed a non-monotonic SYS TC. Anchoring by storage editUnit keeps the run linear →
+          // ~1 anchor/segment, and the player's nearest-anchor + offset reconstructs base+editUnit at
+          // any presentation query (exact for continuous TC; a real TC jump lands within the reorder
+          // distance of its frame — the same best-effort the MPEG-2 path accepts).
+          const tcAnchors = buildTcAnchors(reordered.map(f => ({ editUnit: Number(f.editUnit), tc: f.systemTimecode })));
           post(
-            { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: fetchStart, nextFrame: lgNextFrame },
+            { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: fetchStart, nextFrame: lgNextFrame, systemTcAnchors: tcAnchors.length ? tcAnchors : undefined },
             [seg.buffer],
           );
         }
@@ -579,8 +631,10 @@ async function handleFetchSegment(
               // + remux. Keyed by startFrame (= the requested keyframe). See scrubSegmentCache.
               scrubSegmentCache.set(startFrame, seg.slice());
             }
+            // All-intra (no reorder): storage edit unit == presentation edit unit, so anchor directly.
+            const tcAnchors = buildTcAnchors(videoFrames.map(f => ({ editUnit: Number(f.editUnit), tc: f.systemTimecode })));
             post(
-              { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: startFrame },
+              { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: startFrame, systemTcAnchors: tcAnchors.length ? tcAnchors : undefined },
               [seg.buffer],
             );
           }

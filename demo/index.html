@@ -108,6 +108,8 @@
     <span class="time" id="timeCurrent">0:00</span>
     <input type="range" id="seekBar" min="0" max="100" step="0.1" value="0">
     <span class="time" id="timeDuration">0:00</span>
+    <span id="timecode" title="Timecode of the frame on screen"
+          style="font:13px/1 ui-monospace,SFMono-Regular,Menlo,monospace; color:#3c3; min-width:128px; text-align:right; white-space:nowrap;">--:--:--:--</span>
   </div>
 
   <div style="color:#666; font-size:12px; max-width:960px; margin:4px 0 12px;">
@@ -152,6 +154,8 @@
     const seekBar  = document.getElementById('seekBar');
     const timeCur  = document.getElementById('timeCurrent');
     const timeDur  = document.getElementById('timeDuration');
+    const tcEl     = document.getElementById('timecode');
+    const TC_LABEL = { system: 'SYS', material: 'MP', source: 'SP', file: 'FP' };
     const audioChannelsEl = document.getElementById('audioChannels');
     const channelBoxesEl  = document.getElementById('channelBoxes');
     const bufferingOverlay = document.getElementById('bufferingOverlay');
@@ -267,6 +271,7 @@
       p.on('playing',   () => dbgLog('EVT', 'playing'));
       p.on('buffering', d => dbgLog('EVT', `buffering=${d.buffering}`, `${d.bufferedSeconds.toFixed(2)}s ahead`));
       p.on('timeupdate', d => dbgTimeupdate(d.currentTime));
+      p.on('timecode',  d => dbgTimecode(d));
       p.on('audio-info', d => dbgLog('EVT', 'audio-info', `${d.channelCount}ch active=[${d.activeChannels.map(c => c + 1).join(',')}]`));
       p.on('codec-unsupported', d => dbgLog('EVT', 'codec-unsupported', `${d.codec}: ${d.reason}`));
       p.on('error',     d => dbgLog('ERR', `error${d.fatal ? ' (FATAL)' : ''}`, d.message));
@@ -283,6 +288,26 @@
         lastTuLogged = ct;
       }
       lastTuTime = ct;
+    }
+
+    // timecode fires once per rendered frame (requestVideoFrameCallback). During continuous playback
+    // that's far too dense, so coalesce: log a jump (non-contiguous edit unit — a seek/scrub landed
+    // or the source TC discontinuity'd) or once per ~0.5 s of steady advance. But when the element is
+    // PAUSED every TC change is a discrete user action (frame-step, seek/scrub settle), so always log
+    // it — otherwise single-frame steps (Δeu == 1) fall under the playback throttle and never show.
+    let lastTcUnit = -1, lastTcLoggedUnit = -1;
+    function dbgTimecode({ editUnit, primary, all }) {
+      const eu = Number(editUnit);
+      if (eu === lastTcUnit) return;
+      const jumped = lastTcUnit >= 0 && Math.abs(eu - lastTcUnit) > 1;
+      if (video.paused || jumped || lastTcLoggedUnit < 0 || Math.abs(eu - lastTcLoggedUnit) >= 12) {
+        const tc = primary ? `${primary.text} ${TC_LABEL[primary.source] ?? primary.source ?? ''}`.trim() : '(none)';
+        const others = (all ?? []).filter(a => a !== primary)
+          .map(a => `${a.source}=${a.text}${a.reliable === false ? '~' : ''}`).join(' ');
+        dbgLog('EVT', `timecode ${tc}`, `eu=${eu}${jumped ? ` JUMP from ${lastTcUnit}` : ''}${others ? ` | ${others}` : ''}`);
+        lastTcLoggedUnit = eu;
+      }
+      lastTcUnit = eu;
     }
 
     // Native <video> events — the ground truth of what the element actually did. Attached once (the
@@ -389,6 +414,8 @@
       seekBar.value = 0;
       timeCur.textContent = '0:00';
       timeDur.textContent = '0:00';
+      tcEl.textContent = '--:--:--:--';
+      tcEl.title = '';
 
       player = new MxfPlayer(video, { debug: true, startBufferSeconds: 3, maxBufferSeconds: 8, seekMode: 'accurate' });
       instrumentPlayer(player);   // wrap API + attach event listeners onto the debug timeline
@@ -417,6 +444,15 @@
         timeDur.textContent = fmt(duration);
         if (!seeking && !kbScrubbing) seekBar.value = currentTime;
         syncPlayBtn();
+      });
+
+      // Per-frame timecode (driven by requestVideoFrameCallback): show the primary source's TC plus
+      // a small label (SYS/MP/SP/FP); the tooltip lists every available source.
+      player.on('timecode', ({ primary, all }) => {
+        if (!primary) { tcEl.textContent = '--:--:--:--'; tcEl.title = ''; return; }
+        tcEl.textContent = `${primary.text} ${TC_LABEL[primary.source] ?? ''}`.trim();
+        tcEl.title = all.map(a =>
+          `${a.source}: ${a.text}${a.reliable === false ? ' (approx)' : ''}`).join('\n');
       });
 
       player.on('error', ({ message, fatal }) => {

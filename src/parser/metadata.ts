@@ -13,6 +13,12 @@ export interface MxfTrack {
   editRateNumerator: number;
   editRateDenominator: number;
   origin: bigint;
+  /**
+   * For a timecode track: the start timecode from its TimecodeComponent. `position` is the start
+   * frame count (since 00:00:00:00), `base` the RoundedTimecodeBase (frames/sec), `dropFrame` the
+   * drop-frame flag. Absent for non-timecode tracks or when no TimecodeComponent is found.
+   */
+  startTimecode?: { position: bigint; base: number; dropFrame: boolean };
 }
 
 export interface MxfPackage {
@@ -21,11 +27,27 @@ export interface MxfPackage {
   tracks: MxfTrack[];
 }
 
+/**
+ * A header-metadata timecode track's start point, surfaced once per package that has one. The
+ * running timecode for a rendered frame is computed as `position + absoluteEditUnit`, formatted at
+ * `base`/`dropFrame`. Reliable only when the absolute edit unit is exact (cbg/vbe index modes).
+ */
+export interface MxfTimecodeTrack {
+  source: 'material' | 'file' | 'source';
+  position: bigint;
+  base: number;
+  dropFrame: boolean;
+  editRateNumerator: number;
+  editRateDenominator: number;
+}
+
 export interface MxfMetadata {
   duration: bigint;
   editRateNumerator: number;
   editRateDenominator: number;
   packages: MxfPackage[];
+  /** Start timecodes from the Material / File / Source package timecode tracks (one per package). */
+  timecodes: MxfTimecodeTrack[];
   pictureDescriptor: PictureDescriptor | null;
   soundDescriptor: SoundDescriptor | null;
   operationalPattern: Uint8Array | null;
@@ -42,6 +64,10 @@ const TAG_SEQUENCE        = 0x4803;
 const TAG_DURATION        = 0x0202;
 const TAG_PACKAGE_UID     = 0x4401;
 const TAG_DATA_DEFINITION = 0x0201;
+const TAG_STRUCTURAL_COMPONENTS = 0x1001; // Sequence → array of component strong-refs
+const TAG_START_TIMECODE  = 0x1501;       // TimecodeComponent: Position (int64)
+const TAG_ROUNDED_TC_BASE = 0x1502;       // TimecodeComponent: RoundedTimecodeBase (uint16)
+const TAG_DROP_FRAME      = 0x1503;       // TimecodeComponent: DropFrame (boolean)
 
 // ── Class ULs for metadata Sets ───────────────────────────────────────────────
 // Compared with ulMatchClass (bytes 0-4 + 8-15) to tolerate encoder variation
@@ -55,6 +81,7 @@ const CLASS_SOURCE_PACKAGE   = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,
 const CLASS_STATIC_TRACK     = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x3a,0x00);
 const CLASS_TRACK            = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x3b,0x00);
 const CLASS_SEQUENCE         = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x0f,0x00);
+const CLASS_TIMECODE_COMPONENT = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x14,0x00);
 // Descriptor sets
 const CLASS_CDCI_DESCRIPTOR     = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x28,0x00);
 const CLASS_RGBA_DESCRIPTOR     = cls(0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x29,0x00);
@@ -184,6 +211,7 @@ export function parseHeaderMetadata(
   let editRateNumerator = 25;
   let editRateDenominator = 1;
   const packages: MxfPackage[] = [];
+  const timecodes: MxfTimecodeTrack[] = [];
 
   for (const set of sets) {
     const cls = set.classUL;
@@ -212,12 +240,23 @@ export function parseHeaderMetadata(
         ulMatchClass(cls, CLASS_SOURCE_PACKAGE)) {
       const pkg = parsePackage(cls, set, sets, debug);
       packages.push(pkg);
-      if (pkg.packageType === 'material') {
-        for (const track of pkg.tracks) {
-          if (track.essence === 'picture') {
-            editRateNumerator = track.editRateNumerator;
-            editRateDenominator = track.editRateDenominator;
-          }
+      for (const track of pkg.tracks) {
+        if (pkg.packageType === 'material' && track.essence === 'picture') {
+          editRateNumerator = track.editRateNumerator;
+          editRateDenominator = track.editRateDenominator;
+        }
+        if (track.essence === 'timecode' && track.startTimecode) {
+          const st = track.startTimecode;
+          timecodes.push({
+            source: pkg.packageType,
+            position: st.position,
+            // RoundedTimecodeBase is authoritative; fall back to the track's edit rate when absent.
+            base: st.base > 0 ? st.base
+              : (track.editRateDenominator > 0 ? Math.round(track.editRateNumerator / track.editRateDenominator) : 0),
+            dropFrame: st.dropFrame,
+            editRateNumerator: track.editRateNumerator,
+            editRateDenominator: track.editRateDenominator,
+          });
         }
       }
     }
@@ -242,6 +281,7 @@ export function parseHeaderMetadata(
     editRateNumerator,
     editRateDenominator,
     packages,
+    timecodes,
     pictureDescriptor,
     soundDescriptor,
     operationalPattern: null,
@@ -343,6 +383,7 @@ function parseTrack(set: RawSet, allSets: RawSet[]): MxfTrack {
   const seqRef   = set.localItems.get(TAG_SEQUENCE);
 
   let essence: EssenceKind = 'data';
+  let startTimecode: MxfTrack['startTimecode'];
 
   if (seqRef && seqRef.length >= 16) {
     const seqSet = allSets.find(s =>
@@ -359,6 +400,9 @@ function parseTrack(set: RawSet, allSets: RawSet[]): MxfTrack {
         else if (ulMatchClass(ddSlice, DD_TIMECODE)) essence = 'timecode';
       }
     }
+    // Resolve the track's TimecodeComponent (the start timecode), whether the track references a
+    // Sequence containing it or the component directly.
+    startTimecode = findStartTimecode(seqRef.slice(0, 16), allSets);
   }
 
   let erNum = 25, erDen = 1;
@@ -375,5 +419,47 @@ function parseTrack(set: RawSet, allSets: RawSet[]): MxfTrack {
     editRateNumerator: erNum,
     editRateDenominator: erDen,
     origin: origin && origin.length >= 8 ? i64BE(origin) : 0n,
+    startTimecode,
+  };
+}
+
+/**
+ * Resolve the TimecodeComponent reachable from a track's Sequence ref and read its start timecode.
+ * The ref may point to a Sequence (walk its StructuralComponents array, tag 0x1001) or directly to
+ * a TimecodeComponent. Returns undefined if no TimecodeComponent / StartTimecode is found.
+ */
+function findStartTimecode(refUID: Uint8Array, allSets: RawSet[]): MxfTrack['startTimecode'] {
+  const refSet = allSets.find(s => bytesEqual(s.instanceUID, refUID));
+  if (!refSet) return undefined;
+
+  let tcSet: RawSet | undefined;
+  if (ulMatchClass(refSet.classUL, CLASS_TIMECODE_COMPONENT)) {
+    tcSet = refSet;
+  } else {
+    const comps = refSet.localItems.get(TAG_STRUCTURAL_COMPONENTS);
+    if (comps && comps.length >= 8) {
+      const v = new DataView(comps.buffer, comps.byteOffset, comps.byteLength);
+      const count = v.getUint32(0, false);
+      const itemLen = v.getUint32(4, false);
+      for (let i = 0; i < count && itemLen >= 16; i++) {
+        const uid = comps.slice(8 + i * itemLen, 8 + i * itemLen + 16);
+        const cand = allSets.find(s =>
+          ulMatchClass(s.classUL, CLASS_TIMECODE_COMPONENT) && bytesEqual(s.instanceUID, uid));
+        if (cand) { tcSet = cand; break; }
+      }
+    }
+  }
+  if (!tcSet) return undefined;
+
+  const start = tcSet.localItems.get(TAG_START_TIMECODE);
+  if (!start || start.length < 8) return undefined;
+  const baseB = tcSet.localItems.get(TAG_ROUNDED_TC_BASE);
+  const dropB = tcSet.localItems.get(TAG_DROP_FRAME);
+  const base = baseB && baseB.length >= 2
+    ? new DataView(baseB.buffer, baseB.byteOffset, baseB.byteLength).getUint16(0, false) : 0;
+  return {
+    position: i64BE(start),
+    base,
+    dropFrame: !!(dropB && dropB.length >= 1 && dropB[0] !== 0),
   };
 }

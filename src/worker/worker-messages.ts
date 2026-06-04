@@ -2,6 +2,32 @@ import { MxfTrack } from '../parser/metadata.js';
 import { PictureDescriptor, SoundDescriptor } from '../parser/descriptor.js';
 import type { IndexMode } from '../mxf-file.js';
 
+/**
+ * A computed (header-metadata) package timecode for the manifest. `position` is the start frame
+ * count (since 00:00:00:00); the running value for a rendered frame is `position + editUnit`.
+ */
+export interface ManifestTimecode {
+  source: 'material' | 'file' | 'source';
+  position: number;
+  base: number;
+  dropFrame: boolean;
+  editRateNumerator: number;
+  editRateDenominator: number;
+}
+
+/**
+ * A per-frame System Item timecode anchor: at PRESENTATION edit unit `editUnit` the SMPTE timecode
+ * is `frameCount` (absolute frame index), formatted at `base`/`dropFrame`. Only anchors that break
+ * a linear run are sent, so a continuous-timecode segment carries one anchor; a discontinuity
+ * ("jump") emits a fresh anchor. The player linearly interpolates between successive anchors.
+ */
+export interface TimecodeAnchor {
+  editUnit: number;
+  frameCount: number;
+  base: number;
+  dropFrame: boolean;
+}
+
 // Commands sent from main thread to worker
 export type WorkerCommand =
   | { type: 'initUrl'; url: string; debug?: boolean; videoMode?: 'webcodecs' | 'mse' }
@@ -43,6 +69,8 @@ export type WorkerEvent =
       editRateNumerator: number;
       editRateDenominator: number;
       tracks: MxfTrack[];
+      /** Computed start timecodes from the Material / File / Source package timecode tracks. */
+      timecodes: ManifestTimecode[];
       pictureDescriptor: PictureDescriptor | null;
       soundDescriptor: SoundDescriptor | null;
       /** Active picture dimensions to DISPLAY (the real frame, not the per-field StoredHeight in the
@@ -85,6 +113,9 @@ export type WorkerEvent =
       data: ArrayBuffer;
       seq: number;
       editUnit: number;
+      /** Per-frame System Item timecode anchors covering this segment's presentation edit units
+       *  (sparse; absent when the file has no system-item timecode). */
+      systemTcAnchors?: TimecodeAnchor[];
       /**
        * Long-GOP only: the edit unit the next forward fetch should start at. The worker aligns each
        * Long-GOP fetch to whole GOPs (so per-GOP POC ranking is complete and segments tile), which

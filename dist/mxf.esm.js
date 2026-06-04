@@ -1,4 +1,4 @@
-class v {
+class R {
   constructor() {
     this.listeners = /* @__PURE__ */ new Map();
   }
@@ -29,8 +29,8 @@ class v {
     this.listeners.clear();
   }
 }
-const R = 2, x = 0.25, w = 3, B = 6, F = 0.75;
-class S extends v {
+const w = 2, A = 0.25, E = 3, P = 6, D = 0.75;
+class b extends R {
   constructor(e, t = !1) {
     super(), this.mediaSource = null, this.objectURL = null, this.sourceBuffers = /* @__PURE__ */ new Map(), this.queues = /* @__PURE__ */ new Map(), this.processing = /* @__PURE__ */ new Map(), this.video = e, this.debug = t;
   }
@@ -70,7 +70,7 @@ class S extends v {
    * enough to remove.
    */
   trimBackBuffer(e) {
-    const t = e - B;
+    const t = e - P;
     if (!(t <= 0))
       for (const [s, i] of this.sourceBuffers) {
         if (i.buffered.length === 0) continue;
@@ -89,8 +89,8 @@ class S extends v {
     const s = e + t;
     for (const [i, r] of this.sourceBuffers)
       for (let a = r.buffered.length - 1; a >= 0; a--) {
-        const n = r.buffered.start(a);
-        n > s && this.evict(i, n, r.buffered.end(a));
+        const h = r.buffered.start(a);
+        h > s && this.evict(i, h, r.buffered.end(a));
       }
   }
   drainQueue(e) {
@@ -104,8 +104,8 @@ class S extends v {
         t.shift(), s.appendBuffer(i.data);
       else {
         t.shift();
-        const r = s.buffered.length ? s.buffered.start(0) : i.start, a = s.buffered.length ? s.buffered.end(s.buffered.length - 1) : i.end, n = Math.max(i.start, r), o = Math.min(i.end, a);
-        o > n ? s.remove(n, o) : (this.processing.set(e, !1), this.drainQueue(e));
+        const r = s.buffered.length ? s.buffered.start(0) : i.start, a = s.buffered.length ? s.buffered.end(s.buffered.length - 1) : i.end, h = Math.max(i.start, r), u = Math.min(i.end, a);
+        u > h ? s.remove(h, u) : (this.processing.set(e, !1), this.drainQueue(e));
       }
     } catch (r) {
       this.processing.set(e, !1), i.kind === "append" && (r == null ? void 0 : r.name) === "QuotaExceededError" ? this.handleQuota(e, i.data) : console.error(`appendBuffer error (${e}):`, r);
@@ -121,8 +121,8 @@ class S extends v {
     const s = this.sourceBuffers.get(e), i = this.queues.get(e);
     if (!s || !i) return;
     i.unshift({ kind: "append", data: t });
-    const a = this.video.currentTime - 2, n = s.buffered.length ? s.buffered.start(0) : 0;
-    s.buffered.length > 0 && a > n + 0.5 ? (i.unshift({ kind: "remove", start: n, end: a }), this.drainQueue(e)) : (this.debug && console.warn(`[mse] ${e} buffer full — pausing fetch until playhead advances`), this.emit("bufferfull", void 0));
+    const a = this.video.currentTime - 2, h = s.buffered.length ? s.buffered.start(0) : 0;
+    s.buffered.length > 0 && a > h + 0.5 ? (i.unshift({ kind: "remove", start: h, end: a }), this.drainQueue(e)) : (this.debug && console.warn(`[mse] ${e} buffer full — pausing fetch until playhead advances`), this.emit("bufferfull", void 0));
   }
   setDuration(e) {
     if (this.mediaSource && this.mediaSource.readyState === "open")
@@ -205,7 +205,7 @@ class S extends v {
     this.video.src = "", this.mediaSource = null, this.sourceBuffers.clear(), this.queues.clear(), this.removeAllListeners();
   }
 }
-class T {
+class N {
   constructor(e, t) {
     this.video = e, this.onAudioInfo = t, this.cxt = null, this.startTime = null, this.channelCount = 0, this.active = [0, 1], this.scheduled = [], this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
@@ -261,17 +261,17 @@ class T {
     if (!this.cxt) return;
     const r = this.cxt;
     this.applyChannelCount(s);
-    const a = Math.floor(e.length / s), n = i * this.editRateDenominator / this.editRateNumerator, o = a / t;
+    const a = Math.floor(e.length / s), h = i * this.editRateDenominator / this.editRateNumerator, u = a / t;
     this.startTime === null && (this.startTime = r.currentTime - this.video.currentTime);
-    const h = {
+    const o = {
       source: null,
-      bufStartContextTime: this.startTime + n,
-      duration: o,
+      bufStartContextTime: this.startTime + h,
+      duration: u,
       samples: e,
       channelCount: s,
       sampleRate: t
     };
-    this.scheduleEntry(h) && this.scheduled.push(h);
+    this.scheduleEntry(o) && this.scheduled.push(o);
   }
   /** Drop the playhead anchor so the next chunk re-locks to the (new) playhead. Call on seek. */
   resetAnchor() {
@@ -303,24 +303,24 @@ class T {
   scheduleEntry(e) {
     const t = this.cxt, s = t.currentTime, i = s - e.bufStartContextTime;
     if (i >= e.duration - 1e-3) return !1;
-    const { samples: r, channelCount: a, sampleRate: n } = e, o = Math.floor(r.length / a), h = this.active.filter((u) => u < a), l = [], m = [];
-    h.forEach((u, c) => (c % 2 === 0 ? l : m).push(u)), h.length === 1 && (m.length = 0, m.push(h[0]));
-    const g = t.createBuffer(2, o, n), k = (u, c) => {
-      if (c.length === 0) return;
-      const C = 1 / c.length;
-      for (let p = 0; p < o; p++) {
-        let b = 0;
-        const y = p * a;
-        for (const M of c) b += r[y + M];
-        u[p] = b * C;
+    const { samples: r, channelCount: a, sampleRate: h } = e, u = Math.floor(r.length / a), o = this.active.filter((f) => f < a), c = [], d = [];
+    o.forEach((f, g) => (g % 2 === 0 ? c : d).push(f)), o.length === 1 && (d.length = 0, d.push(o[0]));
+    const l = t.createBuffer(2, u, h), p = (f, g) => {
+      if (g.length === 0) return;
+      const T = 1 / g.length;
+      for (let S = 0; S < u; S++) {
+        let C = 0;
+        const x = S * a;
+        for (const B of g) C += r[x + B];
+        f[S] = C * T;
       }
     };
-    k(g.getChannelData(0), l), k(g.getChannelData(1), m);
-    const d = t.createBufferSource();
-    return d.buffer = g, d.connect(t.destination), i <= 0 ? d.start(e.bufStartContextTime) : d.start(s, i), d.onended = () => {
-      const u = this.scheduled.indexOf(e);
-      u >= 0 && this.scheduled.splice(u, 1);
-    }, e.source = d, !0;
+    p(l.getChannelData(0), c), p(l.getChannelData(1), d);
+    const m = t.createBufferSource();
+    return m.buffer = l, m.connect(t.destination), i <= 0 ? m.start(e.bufStartContextTime) : m.start(s, i), m.onended = () => {
+      const f = this.scheduled.indexOf(e);
+      f >= 0 && this.scheduled.splice(f, 1);
+    }, e.source = m, !0;
   }
   /**
    * Re-mix and reschedule all still-playing / future audio with the current channel selection, so a
@@ -339,7 +339,7 @@ class T {
     this.scheduled = e;
   }
 }
-class E {
+class U {
   constructor(e, t, s, i) {
     this.video = e, this.requestPreview = t, this.settle = s, this.resume = i, this.active = !1, this.cycle = 0, this.latestFrame = null, this.seq = 0, this.watchdog = null, this.wasPlaying = !1, this.suppressSeeking = !1, this.hasStream = !1, this.duration = 0, this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
@@ -424,17 +424,56 @@ class E {
     this.watchdog !== null && (clearTimeout(this.watchdog), this.watchdog = null);
   }
 }
-const P = {
+function k(n) {
+  return (n < 10 ? "0" : "") + n;
+}
+function v(n, e) {
+  return e && (n === 30 || n === 60);
+}
+function F(n) {
+  return n === 60 ? 4 : 2;
+}
+function I(n) {
+  const e = n.base;
+  if (e <= 0) return 0;
+  let t = ((n.hours * 60 + n.minutes) * 60 + n.seconds) * e + n.frames;
+  if (v(e, n.dropFrame)) {
+    const s = F(e), i = n.hours * 60 + n.minutes;
+    t -= s * (i - Math.floor(i / 10));
+  }
+  return t;
+}
+function y(n, e, t) {
+  if (e <= 0) return { hours: 0, minutes: 0, seconds: 0, frames: 0, dropFrame: !1, base: e };
+  let s = n < 0 ? 0 : Math.floor(n);
+  const i = v(e, t);
+  if (i) {
+    const o = F(e), c = e * 600 - o * 9, d = e * 60 - o, l = Math.floor(s / c), p = s % c;
+    s += o * 9 * l + (p > o ? o * Math.floor((p - o) / d) : 0);
+  }
+  const r = s % e, a = Math.floor(s / e) % 60, h = Math.floor(s / (e * 60)) % 60;
+  return { hours: Math.floor(s / (e * 3600)) % 24, minutes: h, seconds: a, frames: r, dropFrame: i, base: e };
+}
+function M(n) {
+  const e = v(n.base, n.dropFrame) ? ";" : ":";
+  return `${k(n.hours)}:${k(n.minutes)}:${k(n.seconds)}${e}${k(n.frames)}`;
+}
+function L(n, e = 0) {
+  if (n.length < 4) return null;
+  const t = (n[0] & 15) + (n[0] >> 4 & 3) * 10, s = (n[0] & 64) !== 0, i = (n[1] & 15) + (n[1] >> 4 & 7) * 10, r = (n[2] & 15) + (n[2] >> 4 & 7) * 10;
+  return { hours: (n[3] & 15) + (n[3] >> 4 & 3) * 10, minutes: r, seconds: i, frames: t, dropFrame: s, base: e };
+}
+const q = {
   startBufferSeconds: 10,
   maxBufferSeconds: 30,
   pcmAudioMode: "auto",
   seekMode: "accurate",
-  resumeBufferSeconds: F,
+  resumeBufferSeconds: D,
   debug: !1
 };
-class A extends v {
+class $ extends R {
   constructor(e, t = {}) {
-    super(), this.worker = null, this.mseController = null, this.manifest = null, this.nextFetchFrame = 0, this.framesPerChunk = 50, this.rampChunkFrames = 50, this.fetchPending = !1, this.bufferFull = !1, this.editRateNumerator = 25, this.editRateDenominator = 1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.playIntent = !1, this.isBuffering = !1, this.startupGating = !1, this.video = e, this.config = { ...P, ...t }, this.audio = new T(this.video, (s) => this.emit("audio-info", s)), this.scrub = new E(
+    super(), this.worker = null, this.mseController = null, this.manifest = null, this.nextFetchFrame = 0, this.framesPerChunk = 50, this.rampChunkFrames = 50, this.fetchPending = !1, this.bufferFull = !1, this.editRateNumerator = 25, this.editRateDenominator = 1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.playIntent = !1, this.isBuffering = !1, this.startupGating = !1, this.manifestTimecodes = [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.rvfcHandle = 0, this.destroyed = !1, this.video = e, this.config = { ...q, ...t }, this.audio = new N(this.video, (s) => this.emit("audio-info", s)), this.scrub = new U(
       this.video,
       (s, i) => {
         var r;
@@ -446,7 +485,69 @@ class A extends v {
       this.startupGating = !1, this.setBuffering(!1);
     }), this.video.addEventListener("canplay", () => this.maybeResumePlayback()), this.video.addEventListener("play", () => {
       this.playIntent = !0;
-    });
+    }), this.startVideoFrameCallback();
+  }
+  startVideoFrameCallback() {
+    const e = this.video;
+    if (typeof e.requestVideoFrameCallback != "function") return;
+    const t = (s, i) => {
+      this.destroyed || (this.updateTimecode(i.mediaTime), this.rvfcHandle = e.requestVideoFrameCallback(t));
+    };
+    this.rvfcHandle = e.requestVideoFrameCallback(t);
+  }
+  /**
+   * Resolve the timecode bundle for the frame at `timeSeconds` and emit `timecode` on change. Fed by
+   * both rVFC (mediaTime, exact) and timeupdate (currentTime, fallback); deduped by edit unit so the
+   * two never double-emit. The edit unit is `round(time × fps)` — exact for any rendered frame
+   * because every fMP4 sample timestamp is edit-unit-derived.
+   */
+  updateTimecode(e) {
+    if (!this.manifest) return;
+    const t = this.editRateNumerator / this.editRateDenominator;
+    if (!(t > 0)) return;
+    const s = Math.max(0, Math.round(e * t));
+    if (s === this.lastTimecodeEditUnit) return;
+    this.lastTimecodeEditUnit = s;
+    const i = this.computeTimecodeBundle(s);
+    this.currentTimecodeBundle = i, this.emit("timecode", i);
+  }
+  /** System Item timecode at a presentation edit unit: nearest preceding anchor + linear offset. */
+  systemTimecodeAt(e) {
+    let t = null;
+    for (const i of this.systemAnchors)
+      i.editUnit <= e && (!t || i.editUnit > t.editUnit) && (t = i);
+    if (!t) return null;
+    const s = t.frameCount + (e - t.editUnit);
+    return M(y(s, t.base, t.dropFrame));
+  }
+  /** Build the full timecode bundle (system + computed package TCs) for a rendered edit unit. */
+  computeTimecodeBundle(e) {
+    var u;
+    const t = [], s = this.systemTimecodeAt(e);
+    s !== null && t.push({ source: "system", text: s, reliable: !0 });
+    const i = ((u = this.manifest) == null ? void 0 : u.indexMode) !== "none", r = this.editRateNumerator / this.editRateDenominator;
+    for (const o of this.manifestTimecodes) {
+      const c = o.editRateDenominator > 0 ? o.editRateNumerator / o.editRateDenominator : r, d = r > 0 ? Math.round(e * (c / r)) : e, l = M(y(o.position + d, o.base, o.dropFrame));
+      t.push({ source: o.source, text: l, reliable: i });
+    }
+    const a = { system: 0, material: 1, source: 2, file: 3 };
+    t.sort((o, c) => a[o.source] - a[c.source]);
+    const h = t.length ? { source: t[0].source, text: t[0].text } : null;
+    return { editUnit: e, primary: h, all: t };
+  }
+  /** The most recently computed timecode bundle for the frame on screen (null before playback). */
+  get currentTimecode() {
+    return this.currentTimecodeBundle;
+  }
+  /** Merge fresh System Item anchors, keeping the list sorted/deduped by edit unit and bounded. */
+  mergeSystemAnchors(e) {
+    for (const s of e) {
+      const i = this.systemAnchors.findIndex((r) => r.editUnit === s.editUnit);
+      i >= 0 ? this.systemAnchors[i] = s : this.systemAnchors.push(s);
+    }
+    this.systemAnchors.sort((s, i) => s.editUnit - i.editUnit);
+    const t = 4096;
+    this.systemAnchors.length > t && this.systemAnchors.splice(0, this.systemAnchors.length - t);
   }
   get currentTime() {
     return this.video.currentTime;
@@ -567,7 +668,7 @@ class A extends v {
       });
     }), this.worker.addEventListener("messageerror", (e) => {
       this.emit("error", { message: `Worker message error: ${String(e)}`, fatal: !0 });
-    }), this.mseController = new S(this.video, !!this.config.debug), this.mseController.on("error", ({ track: e, message: t }) => {
+    }), this.mseController = new b(this.video, !!this.config.debug), this.mseController.on("error", ({ track: e, message: t }) => {
       this.emit("error", { message: `MSE ${e}: ${t}`, fatal: !1 });
     }), this.mseController.on("bufferfull", () => {
       this.bufferFull = !0, this.fetchPending = !1;
@@ -580,7 +681,7 @@ class A extends v {
     return new Worker(e);
   }
   async onWorkerMessage(e) {
-    var t, s, i, r;
+    var t, s, i, r, a;
     switch (e.type) {
       case "manifest":
         await this.onManifest(e);
@@ -589,10 +690,10 @@ class A extends v {
         (t = this.mseController) != null && t.hasVideoBuffer() || (s = this.mseController) != null && s.hasAudioBuffer() ? (this.mseController.appendSegment("video", e.data), this.mseController.appendSegment("audio", e.data), this.fetchNextChunk()) : this.pendingInitSegment = e.data;
         break;
       case "videoSegment":
-        (i = this.mseController) == null || i.appendSegment("video", e.data), e.nextFrame !== void 0 && !this.scrub.isActive && !this.previewParked && (this.nextFetchFrame = e.nextFrame), this.playIntent && this.video.paused && this.maybeResumePlayback();
+        (i = this.mseController) == null || i.appendSegment("video", e.data), (r = e.systemTcAnchors) != null && r.length && this.mergeSystemAnchors(e.systemTcAnchors), e.nextFrame !== void 0 && !this.scrub.isActive && !this.previewParked && (this.nextFetchFrame = e.nextFrame), this.playIntent && this.video.paused && this.maybeResumePlayback();
         break;
       case "audioSegment":
-        (r = this.mseController) == null || r.appendSegment("audio", e.data);
+        (a = this.mseController) == null || a.appendSegment("audio", e.data);
         break;
       case "pcmSamples":
         this.emit("pcm-audio", {
@@ -607,17 +708,17 @@ class A extends v {
         break;
       case "seeked": {
         if (this.pendingSeeks = Math.max(0, this.pendingSeeks - 1), this.pendingSeeks > 0) break;
-        const a = e.nearestKeyframeEditUnit;
-        if (this.nextFetchFrame = a, this.fetchPending = !1, this.activeSeekMode === "keyframe") {
-          const o = Math.max(e.gopFrameCount, this.seekTargetFrame - a + 1, 1);
-          this.fetchKeyframePreview(a, o);
+        const h = e.nearestKeyframeEditUnit;
+        if (this.nextFetchFrame = h, this.fetchPending = !1, this.activeSeekMode === "keyframe") {
+          const o = Math.max(e.gopFrameCount, this.seekTargetFrame - h + 1, 1);
+          this.fetchKeyframePreview(h, o);
           break;
         }
-        const n = Math.min(
+        const u = Math.min(
           this.framesPerChunk,
-          Math.max(1, this.seekTargetFrame - a + 3)
+          Math.max(1, this.seekTargetFrame - h + 3)
         );
-        this.fetchNextChunk(n);
+        this.fetchNextChunk(u);
         break;
       }
       case "previewDone":
@@ -632,11 +733,11 @@ class A extends v {
     }
   }
   async onManifest(e) {
-    var o, h;
+    var u, o;
     const t = e.pictureDescriptor, s = e.soundDescriptor;
     this.editRateNumerator = e.editRateNumerator, this.editRateDenominator = e.editRateDenominator, this.audio.setEditRate(e.editRateNumerator, e.editRateDenominator), this.scrub.setStream(e.duration, e.editRateNumerator, e.editRateDenominator);
     const i = e.editRateNumerator / e.editRateDenominator;
-    this.framesPerChunk = Math.ceil(i * R), this.rampChunkFrames = Math.max(w, Math.ceil(i * x)), this.startupGating = !0, this.manifest = {
+    this.framesPerChunk = Math.ceil(i * w), this.rampChunkFrames = Math.max(E, Math.ceil(i * A)), this.startupGating = !0, this.manifestTimecodes = e.timecodes ?? [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.manifest = {
       duration: e.duration,
       editRateNumerator: e.editRateNumerator,
       editRateDenominator: e.editRateDenominator,
@@ -647,18 +748,19 @@ class A extends v {
       displayHeight: e.displayHeight,
       aspectRatio: e.aspectRatio,
       indexMode: e.indexMode,
-      longGop: e.longGop
+      longGop: e.longGop,
+      timecodes: e.timecodes ?? []
     };
-    const r = e.resolvedVideoCodec ?? (t == null ? void 0 : t.codec) ?? "unknown", a = t && e.videoCodecSupported ? S.getMimeType("video", r) : null;
-    let n = s ? S.getMimeType("audio", s.codec) : null;
-    (s == null ? void 0 : s.codec) === "pcm" && (this.config.pcmAudioMode === "webaudio" || !n) && (n = null, this.audio.createContext(s.sampleRate)), this.audio.applyChannelCount(e.audioChannelCount);
+    const r = e.resolvedVideoCodec ?? (t == null ? void 0 : t.codec) ?? "unknown", a = t && e.videoCodecSupported ? b.getMimeType("video", r) : null;
+    let h = s ? b.getMimeType("audio", s.codec) : null;
+    (s == null ? void 0 : s.codec) === "pcm" && (this.config.pcmAudioMode === "webaudio" || !h) && (h = null, this.audio.createContext(s.sampleRate)), this.audio.applyChannelCount(e.audioChannelCount);
     try {
-      await this.mseController.open(a, n);
-    } catch (l) {
-      this.emit("error", { message: `MSE open failed: ${l}`, fatal: !0 });
+      await this.mseController.open(a, h);
+    } catch (c) {
+      this.emit("error", { message: `MSE open failed: ${c}`, fatal: !0 });
       return;
     }
-    this.mseController.setDuration(e.duration), this.pendingInitSegment ? ((o = this.mseController) == null || o.appendSegment("video", this.pendingInitSegment), (h = this.mseController) == null || h.appendSegment("audio", this.pendingInitSegment), this.pendingInitSegment = null, this.emit("manifest", this.manifest), this.log(`Manifest: ${e.duration.toFixed(2)}s, video=${t == null ? void 0 : t.codec}, audio=${s == null ? void 0 : s.codec}`), this.fetchNextChunk()) : (this.emit("manifest", this.manifest), this.log(`Manifest: ${e.duration.toFixed(2)}s, video=${t == null ? void 0 : t.codec}, audio=${s == null ? void 0 : s.codec}`));
+    this.mseController.setDuration(e.duration), this.pendingInitSegment ? ((u = this.mseController) == null || u.appendSegment("video", this.pendingInitSegment), (o = this.mseController) == null || o.appendSegment("audio", this.pendingInitSegment), this.pendingInitSegment = null, this.emit("manifest", this.manifest), this.log(`Manifest: ${e.duration.toFixed(2)}s, video=${t == null ? void 0 : t.codec}, audio=${s == null ? void 0 : s.codec}`), this.fetchNextChunk()) : (this.emit("manifest", this.manifest), this.log(`Manifest: ${e.duration.toFixed(2)}s, video=${t == null ? void 0 : t.codec}, audio=${s == null ? void 0 : s.codec}`));
   }
   /**
    * Fetch a single I-frame at `keyframe` for a fast scrub preview, telling the worker to stretch
@@ -678,7 +780,7 @@ class A extends v {
     this.seqBase += 2, this.worker.postMessage(s);
   }
   fetchNextChunk(e) {
-    var o;
+    var u;
     if (this.scrub.isActive || this.previewParked || this.bufferFull || this.fetchPending || !this.manifest) return;
     const t = this.video.currentTime, s = this.editRateNumerator / this.editRateDenominator;
     if (this.nextFetchFrame / s - t >= this.config.maxBufferSeconds) return;
@@ -686,18 +788,18 @@ class A extends v {
       this.manifest.duration * this.editRateNumerator / this.editRateDenominator
     );
     if (this.nextFetchFrame >= r) {
-      (o = this.mseController) == null || o.endOfStream();
+      (u = this.mseController) == null || u.endOfStream();
       return;
     }
     const a = e ?? this.nextRampChunk();
     this.fetchPending = !0;
-    const n = {
+    const h = {
       type: "fetchSegment",
       startFrame: this.nextFetchFrame,
       frameCount: a,
       seqBase: this.seqBase
     };
-    this.seqBase += 2, this.nextFetchFrame += a, this.worker.postMessage(n);
+    this.seqBase += 2, this.nextFetchFrame += a, this.worker.postMessage(h);
   }
   /** Return the current cold-start ramp size, then grow it ×2 toward framesPerChunk. A fresh load
    *  ramps ~0.25 s → 0.5 s → 1 s → 2 s so the first paint is fast without a big first download, then
@@ -744,7 +846,7 @@ class A extends v {
     var s, i, r;
     if (!this.manifest) return;
     const e = this.video.currentTime;
-    this.scrub.isActive || ((s = this.mseController) == null || s.trimBackBuffer(e), (i = this.mseController) == null || i.trimForwardOrphans(e, this.config.maxBufferSeconds + 5), this.bufferFull = !1), (((r = this.mseController) == null ? void 0 : r.getBufferedAhead("video", e)) ?? 0) < this.config.startBufferSeconds && (this.previewParked && !this.video.paused && !this.scrub.isActive ? this.initiateSeek(e, "accurate") : this.fetchNextChunk()), this.emit("timeupdate", { currentTime: e, duration: this.duration });
+    this.scrub.isActive || ((s = this.mseController) == null || s.trimBackBuffer(e), (i = this.mseController) == null || i.trimForwardOrphans(e, this.config.maxBufferSeconds + 5), this.bufferFull = !1), (((r = this.mseController) == null ? void 0 : r.getBufferedAhead("video", e)) ?? 0) < this.config.startBufferSeconds && (this.previewParked && !this.video.paused && !this.scrub.isActive ? this.initiateSeek(e, "accurate") : this.fetchNextChunk()), this.emit("timeupdate", { currentTime: e, duration: this.duration }), this.updateTimecode(e);
   }
   /** Buffered-ahead seconds of video at the current playhead (0 if unknown). */
   bufferedAhead() {
@@ -787,13 +889,19 @@ class A extends v {
   }
   destroyInternal() {
     var e, t;
-    (e = this.worker) == null || e.terminate(), this.worker = null, (t = this.mseController) == null || t.destroy(), this.mseController = null, this.audio.destroy(), this.manifest = null, this.nextFetchFrame = 0, this.fetchPending = !1, this.bufferFull = !1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.playIntent = !1, this.isBuffering = !1, this.startupGating = !1, this.scrub.reset();
+    (e = this.worker) == null || e.terminate(), this.worker = null, (t = this.mseController) == null || t.destroy(), this.mseController = null, this.audio.destroy(), this.manifest = null, this.nextFetchFrame = 0, this.fetchPending = !1, this.bufferFull = !1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.playIntent = !1, this.isBuffering = !1, this.startupGating = !1, this.manifestTimecodes = [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.scrub.reset();
   }
   destroy() {
-    this.destroyInternal(), this.removeAllListeners(), this.emit("destroyed", void 0);
+    this.destroyed = !0;
+    const e = this.video;
+    this.rvfcHandle && typeof e.cancelVideoFrameCallback == "function" && e.cancelVideoFrameCallback(this.rvfcHandle), this.rvfcHandle = 0, this.destroyInternal(), this.removeAllListeners(), this.emit("destroyed", void 0);
   }
 }
 export {
-  A as MxfPlayer
+  $ as MxfPlayer,
+  L as decodeSmpte12mBcd,
+  M as formatTimecode,
+  y as frameCountToTimecode,
+  I as timecodeToFrameCount
 };
 //# sourceMappingURL=mxf.esm.js.map
