@@ -198,6 +198,7 @@ interface ManifestData {
   pictureDescriptor: PictureDescriptor | null;
   soundDescriptor: SoundDescriptor | null;
   indexMode: IndexMode;
+  longGop: boolean;                // true for H.264 Long-GOP (XAVC-L); B-frame reorder applied on fetch
 }
 
 interface PictureDescriptor {
@@ -229,6 +230,8 @@ interface SoundDescriptor {
 - ❌ Python's `http.server` (no range support)
 
 Cross-origin URLs also need standard CORS (`Access-Control-Allow-Origin`). The dev server does **not** set COEP headers (they would block cross-origin essence fetches from the worker), and nothing uses `SharedArrayBuffer`.
+
+For local development, the Vite dev server (`npm run dev`) also serves the assets in `MXF_MEDIA_DIR` (default `C:/temp/mxf.js`) same-origin at `/media/<file>.mxf` with full `Range` support — so the demo's **Load URL** works out of the box (default `/media/vistek.mxf`) with no second server. That route also implements a network simulator driven by query params (`?latency=<ms>&rate=<bytes/sec>`, e.g. `/media/vistek.mxf?latency=50&rate=10m`), which the demo's latency/bandwidth inputs use. This is a dev-server-only convenience — it does not exist in the published package.
 
 ---
 
