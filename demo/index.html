@@ -299,7 +299,14 @@
     function dbgTimecode({ editUnit, primary, all }) {
       const eu = Number(editUnit);
       if (eu === lastTcUnit) return;
-      const jumped = lastTcUnit >= 0 && Math.abs(eu - lastTcUnit) > 1;
+      // rVFC samples once per PRESENTED frame, but at high fps (e.g. 50p) the compositor drops
+      // frames, so a contiguous playback step is +2..+3 edit units, not +1. Flag a jump only on a
+      // backward step (a seek) or a forward gap larger than the dropped-frame cadence — otherwise
+      // every undersampled-but-contiguous frame is mislabelled JUMP. Paused single-frame steps
+      // (Δeu == 1) still log via the `video.paused` branch below.
+      const dEu = lastTcUnit >= 0 ? eu - lastTcUnit : 0;
+      const maxStep = Math.max(2, Math.ceil(fps / 12));
+      const jumped = lastTcUnit >= 0 && (dEu < 0 || dEu > maxStep);
       if (video.paused || jumped || lastTcLoggedUnit < 0 || Math.abs(eu - lastTcLoggedUnit) >= 12) {
         const tc = primary ? `${primary.text} ${TC_LABEL[primary.source] ?? primary.source ?? ''}`.trim() : '(none)';
         const others = (all ?? []).filter(a => a !== primary)
