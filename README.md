@@ -44,6 +44,14 @@ All video flows through the single `<video>` element, so seeking and scrubbing w
 - **Fast-drag scrub**: single-flight, latest-wins preview pump with a per-keyframe scrub-preview cache (LRU). The playhead is gated on actual paint, so the picture keeps updating during a continuous drag instead of stalling.
 - **Bounded buffering**: prefetch is capped by requested-ahead time, back buffer is evicted behind the playhead, and `QuotaExceededError` back-pressure is handled — so high-bitrate AVC-Intra (~280 Mbps) doesn't overflow the SourceBuffer or saturate the worker.
 
+### Timecode
+- **Per-frame System Item timecode** (the authoritative source TC, which can jump) and **computed package start timecodes** (Material / File / Source), surfaced through one `timecode` event and the `currentTimecode` getter.
+- Locked to the frame **on screen** via `requestVideoFrameCallback`, so the displayed TC never lags the picture.
+- Helpers exported from the package root: `formatTimecode`, `frameCountToTimecode`, `timecodeToFrameCount`, `decodeSmpte12mBcd`.
+
+### Display aspect ratio
+- Anamorphic content (SD `720×576`/`720×608`, XDCAM-EX `1440×1080`) is shown at its true shape via a `pasp` box in the sample entry — no CSS needed. The DAR is also surfaced on the manifest (`aspectRatio`) and the `aspectRatio` getter.
+
 ---
 
 ## Installation
@@ -81,6 +89,10 @@ const player = new MxfPlayer(video, {
 
 player.on('manifest', (m) => {
   console.log(`${m.duration}s, ${m.pictureDescriptor?.codec}, index=${m.indexMode}`);
+  console.log(`${m.displayWidth}×${m.displayHeight}`, m.aspectRatio); // e.g. 1024×576 {num:16,den:9}
+});
+player.on('timecode', ({ primary }) => {
+  if (primary) tcLabel.textContent = `${primary.text} (${primary.source})`;
 });
 player.on('error', ({ message, fatal }) => console.error(message, fatal));
 
@@ -132,6 +144,7 @@ A runnable demo is in [`demo/index.html`](demo/index.html) (`npm run dev`, then 
 | `maxBufferSeconds` | `number` | `30` | Maximum seconds to buffer ahead of the playhead (caps prefetch). |
 | `pcmAudioMode` | `'mse' \| 'webaudio' \| 'auto'` | `'auto'` | How to play PCM audio. `'auto'` uses MSE where supported, else Web Audio. |
 | `seekMode` | `'accurate' \| 'keyframe'` | `'accurate'` | Default `seek()` behaviour. `accurate` decodes keyframe→target; `keyframe` shows just the GOP-head I-frame. Scrubbing always uses keyframe internally and settles accurately on release. |
+| `resumeBufferSeconds` | `number` | `0.75` | Seconds buffered ahead before (re)starting playback after a cold start, seek, or stall. The first decoded picture shows immediately (with `buffering: true`) while this fills. Smaller = snappier resume but more re-buffering on a thin/decode-bound source. |
 | `debug` | `boolean` | `false` | Verbose `[mxf.js]` console logging. |
 
 ### Methods
@@ -156,7 +169,11 @@ A runnable demo is in [`demo/index.html`](demo/index.html) (`npm run dev`, then 
 | `currentTime` | `number` | Current playhead time (seconds). |
 | `duration` | `number` | Total duration (seconds), `0` before the manifest. |
 | `paused` | `boolean` | Whether playback is paused. |
+| `buffering` | `boolean` | Whether playback is held/stalled waiting for data (mirrors the `buffering` event). |
 | `indexMode` | `'cbg' \| 'vbe' \| 'none' \| null` | Seeking strategy of the loaded file, `null` before the manifest. |
+| `videoDimensions` | `{ width, height } \| null` | Active (display) picture size, `null` before the manifest. |
+| `aspectRatio` | `{ num, den } \| null` | Display aspect ratio (DAR), or `null` for square pixels / before the manifest. |
+| `currentTimecode` | `TimecodeBundle \| null` | Timecode(s) for the frame on screen, `null` before playback (see the `timecode` event). |
 | `audioChannels` | `number` | Total source audio channels (`0` until audio arrives). |
 | `activeChannels` | `number[]` | Source channels currently routed to stereo. |
 
@@ -168,7 +185,8 @@ Subscribe with `player.on(event, handler)` / `.once(...)` / `.off(...)`.
 |-------|---------|------|
 | `manifest` | `ManifestData` | Metadata parsed; safe to read duration, tracks, descriptors, `indexMode`. |
 | `timeupdate` | `{ currentTime, duration }` | Playhead advanced. |
-| `buffering` | `{ bufferedSeconds }` | Buffered-ahead amount changed. |
+| `buffering` | `{ buffering, bufferedSeconds }` | Buffering **state** changed (emitted on change, not per tick). `buffering: true` ⇒ show a "Buffering…" indicator. |
+| `timecode` | `TimecodeBundle` | The timecode of the frame on screen changed (per-rendered-frame, via `requestVideoFrameCallback`). |
 | `seeking` | `{ targetTime }` | A seek started. |
 | `seeked` | `{ actualTime }` | A seek completed. |
 | `playing` | `void` | Playback (re)started. |
@@ -181,13 +199,20 @@ Subscribe with `player.on(event, handler)` / `.once(...)` / `.off(...)`.
 ### Types
 
 ```ts
+import {
+  MxfPlayer,
+  // timecode helpers (re-exported from the package root)
+  formatTimecode, frameCountToTimecode, timecodeToFrameCount, decodeSmpte12mBcd,
+} from 'mxf.js';
 import type {
   MxfConfig,
   ManifestData,
   MxfPlayerEvents,
+  TimecodeBundle, TimecodeSource, ManifestTimecode,
   IndexMode,                       // 'cbg' | 'vbe' | 'none'
-  MxfTrack, MxfPackage, MxfMetadata,
+  MxfTrack, MxfPackage, MxfMetadata, MxfTimecodeTrack,
   PictureDescriptor, SoundDescriptor,
+  Timecode,
 } from 'mxf.js';
 ```
 
@@ -199,8 +224,12 @@ interface ManifestData {
   tracks: MxfTrack[];
   pictureDescriptor: PictureDescriptor | null;
   soundDescriptor: SoundDescriptor | null;
+  displayWidth: number;            // active picture size to show (not the per-field StoredHeight),
+  displayHeight: number;           //   0 when unknown
+  aspectRatio: { num: number; den: number } | null;  // display aspect ratio (DAR), null = square
   indexMode: IndexMode;
   longGop: boolean;                // true for H.264 Long-GOP (XAVC-L); B-frame reorder applied on fetch
+  timecodes: ManifestTimecode[];   // computed start TCs from material/file/source packages
 }
 
 interface PictureDescriptor {
@@ -208,6 +237,7 @@ interface PictureDescriptor {
   width: number; height: number;
   storedWidth: number; storedHeight: number;
   frameRateNumerator: number; frameRateDenominator: number;
+  aspectRatioNum: number; aspectRatioDen: number;    // DAR from AspectRatio (tag 0x320E); 0/0 if absent
   spsNALU: Uint8Array | null;
   ppsNALU: Uint8Array | null;
   pictureEssenceCodingUL: Uint8Array | null;
@@ -219,6 +249,15 @@ interface SoundDescriptor {
   channelCount: number;
   bitDepth: number;
   blockAlign: number;
+}
+
+// The timecode(s) for the frame on screen. `primary` is the highest-priority available
+// (system → material → source → file); `all` lists every source with a `reliable` flag
+// (computed package timecodes are unreliable in 'none' index mode).
+interface TimecodeBundle {
+  editUnit: number;
+  primary: { source: TimecodeSource; text: string } | null;     // TimecodeSource = 'system'|'material'|'file'|'source'
+  all: { source: TimecodeSource; text: string; reliable: boolean }[];
 }
 ```
 
