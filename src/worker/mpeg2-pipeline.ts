@@ -178,9 +178,19 @@ export class Mpeg2Pipeline {
     const counterBefore = this.editUnitCounter;
 
     const decodeT0 = performance.now();
-    for (const vf of videoFrames) {
+    for (let i = 0; i < videoFrames.length; i++) {
       if (shouldAbort()) break;
-      this.decoder.write(vf.data);
+      // Yield to the worker's event loop every 5 frames so queued messages (seek, cancelPrefetch)
+      // can run mid-decode. Without this, the fully synchronous decode loop (~32 ms/frame × 50 frames
+      // = 1600 ms) blocks the worker thread: a seek arriving while buffering is queued but can't
+      // execute until the entire loop finishes, so shouldAbort() never fires during the sync run and
+      // the whole chunk decodes before the abort is seen. setTimeout(r,0) flushes the macrotask queue
+      // (message handlers are macrotasks; Promise.resolve() only flushes microtasks and is not enough).
+      if (i > 0 && i % 5 === 0) {
+        await new Promise<void>(r => setTimeout(r, 0));
+        if (shouldAbort()) break;
+      }
+      this.decoder.write(videoFrames[i].data);
       while (this.decoder.decode()) { /* onFrame fires inside decode(), driving the encoder */ }
     }
     const decodeMs = performance.now() - decodeT0;

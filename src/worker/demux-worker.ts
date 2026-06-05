@@ -92,7 +92,7 @@ function abortSpeculation(): void {
 // onSupersede aborts the speculative read-ahead in the same choke point that drops queued jobs.
 const fetchQ = new FetchQueue(
   (job, signal) =>
-    handleFetchSegment(job.startFrame, job.frameCount, job.seqBase, job.gen, job.stretchToFrames, job.previewSeq, signal),
+    handleFetchSegment(job.startFrame, job.frameCount, job.seqBase, job.gen, job.stretchToFrames, job.previewSeq, signal, job.resetToFrame, job.cacheOnly),
   abortSpeculation,
 );
 // seqBase pool for internally-scheduled scrub-preview decodes (kept apart from the player's seqBase).
@@ -420,6 +420,8 @@ async function handleFetchSegment(
   stretchToFrames = 0,
   previewSeq?: number,
   signal?: AbortSignal,
+  resetToFrame?: number,
+  cacheOnly?: boolean,
 ): Promise<void> {
   // A scrub preview is a throwaway single-frame decode that must always answer with previewDone
   // (so the player's single-flight pump never deadlocks) and must skip audio.
@@ -531,6 +533,10 @@ async function handleFetchSegment(
     // MPEG-2 → H.264 transcode
     // -----------------------------------------------------------------------
     if (mpeg2Pipeline) {
+      // Speculative cache-fill jobs carry the keyframe they should decode from (the primary preview
+      // already ran and left the decoder positioned elsewhere); reset to that frame before decoding.
+      if (resetToFrame !== undefined) mpeg2Pipeline.reset(resetToFrame);
+
       if (videoFrames.length > 0) {
         const pipeline = mpeg2Pipeline;
 
@@ -562,12 +568,14 @@ async function handleFetchSegment(
           chunks,
           keyframePreview ? { totalDurationFrames: stretchToFrames } : undefined,
         );
-        if (seg && isScrubPreview) {
+        if (seg && (isScrubPreview || cacheOnly)) {
           // Cache a copy keyed by the GOP-head keyframe (= startFrame here) so future scrub
           // visits to this GOP skip the decode/encode entirely (see scrubSegmentCache).
           scrubSegmentCache.set(startFrame, seg.slice());
         }
-        if (seg) {
+        // cacheOnly jobs (speculative adjacent-GOP prefill) post nothing to the player — they just
+        // fill the cache for the next drag. All real posting is skipped.
+        if (seg && !cacheOnly) {
           if (workerDebug) console.log('[worker] videoSegment', seg.length, 'bytes,', chunks.length, 'chunks, first chunk keyframe:', chunks[0]?.isKeyframe, 'first chunk editUnit:', chunks[0] ? Number(chunks[0].editUnit) : -1, keyframePreview ? `(keyframe preview, stretch ${stretchToFrames}f)` : '');
           // The decoder's display reorder isn't tracked per-frame here, so emit a single base anchor:
           // the earliest source TC (displays first in a forward GOP) at the first displayed edit unit.
@@ -698,7 +706,7 @@ async function handleFetchSegment(
       }
     }
 
-    if (!isScrubPreview) post({ type: 'segmentDone' });
+    if (!isScrubPreview && !cacheOnly) post({ type: 'segmentDone' });
 
   } catch (e) {
     // A read aborted by a seek/scrub supersession is expected — the next fetch is already queued, so
@@ -710,7 +718,7 @@ async function handleFetchSegment(
       // segmentDone the player's fetchPending stays true and it never fetches again (the playhead
       // drains to the frontier and hard-stalls). Post it so the player clears fetchPending and
       // advances to the next chunk — a single bad chunk becomes a gap/glitch, not a permanent freeze.
-      if (!isScrubPreview) post({ type: 'segmentDone' });
+      if (!isScrubPreview && !cacheOnly) post({ type: 'segmentDone' });
     }
   } finally {
     // Always answer a scrub preview, even when superseded (gen mismatch returns above) or errored,
@@ -802,10 +810,10 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
   // Fetch a small CONTIGUOUS run of real frames starting AT the keyframe (the player renders the
   // keyframe, not the mid-GOP target — standard keyframe-granularity scrub). A paused <video> paints
   // a seek into a contiguous multi-frame region (exactly why scrubbing the already-buffered area
-  // works) but will NOT settle on a lone stretched sample. ~0.4 s of lookahead is enough contiguous
-  // future data to paint, while keeping the per-preview decode small — critical for MPEG-2, where
-  // decoding a whole GOP+lookahead per preview saturated the worker so nothing painted. Constant per
-  // keyframe (independent of target) so it stays cacheable.
+  // works) but will NOT settle on a lone stretched sample. SCRUB_PREVIEW_LOOKAHEAD_SECONDS of
+  // contiguous future data is enough to paint, while keeping the per-preview decode small — critical
+  // for MPEG-2, where decoding a whole GOP+lookahead per preview saturated the worker so nothing
+  // painted. Constant per keyframe (independent of target) so it stays cacheable.
   const fps = storedEditRateNumerator / storedEditRateDenominator;
   const runFrames = 1 + Math.max(SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES, Math.round(fps * SCRUB_PREVIEW_LOOKAHEAD_SECONDS));
 
@@ -815,11 +823,39 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
   // This preview run starts a fresh GOP: drop open-GOP leading B's so the keyframe paints first.
   longGopBoundaryPending = true;
 
-  // Enqueue the throwaway decode (serialized via the queue so it can't race a normal fetch).
+  // Enqueue the primary throwaway decode (serialized via the queue so it can't race a normal fetch).
   // stretchToFrames stays 0 — these are real consecutive frames, so the segment is naturally
   // contiguous and the element can paint a paused seek into it.
   fetchQ.enqueue({ startFrame: keyframe, frameCount: runFrames, seqBase: scrubSeqBase, previewSeq: seq });
   scrubSeqBase += 2;
+
+  // Speculative adjacent-GOP cache fill (MPEG-2 only, VBE/CBG index modes only).
+  // After the primary decode completes (~220 ms), the worker is idle while the player seeks the
+  // element onto the preview frame ('seeked' fires in ~30 ms) and the user decides where to drag next.
+  // Use that idle time to speculatively decode the NEXT keyframe into the scrubSegmentCache so a
+  // forward drag finds a cache hit (instant) instead of paying another ~220 ms decode.
+  //
+  // The job carries `resetToFrame` (the next keyframe edit unit) so handleFetchSegment repositions the
+  // shared decoder before decoding; and `cacheOnly` so it posts nothing to the player. It is
+  // superseded cleanly by any real drag (fetchQ.supersede() kills it mid-decode via the gen check).
+  //
+  // Only enqueue for MPEG-2 (mpeg2Pipeline present) with a real index (so findKeyframeCeil works);
+  // H.264 scrub previews are already cheap and don't need this.
+  if (mpeg2Pipeline && bootstrap.indexMode !== 'none') {
+    const segs = bootstrap.indexSegments;
+    const vid = bootstrap.essenceBodySID;
+    const nextKf = findKeyframeCeil(segs, BigInt(keyframe + 1), vid);
+    if (nextKf !== null && !scrubSegmentCache.get(Number(nextKf))) {
+      fetchQ.enqueue({
+        startFrame: Number(nextKf),
+        frameCount: runFrames,
+        seqBase: scrubSeqBase,
+        cacheOnly: true,
+        resetToFrame: Number(nextKf),
+      });
+      scrubSeqBase += 2;
+    }
+  }
 }
 
 // Command dispatch: one handler per command type. Each handler's parameter is narrowed to the

@@ -29,7 +29,7 @@ class C {
     this.listeners.clear();
   }
 }
-const y = 2, B = 0.5, w = 3, A = 6, D = y + 0.5;
+const y = 1, B = 0.5, w = 3, A = 6, D = y + 0.5;
 class S extends C {
   constructor(e, t = !1) {
     super(), this.mediaSource = null, this.objectURL = null, this.sourceBuffers = /* @__PURE__ */ new Map(), this.queues = /* @__PURE__ */ new Map(), this.processing = /* @__PURE__ */ new Map(), this.video = e, this.debug = t;

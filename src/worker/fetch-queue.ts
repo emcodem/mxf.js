@@ -19,6 +19,12 @@ export interface FetchJob {
   gen: number;
   /** Set for throwaway scrub-preview decodes; carries the seq the player matches its reply to. */
   previewSeq?: number;
+  /** If set, reset the MPEG-2 pipeline to this frame before decoding (used by speculative cache-fill
+   *  jobs, which run after the primary preview and need to reposition the shared decoder). */
+  resetToFrame?: number;
+  /** If true, this is a background speculative cache-fill: decode + cache but post nothing to the
+   *  player (no videoSegment, no previewDone, no segmentDone). Superseded cleanly by any real drag. */
+  cacheOnly?: boolean;
 }
 
 export class FetchQueue {

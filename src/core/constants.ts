@@ -44,8 +44,13 @@ export const SEQ_WINDOW = 4 * 1024 * 1024;
 export const SEQ_HARD_CAP = 64 * 1024 * 1024;
 
 // ── Playback buffering (mxf-player.ts, mse-controller.ts) ────────────────────
-/** Target media duration per fetched chunk (frames = ceil(fps * this)). */
-export const CHUNK_DURATION_SECONDS = 2;
+/** Target media duration per fetched chunk (frames = ceil(fps * this)).
+ *  1 s (25 frames @25fps) balances startup latency against chunk overhead:
+ *  each chunk decodes in ~0.8s for 1s of content (~1.25× realtime), so RESUME_BUFFER_SECONDS
+ *  only needs to be ~1.5s and the startup gate clears after two ramp steps (~1.8s from file-pick).
+ *  Seek abort cost is determined by the yield granularity in decodeSegment (5 frames ≈ 160ms),
+ *  not the chunk size, so halving chunks does not change seek responsiveness. */
+export const CHUNK_DURATION_SECONDS = 1;
 /** Target media duration of the FIRST cold-start fetch, so play-to-first-frame is fast on thin
  *  lines. The full CHUNK_DURATION_SECONDS chunk (~2 s ≈ 12.5 MB for 50 Mbit XDCAM) would block
  *  first paint on ~2 s of download; the cold-start fetch ramps from this up to the full size.
@@ -82,7 +87,12 @@ export const RESUME_BUFFER_SECONDS = CHUNK_DURATION_SECONDS + 0.5;
 // ── Scrub preview (demux-worker.ts) ──────────────────────────────────────────
 /** Max cached scrub-preview segments (LRU, keyed by GOP-head keyframe edit unit). */
 export const SCRUB_CACHE_MAX = 128;
-/** Contiguous lookahead decoded at a scrub-preview keyframe so a paused <video> paints. */
-export const SCRUB_PREVIEW_LOOKAHEAD_SECONDS = 0.4;
+/** Contiguous lookahead decoded at a scrub-preview keyframe so a paused <video> paints.
+ *  Kept short (0.2 s) because each MPEG-2 preview frame costs ~32 ms to decode+encode; the old 0.4 s
+ *  (11 frames at 25 fps) was conservative. 0.2 s (6 frames) is enough for Chrome to settle a paused
+ *  seek, halving per-preview decode time (~220 ms → ~4.5 new-GOP previews/s vs the old ~2.4/s).
+ *  If a particular browser won't paint this little, raise to 0.3 s. MIN_LOOKAHEAD_FRAMES (= 4)
+ *  is the fps-independent floor and is unchanged. */
+export const SCRUB_PREVIEW_LOOKAHEAD_SECONDS = 0.2;
 /** Floor on the lookahead frame count (independent of frame rate). */
 export const SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES = 4;
