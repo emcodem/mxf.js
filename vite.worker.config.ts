@@ -8,9 +8,8 @@ export default defineConfig({
     rollupOptions: {
       input: 'src/worker/demux-worker.ts',
       output: {
-        format: 'iife',
+        format: 'es',
         entryFileNames: 'demux-worker.js',
-        name: 'DemuxWorker',
       },
     },
   },

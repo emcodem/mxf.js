@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>mxf.js — Wasm Plugin Test</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #111; color: #eee; padding: 24px; }
+    h1 { margin-bottom: 4px; font-size: 1.4rem; color: #4af; }
+    .subtitle { color: #666; font-size: 13px; margin-bottom: 16px; }
+    .controls { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+    button { padding: 8px 16px; border: none; border-radius: 6px; background: #4af; color: #000; cursor: pointer; font-weight: 600; }
+    button:hover { background: #6cf; }
+    button:disabled { background: #444; color: #888; cursor: default; }
+    input[type="file"] { color: #eee; }
+    input[type="text"] { padding: 8px; border-radius: 6px; border: 1px solid #444; background: #222; color: #eee; width: 360px; }
+    video { width: 100%; max-width: 960px; background: #000; display: block; border-radius: 8px; margin-bottom: 0; }
+    .playback { display: none; align-items: center; gap: 10px; max-width: 960px; margin-bottom: 16px; margin-top: 8px; }
+    .playback button { padding: 6px 14px; min-width: 44px; font-size: 1rem; }
+    #seekBar { flex: 1; accent-color: #4af; cursor: pointer; height: 4px; }
+    .time { font-family: monospace; font-size: 13px; color: #aaa; min-width: 42px; text-align: center; user-select: none; }
+    #log { font-family: monospace; font-size: 12px; background: #000; padding: 12px; border-radius: 6px; max-height: 200px; overflow-y: auto; line-height: 1.6; }
+    .info { color: #8af; }
+    .warn { color: #fa8; }
+    .err  { color: #f44; }
+    #meta { font-family: monospace; font-size: 12px; color: #aaa; margin-bottom: 12px; min-height: 20px; }
+    #bufferingOverlay {
+      position: absolute; top: 12px; left: 12px; display: none; align-items: center; gap: 8px;
+      padding: 6px 12px; border-radius: 6px; background: rgba(0,0,0,0.65); color: #eee;
+      font: 600 13px/1 system-ui, sans-serif; pointer-events: none;
+    }
+    #bufferingOverlay.show { display: inline-flex; }
+    .spinner {
+      width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #4af;
+      border-radius: 50%; animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Plugin selector ──────────────────────────────────────────────────────────────────────── */
+    #pluginBar {
+      display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+      margin-bottom: 16px; padding: 10px 14px; border-radius: 8px;
+      background: #0d1a0d; border: 1px solid #1a3a1a;
+      font-size: 13px;
+    }
+    #pluginBar label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    #pluginBar input[type="checkbox"] { accent-color: #4d4; width: 15px; height: 15px; }
+    #pluginBar code { background: #1a2a1a; padding: 2px 6px; border-radius: 4px; color: #6e6; font-size: 12px; }
+    #pluginStatus {
+      padding: 4px 10px; border-radius: 5px; font-weight: 600; font-size: 12px; font-family: monospace;
+    }
+    #pluginStatus.active   { background: #0d2a0d; color: #4d4; border: 1px solid #2a4a2a; }
+    #pluginStatus.inactive { background: #1a1a00; color: #aa8; border: 1px solid #333300; }
+    #pluginStatus.error    { background: #2a0d0d; color: #f66; border: 1px solid #4a2a2a; }
+
+    /* ── Debug timeline ───────────────────────────────────────────────────────────────────── */
+    #debugPanel { margin-top: 20px; border: 1px solid #333; border-radius: 8px; background: #0a0a0a; }
+    .debug-bar {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 8px 12px; border-bottom: 1px solid #222; font: 12px/1.4 system-ui, sans-serif; color: #aaa;
+    }
+    .debug-bar strong { color: #4af; font-size: 13px; }
+    .debug-bar label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
+    .debug-bar button { padding: 4px 10px; font-size: 12px; font-weight: 600; }
+    #debugLog {
+      font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 11.5px; line-height: 1.5;
+      padding: 8px 12px; max-height: 360px; overflow-y: auto; white-space: pre; tab-size: 2;
+    }
+    #debugLog .row { display: flex; gap: 8px; }
+    #debugLog .t   { color: #555; min-width: 64px; text-align: right; }
+    #debugLog .tag { min-width: 46px; font-weight: 700; }
+    #debugLog .lbl { min-width: 210px; color: #ddd; }
+    #debugLog .det { color: #888; flex: 0 0 auto; }
+    #debugLog .vst { color: #4a5; margin-left: auto; opacity: 0.65; }
+    .cat-USER .tag { color: #fb4; }
+    .cat-CMD  .tag { color: #4cf; }
+    .cat-EVT  .tag { color: #6e6; }
+    .cat-VID  .tag { color: #c8f; }
+    .cat-MSG  .tag { color: #888; }
+    .cat-ERR  .tag { color: #f55; }
+    .cat-ERR  .lbl { color: #f88; }
+    #debugLog.hide-USER .cat-USER,
+    #debugLog.hide-CMD  .cat-CMD,
+    #debugLog.hide-EVT  .cat-EVT,
+    #debugLog.hide-VID  .cat-VID,
+    #debugLog.hide-MSG  .cat-MSG { display: none; }
+  </style>
+</head>
+<body>
+  <h1>mxf.js — Wasm Decoder Plugin Test</h1>
+  <p class="subtitle">
+    Tests the <code>VideoDecoderPlugin</code> mechanism using
+    <code>mpeg2-decoder.wasm</code> (emscripten ffmpeg) as a drop-in replacement
+    for the built-in JS MPEG-2 decoder. Use an MPEG-2 MXF to exercise the plugin.
+  </p>
+
+  <!-- Plugin toggle + status -->
+  <div id="pluginBar">
+    <label>
+      <input type="checkbox" id="usePlugin" checked>
+      Use wasm decoder plugin
+    </label>
+    <span style="color:#555">│</span>
+    <span>module: <code id="pluginModuleUrl">/mpeg2-decoder.js</code></span>
+    <span>codec: <code>mpeg2video</code> → <code>mxfCodec: mpeg2</code></span>
+    <span id="pluginStatus" class="inactive">no file loaded</span>
+  </div>
+
+  <div class="controls">
+    <input type="file" id="fileInput" accept=".mxf,.MXF">
+    <span style="color:#666">or</span>
+    <input type="text" id="urlInput" placeholder="https://example.com/clip.mxf" value="../media/xdcamhd_1920_25i_16tracks.mxf">
+    <button id="loadUrl">Load URL</button>
+  </div>
+
+  <div id="meta"></div>
+  <div id="videoWrap" style="position:relative; max-width:960px;">
+    <video id="video" autoplay muted></video>
+    <div id="bufferingOverlay">
+      <span class="spinner"></span> Buffering…
+    </div>
+  </div>
+
+  <div class="playback" id="playback">
+    <button id="playBtn" disabled>&#9654;</button>
+    <span class="time" id="timeCurrent">0:00</span>
+    <input type="range" id="seekBar" min="0" max="100" step="0.1" value="0">
+    <span class="time" id="timeDuration">0:00</span>
+    <span id="timecode"
+          style="font:13px/1 ui-monospace,SFMono-Regular,Menlo,monospace; color:#3c3; min-width:128px; text-align:right; white-space:nowrap;">--:--:--:--</span>
+  </div>
+
+  <div style="color:#666; font-size:12px; max-width:960px; margin:4px 0 12px;">
+    Keys: <code>Space</code> play/pause · <code>J</code>/<code>L</code> rewind/forward ·
+    <code>K</code> stop · <code>←</code>/<code>→</code> frame step · <code>↑</code>/<code>↓</code> ±10s
+  </div>
+
+  <div id="audioChannels" style="display:none; margin:8px 0; font:13px/1.6 system-ui,sans-serif;">
+    <span style="color:#666">Audio channels:</span>
+    <span id="channelBoxes"></span>
+  </div>
+
+  <div id="log"></div>
+
+  <div id="debugPanel">
+    <div class="debug-bar">
+      <strong>Debug timeline</strong>
+      <span style="color:#666">filter:</span>
+      <label><input type="checkbox" class="dbgFilter" data-cat="USER" checked> user input</label>
+      <label><input type="checkbox" class="dbgFilter" data-cat="CMD"  checked> player cmd</label>
+      <label><input type="checkbox" class="dbgFilter" data-cat="EVT"  checked> player event</label>
+      <label><input type="checkbox" class="dbgFilter" data-cat="VID"  checked> video event</label>
+      <label><input type="checkbox" class="dbgFilter" data-cat="MSG"  checked> messages</label>
+      <span style="flex:1"></span>
+      <span id="dbgCount" style="color:#666"></span>
+      <button id="dbgPause">Pause</button>
+      <button id="dbgCopy">Copy</button>
+      <button id="dbgDownload">Download</button>
+      <button id="dbgClear">Clear</button>
+    </div>
+    <div id="debugLog"></div>
+  </div>
+
+  <script type="module">
+    import { MxfPlayer } from '../dist/mxf.esm.js';
+
+    // ── Config ──────────────────────────────────────────────────────────────────────────────────
+    const PLUGIN_MODULE_URL = '/wasm-plugin/mpeg2-decoder.js';
+    const PLUGIN_FFMPEG_CODEC = 'mpeg2video';
+
+    // ── DOM refs ────────────────────────────────────────────────────────────────────────────────
+    const video    = document.getElementById('video');
+    const logEl    = document.getElementById('log');
+    const metaEl   = document.getElementById('meta');
+    const playback = document.getElementById('playback');
+    const playBtn  = document.getElementById('playBtn');
+    const seekBar  = document.getElementById('seekBar');
+    const timeCur  = document.getElementById('timeCurrent');
+    const timeDur  = document.getElementById('timeDuration');
+    const tcEl     = document.getElementById('timecode');
+    const TC_LABEL = { system: 'SYS', material: 'MP', source: 'SP', file: 'FP' };
+    const audioChannelsEl = document.getElementById('audioChannels');
+    const channelBoxesEl  = document.getElementById('channelBoxes');
+    const bufferingOverlay = document.getElementById('bufferingOverlay');
+    const usePluginCb = document.getElementById('usePlugin');
+    const pluginStatus = document.getElementById('pluginStatus');
+    const pluginModuleUrlEl = document.getElementById('pluginModuleUrl');
+    pluginModuleUrlEl.textContent = PLUGIN_MODULE_URL;
+
+    let player = null;
+    let seeking = false;
+    let fps = 25;
+
+    // ── Plugin status badge ─────────────────────────────────────────────────────────────────────
+    function setPluginStatus(state, text) {
+      pluginStatus.className = `active inactive error`.split(' ')
+        .reduce((el, c) => (el.classList.remove(c), el), pluginStatus) || pluginStatus;
+      pluginStatus.classList.add(state);
+      pluginStatus.textContent = text;
+    }
+    usePluginCb.addEventListener('change', () => {
+      setPluginStatus('inactive', 'reload a file to apply');
+    });
+
+    // ── Debug timeline ──────────────────────────────────────────────────────────────────────────
+    const debugLogEl = document.getElementById('debugLog');
+    const dbgCountEl = document.getElementById('dbgCount');
+    const dbg = { t0: performance.now(), entries: [], paused: false, max: 4000 };
+    function dnow() { return ((performance.now() - dbg.t0) / 1000).toFixed(3); }
+    function vstate() {
+      if (!video) return '';
+      const READY = ['nothing', 'metadata', 'curr', 'future', 'enough'];
+      let buf = '';
+      try {
+        const r = [];
+        for (let i = 0; i < video.buffered.length; i++)
+          r.push(`${video.buffered.start(i).toFixed(1)}-${video.buffered.end(i).toFixed(1)}`);
+        buf = r.join(',') || '∅';
+      } catch { buf = '?'; }
+      const ahead = bufferedAheadOf(video.currentTime);
+      return `ct=${video.currentTime.toFixed(3)} ${video.paused ? 'PAUSED' : 'play'} ` +
+             `rs=${READY[video.readyState] ?? video.readyState} ahead=${ahead === null ? '?' : ahead.toFixed(2)}s buf=[${buf}]` +
+             (seeking ? ' SCRUB' : '') + (jklDir ? ` ${jklDir}${SPEED_LADDER[jklSpeedIdx]}x` : '');
+    }
+    function bufferedAheadOf(t) {
+      try {
+        for (let i = 0; i < video.buffered.length; i++)
+          if (t >= video.buffered.start(i) - 0.05 && t < video.buffered.end(i))
+            return video.buffered.end(i) - t;
+      } catch {}
+      return null;
+    }
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+    }
+    const dbgPending = [];
+    let dbgFlushScheduled = false;
+    function dbgLog(cat, label, detail = '') {
+      const entry = { t: dnow(), cat, label, detail: String(detail), v: vstate() };
+      dbg.entries.push(entry);
+      if (dbg.entries.length > dbg.max) dbg.entries.shift();
+      if (dbg.paused) return;
+      dbgPending.push(entry);
+      if (dbgPending.length > 2000) dbgPending.shift();
+      if (!dbgFlushScheduled) { dbgFlushScheduled = true; requestAnimationFrame(dbgFlushRows); }
+    }
+    function dbgFlushRows() {
+      dbgFlushScheduled = false;
+      if (!dbgPending.length) return;
+      const frag = document.createDocumentFragment();
+      for (const entry of dbgPending) {
+        const row = document.createElement('div');
+        row.className = `row cat-${entry.cat}`;
+        row.innerHTML =
+          `<span class="t">+${entry.t}</span>` +
+          `<span class="tag">${entry.cat}</span>` +
+          `<span class="lbl">${escapeHtml(entry.label)}</span>` +
+          `<span class="det">${escapeHtml(entry.detail)}</span>` +
+          `<span class="vst">${escapeHtml(entry.v)}</span>`;
+        frag.appendChild(row);
+      }
+      dbgPending.length = 0;
+      debugLogEl.appendChild(frag);
+      while (debugLogEl.childElementCount > 1200) debugLogEl.firstChild.remove();
+      debugLogEl.scrollTop = debugLogEl.scrollHeight;
+      if (dbgCountEl) dbgCountEl.textContent = `${dbg.entries.length} events`;
+    }
+
+    function instrumentPlayer(p) {
+      const fmtArgs = {
+        seek:    a => `${(+a[0]).toFixed(3)}s`,
+        scrubTo: a => `${(+a[0]).toFixed(3)}s`,
+        endScrub:a => a[0] === undefined ? '(current)' : `${(+a[0]).toFixed(3)}s`,
+        setAudioChannels: a => `[${(a[0] || []).map(c => c + 1).join(',')}]`,
+        loadFile: a => a[0]?.name ?? '',
+        loadUrl:  a => a[0] ?? '',
+      };
+      for (const name of ['play', 'pause', 'seek', 'beginScrub', 'scrubTo', 'endScrub',
+                          'setAudioChannels', 'loadFile', 'loadUrl']) {
+        const orig = p[name].bind(p);
+        p[name] = (...args) => {
+          dbgLog('CMD', `player.${name}()`, fmtArgs[name] ? fmtArgs[name](args) : '');
+          return orig(...args);
+        };
+      }
+      p.on('manifest',  d => dbgLog('EVT', 'manifest', `${d.duration.toFixed(2)}s index=${d.indexMode} codec=${d.pictureDescriptor?.codec}`));
+      p.on('seeking',   d => dbgLog('EVT', 'seeking', `target=${d.targetTime.toFixed(3)}s`));
+      p.on('seeked',    d => dbgLog('EVT', 'seeked', `actual=${d.actualTime?.toFixed?.(3) ?? '?'}s`));
+      p.on('playing',   () => dbgLog('EVT', 'playing'));
+      p.on('buffering', d => dbgLog('EVT', `buffering=${d.buffering}`, `${d.bufferedSeconds.toFixed(2)}s ahead`));
+      p.on('timeupdate', d => dbgTimeupdate(d.currentTime));
+      p.on('timecode',  d => dbgTimecode(d));
+      p.on('audio-info', d => dbgLog('EVT', 'audio-info', `${d.channelCount}ch`));
+      p.on('codec-unsupported', d => dbgLog('EVT', 'codec-unsupported', `${d.codec}: ${d.reason}`));
+      p.on('error',     d => dbgLog('ERR', `error${d.fatal ? ' (FATAL)' : ''}`, d.message));
+      p.on('destroyed', () => dbgLog('EVT', 'destroyed'));
+    }
+    let lastTuTime = -1, lastTuLogged = -1;
+    function dbgTimeupdate(ct) {
+      const jumped = lastTuTime >= 0 && Math.abs(ct - lastTuTime) > 0.5;
+      if (jumped || lastTuLogged < 0 || Math.abs(ct - lastTuLogged) >= 0.5) {
+        dbgLog('EVT', 'timeupdate', jumped ? `JUMP from ${lastTuTime.toFixed(3)}s` : '');
+        lastTuLogged = ct;
+      }
+      lastTuTime = ct;
+    }
+    let lastTcUnit = -1, lastTcLoggedUnit = -1;
+    function dbgTimecode({ editUnit, primary, all }) {
+      const eu = Number(editUnit);
+      if (eu === lastTcUnit) return;
+      const dEu = lastTcUnit >= 0 ? eu - lastTcUnit : 0;
+      const maxStep = Math.max(2, Math.ceil(fps / 12));
+      const jumped = lastTcUnit >= 0 && (dEu < 0 || dEu > maxStep);
+      if (video.paused || jumped || lastTcLoggedUnit < 0 || Math.abs(eu - lastTcLoggedUnit) >= 12) {
+        const tc = primary ? `${primary.text} ${TC_LABEL[primary.source] ?? primary.source ?? ''}`.trim() : '(none)';
+        dbgLog('EVT', `timecode ${tc}`, `eu=${eu}${jumped ? ` JUMP from ${lastTcUnit}` : ''}`);
+        lastTcLoggedUnit = eu;
+      }
+      lastTcUnit = eu;
+    }
+    for (const ev of ['play', 'pause', 'seeking', 'seeked', 'waiting', 'playing', 'canplay',
+                      'stalled', 'ratechange', 'ended', 'durationchange', 'emptied',
+                      'loadedmetadata', 'error']) {
+      video.addEventListener(ev, () => {
+        let extra = '';
+        if (ev === 'ratechange') extra = `${video.playbackRate}x`;
+        if (ev === 'error' && video.error) extra = `code=${video.error.code} ${video.error.message || ''}`;
+        dbgLog('VID', `video.${ev}`, extra);
+      });
+    }
+    document.querySelectorAll('.dbgFilter').forEach(cb => {
+      cb.addEventListener('change', () => debugLogEl.classList.toggle(`hide-${cb.dataset.cat}`, !cb.checked));
+    });
+    document.getElementById('dbgPause').addEventListener('click', (e) => {
+      dbg.paused = !dbg.paused;
+      e.target.textContent = dbg.paused ? 'Resume' : 'Pause';
+      if (!dbg.paused) dbgLog('MSG', '— capture resumed —');
+    });
+    document.getElementById('dbgClear').addEventListener('click', () => {
+      dbg.entries.length = 0; dbgPending.length = 0; debugLogEl.innerHTML = ''; dbg.t0 = performance.now();
+      lastTuTime = lastTuLogged = -1;
+      if (dbgCountEl) dbgCountEl.textContent = '';
+    });
+    function dbgAsText() {
+      return dbg.entries.map(e =>
+        `+${e.t.padStart(8)}  ${e.cat.padEnd(4)}  ${e.label.padEnd(24)} ${e.detail.padEnd(22)} │ ${e.v}`).join('\n');
+    }
+    document.getElementById('dbgCopy').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(dbgAsText()); dbgLog('MSG', '— timeline copied —'); }
+      catch (err) { dbgLog('ERR', 'clipboard copy failed', err.message); }
+    });
+    document.getElementById('dbgDownload').addEventListener('click', () => {
+      const blob = new Blob([dbgAsText()], { type: 'text/plain' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `mxf-plugin-debug-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+
+    // ── Channel selector ────────────────────────────────────────────────────────────────────────
+    function buildChannelSelector(channelCount, activeChannels) {
+      channelBoxesEl.innerHTML = '';
+      const active = new Set(activeChannels);
+      for (let i = 0; i < channelCount; i++) {
+        const label = document.createElement('label');
+        label.style.marginRight = '10px';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox'; cb.value = String(i); cb.checked = active.has(i);
+        cb.addEventListener('change', () => {
+          const sel = [...channelBoxesEl.querySelectorAll('input:checked')].map(c => parseInt(c.value, 10));
+          player?.setAudioChannels(sel);
+        });
+        label.append(cb, ` ${i + 1}`);
+        channelBoxesEl.appendChild(label);
+      }
+      audioChannelsEl.style.display = channelCount > 0 ? 'block' : 'none';
+    }
+
+    function fmt(s) {
+      if (!isFinite(s) || s < 0) return '0:00';
+      const m = Math.floor(s / 60);
+      return `${m}:${Math.floor(s % 60).toString().padStart(2, '0')}`;
+    }
+    function log(msg, cls = 'info') {
+      const line = document.createElement('div');
+      line.className = cls;
+      line.textContent = `[${new Date().toISOString().slice(11,23)}] ${msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+      dbgLog(cls === 'err' ? 'ERR' : 'MSG', msg);
+    }
+    function syncPlayBtn() {
+      if (!player) return;
+      playBtn.textContent = player.paused ? '▶' : '⏸';
+    }
+
+    // ── Player init ─────────────────────────────────────────────────────────────────────────────
+    function initPlayer() {
+      resetSpeed();
+      player?.destroy();
+      bufferingOverlay.classList.remove('show');
+      playback.style.display = 'none';
+      audioChannelsEl.style.display = 'none';
+      channelBoxesEl.innerHTML = '';
+      playBtn.disabled = true;
+      seekBar.value = 0;
+      timeCur.textContent = '0:00';
+      timeDur.textContent = '0:00';
+      tcEl.textContent = '--:--:--:--';
+      setPluginStatus('inactive', 'loading…');
+
+      const usingPlugin = usePluginCb.checked;
+      const pluginCfg = usingPlugin ? {
+        videoDecoder: {
+          moduleUrl: PLUGIN_MODULE_URL,
+          ffmpegCodec: PLUGIN_FFMPEG_CODEC,
+          // mxfCodec defaults to 'mpeg2' via the built-in map
+        }
+      } : undefined;
+
+      const mode = usingPlugin
+        ? `wasm plugin (${PLUGIN_FFMPEG_CODEC})`
+        : 'built-in JS decoder';
+      log(`Initialising player — decoder: ${mode}`);
+      dbgLog('MSG', `decoder mode: ${mode}`, usingPlugin ? PLUGIN_MODULE_URL : '');
+
+      player = new MxfPlayer(video, {
+        debug: true,
+        startBufferSeconds: 3,
+        maxBufferSeconds: 8,
+        seekMode: 'accurate',
+        plugins: pluginCfg,
+      });
+      instrumentPlayer(player);
+
+      player.on('manifest', (data) => {
+        fps = data.editRateNumerator / data.editRateDenominator;
+        const pd = data.pictureDescriptor;
+        const sd = data.soundDescriptor;
+        const ar = data.aspectRatio ? ` (${data.aspectRatio.num}:${data.aspectRatio.den})` : '';
+        metaEl.textContent =
+          `Duration: ${data.duration.toFixed(2)}s | ` +
+          `FPS: ${fps.toFixed(2)} | ` +
+          `Video: ${pd?.codec ?? 'unknown'} ${data.displayWidth}×${data.displayHeight}${ar} | ` +
+          `Audio: ${sd?.codec ?? 'unknown'} ${sd?.sampleRate ?? '?'}Hz ${sd?.channelCount ?? '?'}ch`;
+        log(`Manifest: ${data.duration.toFixed(2)}s, ${data.tracks.length} tracks, index=${data.indexMode}`);
+        seekBar.max = data.duration;
+        timeDur.textContent = fmt(data.duration);
+        playback.style.display = 'flex';
+        playBtn.disabled = false;
+        syncPlayBtn();
+
+        // Update the plugin status badge based on whether the plugin was expected to fire.
+        if (usingPlugin && pd?.codec === 'mpeg2') {
+          setPluginStatus('active', `⬤ wasm plugin active — ${PLUGIN_FFMPEG_CODEC} → H.264`);
+          log(`Wasm plugin should be active for this MPEG-2 file. Check worker console for "[worker] wasm plugin init OK".`);
+        } else if (usingPlugin && pd?.codec !== 'mpeg2') {
+          setPluginStatus('inactive', `plugin skipped — codec is ${pd?.codec ?? 'unknown'} (not mpeg2)`);
+        } else {
+          setPluginStatus('inactive', 'built-in JS decoder');
+        }
+      });
+
+      player.on('timeupdate', ({ currentTime, duration }) => {
+        timeCur.textContent = fmt(currentTime);
+        timeDur.textContent = fmt(duration);
+        if (!seeking && !kbScrubbing) seekBar.value = currentTime;
+        syncPlayBtn();
+      });
+
+      player.on('timecode', ({ primary, all }) => {
+        if (!primary) { tcEl.textContent = '--:--:--:--'; tcEl.title = ''; return; }
+        tcEl.textContent = `${primary.text} ${TC_LABEL[primary.source] ?? ''}`.trim();
+        tcEl.title = all.map(a =>
+          `${a.source}: ${a.text}${a.reliable === false ? ' (approx)' : ''}`).join('\n');
+      });
+
+      player.on('error', ({ message, fatal }) => {
+        log(`${fatal ? 'FATAL' : 'Error'}: ${message}`, fatal ? 'err' : 'warn');
+        if (fatal && usingPlugin) setPluginStatus('error', `error — ${message.slice(0, 60)}`);
+      });
+
+      const BUFFER_OVERLAY_DELAY_MS = 180;
+      let bufferOverlayTimer = null;
+      player.on('buffering', ({ buffering, bufferedSeconds }) => {
+        if (buffering) {
+          if (bufferOverlayTimer === null)
+            bufferOverlayTimer = setTimeout(() => { bufferOverlayTimer = null; bufferingOverlay.classList.add('show'); }, BUFFER_OVERLAY_DELAY_MS);
+          log(`Buffering… (${bufferedSeconds.toFixed(2)}s ahead)`, 'warn');
+        } else {
+          if (bufferOverlayTimer !== null) { clearTimeout(bufferOverlayTimer); bufferOverlayTimer = null; }
+          bufferingOverlay.classList.remove('show');
+        }
+      });
+
+      player.on('codec-unsupported', ({ codec, reason }) => {
+        log(`Codec unsupported: ${codec} — ${reason}`, 'warn');
+        if (usingPlugin) setPluginStatus('error', `codec-unsupported: ${reason.slice(0, 50)}`);
+      });
+
+      player.on('audio-info', ({ channelCount, activeChannels }) => {
+        log(`Audio: ${channelCount} channel(s); playing ${activeChannels.map(c => c + 1).join(', ')}`);
+        buildChannelSelector(channelCount, activeChannels);
+      });
+    }
+
+    // ── Playback controls ───────────────────────────────────────────────────────────────────────
+    playBtn.addEventListener('click', () => {
+      if (!player) return;
+      dbgLog('USER', 'click: play button', player.paused ? '→ play' : '→ pause');
+      endKbScrub(); resetSpeed();
+      if (player.paused) { player.play(); } else { player.pause(); }
+      syncPlayBtn();
+    });
+
+    function startScrub() {
+      if (!player || seeking) return;
+      endKbScrub();
+      dbgLog('USER', 'scrub start', `${parseFloat(seekBar.value).toFixed(2)}s`);
+      resetSpeed(); seeking = true; player.beginScrub();
+    }
+    seekBar.addEventListener('mousedown', startScrub);
+    seekBar.addEventListener('touchstart', startScrub);
+    seekBar.addEventListener('input', () => {
+      const t = parseFloat(seekBar.value);
+      timeCur.textContent = fmt(t);
+      if (player && seeking) player.scrubTo(t);
+    });
+    seekBar.addEventListener('change', () => {
+      if (!player) return;
+      const t = parseFloat(seekBar.value);
+      if (seeking) { dbgLog('USER', 'scrub release', `${t.toFixed(2)}s`); seeking = false; player.endScrub(t); }
+      else { dbgLog('USER', 'slider seek', `${t.toFixed(2)}s`); player.seek(t); }
+    });
+
+    // ── JKL + arrow keys ────────────────────────────────────────────────────────────────────────
+    const SPEED_LADDER = [1, 2, 4, 8, 16];
+    let jklDir = null, jklSpeedIdx = 0, rewindTimer = null;
+    function stopRewind() { if (rewindTimer !== null) { clearInterval(rewindTimer); rewindTimer = null; } }
+    function resetSpeed() { stopRewind(); jklDir = null; jklSpeedIdx = 0; if (player) video.playbackRate = 1; }
+    function fastForward() {
+      if (!player) return; endKbScrub(); stopRewind();
+      jklSpeedIdx = (jklDir === 'fwd') ? Math.min(jklSpeedIdx + 1, SPEED_LADDER.length - 1) : 0;
+      jklDir = 'fwd'; video.playbackRate = SPEED_LADDER[jklSpeedIdx];
+      if (player.paused) player.play(); syncPlayBtn();
+    }
+    function fastRewind() {
+      if (!player) return; endKbScrub();
+      jklSpeedIdx = (jklDir === 'rev') ? Math.min(jklSpeedIdx + 1, SPEED_LADDER.length - 1) : 0;
+      jklDir = 'rev'; const speed = SPEED_LADDER[jklSpeedIdx];
+      video.playbackRate = 1; player.pause(); stopRewind();
+      rewindTimer = setInterval(() => {
+        if (jklDir !== 'rev' || !video.paused) { stopRewind(); jklDir = null; jklSpeedIdx = 0; return; }
+        const t = video.currentTime - speed * (125 / 1000);
+        if (t <= 0) { resetSpeed(); player.seek(0); return; }
+        player.seek(t);
+      }, 125); syncPlayBtn();
+    }
+    let stepTarget = null, stepRaf = null;
+    function stepFrame(dir) {
+      if (!player) return; endKbScrub(); resetSpeed(); player.pause();
+      const base = stepTarget != null ? stepTarget : player.currentTime;
+      stepTarget = Math.max(0, Math.min(base + dir / fps, player.duration));
+      if (stepRaf == null) stepRaf = requestAnimationFrame(() => {
+        stepRaf = null;
+        if (stepTarget == null || !player) return;
+        const t = stepTarget; stepTarget = null; player.seek(t);
+      });
+    }
+    let kbScrubbing = false, kbScrubTimer = null, kbScrubTarget = 0;
+    function skipSeconds(delta) {
+      if (!player) return;
+      if (player.indexMode === 'none') { resetSpeed(); player.seek(player.currentTime + delta); return; }
+      if (seeking) return; resetSpeed();
+      const base = kbScrubbing ? kbScrubTarget : player.currentTime;
+      kbScrubTarget = Math.max(0, Math.min(base + delta, player.duration));
+      if (!kbScrubbing) { kbScrubbing = true; player.beginScrub(); }
+      seekBar.value = kbScrubTarget; timeCur.textContent = fmt(kbScrubTarget);
+      player.scrubTo(kbScrubTarget);
+      if (kbScrubTimer) clearTimeout(kbScrubTimer);
+      kbScrubTimer = setTimeout(endKbScrub, 350);
+    }
+    function endKbScrub() {
+      if (kbScrubTimer) { clearTimeout(kbScrubTimer); kbScrubTimer = null; }
+      if (!kbScrubbing) return;
+      kbScrubbing = false; player.endScrub(kbScrubTarget);
+    }
+    document.addEventListener('keydown', (e) => {
+      const tag = (e.target.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) return;
+      if (!player || playBtn.disabled) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      switch (e.key) {
+        case ' ': e.preventDefault(); endKbScrub(); resetSpeed();
+          if (player.paused) player.play(); else player.pause(); syncPlayBtn(); break;
+        case 'j': case 'J': e.preventDefault(); fastRewind(); break;
+        case 'l': case 'L': e.preventDefault(); fastForward(); break;
+        case 'k': case 'K': e.preventDefault(); endKbScrub(); resetSpeed(); player.pause(); syncPlayBtn(); break;
+        case 'ArrowLeft':  e.preventDefault(); stepFrame(-1); break;
+        case 'ArrowRight': e.preventDefault(); stepFrame(1);  break;
+        case 'ArrowUp':    e.preventDefault(); skipSeconds(10);  break;
+        case 'ArrowDown':  e.preventDefault(); skipSeconds(-10); break;
+      }
+    });
+
+    // ── File + URL loading ──────────────────────────────────────────────────────────────────────
+    document.getElementById('fileInput').addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      dbgLog('USER', 'pick file', file.name);
+      log(`Loading file: ${file.name} (${(file.size / 1e6).toFixed(1)} MB)`);
+      initPlayer();
+      player.loadFile(file);
+    });
+
+    document.getElementById('loadUrl').addEventListener('click', () => {
+      const url = document.getElementById('urlInput').value.trim();
+      if (!url) return;
+      dbgLog('USER', 'click: Load URL', url);
+      log(`Loading URL: ${url}`);
+      initPlayer();
+      player.loadUrl(url);
+    });
+  </script>
+</body>
+</html>

@@ -12,6 +12,27 @@ export interface DecodeSegmentResult {
 }
 
 /**
+ * Common interface for transcode pipelines: the JS MPEG-2 pipeline and any wasm-backed plugin
+ * pipeline both expose this shape so the worker can drive them identically.
+ */
+export interface ITranscodePipeline {
+  readonly frameDurUs: number;
+  readonly sps: Uint8Array;
+  readonly pps: Uint8Array;
+  readonly codedWidth: number;
+  readonly codedHeight: number;
+  readonly displayWidth: number;
+  readonly displayHeight: number;
+  readonly codecString: string;
+  reset(toFrame: number): void;
+  decodeSegment(
+    videoFrames: { data: ArrayBuffer }[],
+    flushHeldAnchor: boolean,
+    shouldAbort: () => boolean,
+  ): Promise<DecodeSegmentResult>;
+}
+
+/**
  * The MPEG-2 → H.264 transcode pipeline, extracted from the demux worker.
  *
  * Wraps one persistent {@link Mpeg2Decoder} feeding one persistent {@link Mpeg2Transcoder}

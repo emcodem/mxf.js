@@ -28,10 +28,23 @@ export interface TimecodeAnchor {
   dropFrame: boolean;
 }
 
+/** Plugin descriptor carried in init commands. Resolved on the main thread before posting. */
+export interface WorkerPluginConfig {
+  /** URL to the emscripten-generated .js factory (the .wasm is loaded automatically). */
+  moduleUrl: string;
+  /** FFmpeg codec name passed to dec_create(), e.g. 'mpeg2video', 'prores', 'mjpeg'. */
+  ffmpegCodec: string;
+  /**
+   * The pd.codec value that triggers this plugin (e.g. 'mpeg2', 'h264', 'unknown').
+   * Resolved from a built-in map on the main thread before the command is posted.
+   */
+  mxfCodec: string;
+}
+
 // Commands sent from main thread to worker
 export type WorkerCommand =
-  | { type: 'initUrl'; url: string; debug?: boolean; videoMode?: 'webcodecs' | 'mse' }
-  | { type: 'initFile'; file: File; debug?: boolean; videoMode?: 'webcodecs' | 'mse' }
+  | { type: 'initUrl';  url: string;  debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig } }
+  | { type: 'initFile'; file: File; debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig } }
   | {
       type: 'fetchSegment';
       startFrame: number;

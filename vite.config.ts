@@ -66,6 +66,30 @@ async function pipeThrottled(stream: any, res: any, bytesPerSec: number) {
   }
 }
 
+// Serve built ffmpeg wasm decoder modules at /wasm-plugin/<file> so the plugin test demo
+// can reference them by URL without copying them into the project.
+const WASM_PLUGIN_DIR = path.resolve(process.env.WASM_PLUGIN_DIR ?? 'C:/dev/ffmpeg_wasm/dist');
+
+function wasmPluginServer() {
+  return {
+    name: 'wasm-plugin',
+    configureServer(server: any) {
+      server.middlewares.use('/wasm-plugin', (req: any, res: any, next: any) => {
+        const rel = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname);
+        const file = path.join(WASM_PLUGIN_DIR, rel);
+        if (!file.startsWith(WASM_PLUGIN_DIR + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+          return next();
+        }
+        const ext = path.extname(file);
+        const mime: Record<string, string> = { '.js': 'application/javascript', '.wasm': 'application/wasm' };
+        res.setHeader('Content-Type', mime[ext] ?? 'application/octet-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        fs.createReadStream(file).pipe(res);
+      });
+    },
+  };
+}
+
 function mediaServer() {
   return {
     name: 'mxf-media',
@@ -137,7 +161,7 @@ function mediaServer() {
 export default defineConfig({
   root: '.',
   publicDir: false,
-  plugins: [mediaServer()],
+  plugins: [wasmPluginServer(), mediaServer()],
   server: {
     open: '/demo/index.html',
     // NOTE: deliberately NOT setting COOP/COEP. `Cross-Origin-Embedder-Policy: require-corp`

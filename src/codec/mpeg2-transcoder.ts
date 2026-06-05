@@ -23,6 +23,8 @@ export class Mpeg2Transcoder {
   private _spspps: SpsppsPair | null = null;
   private _codecStr: string | null = null;
   private frameDurUs: number;
+  private codedWidth: number;
+  private codedHeight: number;
   private displayWidth: number;
   private displayHeight: number;
   private encoderError: Error | null = null;
@@ -43,6 +45,8 @@ export class Mpeg2Transcoder {
     displayHeight: number,
     frameRate: number,
   ) {
+    this.codedWidth = codedWidth;
+    this.codedHeight = codedHeight;
     this.displayWidth = displayWidth;
     this.displayHeight = displayHeight;
     this.frameDurUs = Math.round(1_000_000 / frameRate);
@@ -98,7 +102,10 @@ export class Mpeg2Transcoder {
           timestampUs: chunk.timestamp,
         });
       },
-      error: (e) => { this.encoderError = e; },
+      error: (e) => {
+        console.error('[Mpeg2Transcoder] VideoEncoder error:', e);
+        this.encoderError = e;
+      },
     });
 
     this.encoder.configure({
@@ -182,6 +189,76 @@ export class Mpeg2Transcoder {
       duration:      this.frameDurUs,
     });
 
+    this.encoder.encode(videoFrame, { keyFrame: forceKeyframe });
+    videoFrame.close();
+  }
+
+  /**
+   * Encode an RGBA frame from a wasm decoder.
+   *
+   * Chrome's VideoEncoder (H.264) only accepts I420/NV12 input — it silently drops RGBA frames
+   * and never emits SPS/PPS. We therefore convert RGBA→I420 here in JS (BT.601 limited-range,
+   * 2×2 chroma averaging) and reuse interleaveBuf to avoid per-frame allocation.
+   *
+   * The source RGBA is at `srcWidth × srcHeight` (the decoded display size, e.g. 1440×1080).
+   * The transcoder's coded dimensions `codedWidth × codedHeight` are MB-aligned (e.g. 1440×1088).
+   * Any extra rows are zero-filled (Y=16/black, Cb=Cr=128/neutral) so the encoder sees a valid
+   * full-MB frame; the display crop in the avc1 box hides the padded rows from the viewer.
+   */
+  encodeRgbaFrame(rgba: Uint8ClampedArray, srcWidth: number, srcHeight: number, timestampUs: number, forceKeyframe: boolean): void {
+    if (this.encoderError) throw this.encoderError;
+
+    const cw     = this.codedWidth;
+    const ch     = this.codedHeight;
+    const ySize  = cw * ch;
+    const uvW    = cw >> 1;
+    const uvH    = ch >> 1;
+    const uvSize = uvW * uvH;
+    const bufLen = ySize + uvSize * 2;
+
+    if (this.interleaveBuf === null || this.interleaveBuf.length !== bufLen) {
+      this.interleaveBuf = new Uint8Array(bufLen);
+      // Pre-fill entire buffer with black (Y=16) and neutral chroma (128) so any
+      // padding rows below srcHeight are already correct without per-row branching.
+      this.interleaveBuf.fill(16,  0,        ySize);
+      this.interleaveBuf.fill(128, ySize);
+    }
+    const buf = this.interleaveBuf;
+
+    // Y plane — convert srcWidth × srcHeight RGBA rows; coded rows beyond srcHeight stay 16.
+    for (let row = 0; row < srcHeight; row++) {
+      for (let col = 0; col < srcWidth; col++) {
+        const si = (row * srcWidth + col) * 4;
+        const r = rgba[si], g = rgba[si + 1], b = rgba[si + 2];
+        buf[row * cw + col] = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+      }
+    }
+    // Cb / Cr planes — 2×2 block average (BT.601); only over the source rows.
+    const uvSrcH = srcHeight >> 1;
+    const uvSrcW = srcWidth  >> 1;
+    for (let uy = 0; uy < uvSrcH; uy++) {
+      for (let ux = 0; ux < uvSrcW; ux++) {
+        const p0 = (uy * 2 * srcWidth + ux * 2) * 4;
+        const p1 = p0 + 4;
+        const p2 = p0 + srcWidth * 4;
+        const p3 = p2 + 4;
+        const r = (rgba[p0] + rgba[p1] + rgba[p2] + rgba[p3]) >> 2;
+        const g = (rgba[p0 + 1] + rgba[p1 + 1] + rgba[p2 + 1] + rgba[p3 + 1]) >> 2;
+        const b = (rgba[p0 + 2] + rgba[p1 + 2] + rgba[p2 + 2] + rgba[p3 + 2]) >> 2;
+        buf[ySize          + uy * uvW + ux] = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+        buf[ySize + uvSize + uy * uvW + ux] = ((112 * r - 94 * g  - 18 * b + 128) >> 8) + 128;
+      }
+    }
+
+    const videoFrame = new VideoFrame(buf, {
+      format:       'I420',
+      codedWidth:    cw,
+      codedHeight:   ch,
+      displayWidth:  this.displayWidth,
+      displayHeight: this.displayHeight,
+      timestamp:     timestampUs,
+      duration:      this.frameDurUs,
+    });
     this.encoder.encode(videoFrame, { keyFrame: forceKeyframe });
     videoFrame.close();
   }

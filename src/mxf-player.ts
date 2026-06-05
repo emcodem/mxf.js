@@ -2,9 +2,34 @@ import { EventEmitter, MxfPlayerEvents, ManifestData, TimecodeBundle, TimecodeSo
 import { MseController } from './mse/mse-controller.js';
 import { WebAudioController } from './audio/web-audio-controller.js';
 import { ScrubController } from './scrub-controller.js';
-import { WorkerCommand, WorkerEvent, ManifestTimecode, TimecodeAnchor } from './worker/worker-messages.js';
+import { WorkerCommand, WorkerEvent, WorkerPluginConfig, ManifestTimecode, TimecodeAnchor } from './worker/worker-messages.js';
 import { frameCountToTimecode, formatTimecode } from './parser/timecode.js';
 import { CHUNK_DURATION_SECONDS, FIRST_CHUNK_DURATION_SECONDS, MIN_CHUNK_FRAMES, RESUME_BUFFER_SECONDS } from './core/constants.js';
+
+/**
+ * Configuration for a wasm-backed video decoder plugin. The module must be an
+ * emscripten-compiled ffmpeg decoder built with the dec_create / dec_send_packet /
+ * dec_receive_frame / dec_frame_width / dec_frame_height / dec_get_rgba / dec_free API.
+ */
+export interface VideoDecoderPluginConfig {
+  /**
+   * URL to the emscripten-generated .js factory file (the .wasm is loaded automatically
+   * from the same directory). E.g. '/dist/mpeg2-decoder.js'.
+   */
+  moduleUrl: string;
+  /**
+   * FFmpeg codec name passed to dec_create(), e.g. 'mpeg2video', 'prores', 'mjpeg'.
+   * Common codecs are mapped automatically to their MXF descriptor IDs; use mxfCodec
+   * to override when the automatic mapping is wrong or missing.
+   */
+  ffmpegCodec: string;
+  /**
+   * The pd.codec value that activates this plugin. Defaults to a built-in map
+   * ('mpeg2video' → 'mpeg2', 'h264' → 'h264') or falls back to ffmpegCodec.
+   * Only set this when the automatic mapping is wrong.
+   */
+  mxfCodec?: string;
+}
 
 export interface MxfConfig {
   /** Seconds of content to buffer before starting playback */
@@ -31,6 +56,23 @@ export interface MxfConfig {
    */
   resumeBufferSeconds?: number;
   debug?: boolean;
+  /** Optional decoder plugin. When the MXF codec matches, this wasm decoder is used instead
+   *  of the built-in JS decoder, enabling new codecs and Firefox-compatible paths. */
+  plugins?: {
+    videoDecoder?: VideoDecoderPluginConfig;
+  };
+}
+
+/** Built-in FFmpeg-codec-name → pd.codec mapping for common cases. */
+const FFMPEG_TO_MXF_CODEC: Record<string, string> = {
+  'mpeg2video': 'mpeg2',
+  'h264':       'h264',
+  'libx264':    'h264',
+};
+
+function resolveWorkerPlugin(p: VideoDecoderPluginConfig): WorkerPluginConfig {
+  const mxfCodec = p.mxfCodec ?? FFMPEG_TO_MXF_CODEC[p.ffmpegCodec] ?? p.ffmpegCodec;
+  return { moduleUrl: p.moduleUrl, ffmpegCodec: p.ffmpegCodec, mxfCodec };
 }
 
 const DEFAULT_CONFIG: Required<MxfConfig> = {
@@ -40,7 +82,9 @@ const DEFAULT_CONFIG: Required<MxfConfig> = {
   seekMode: 'accurate',
   resumeBufferSeconds: RESUME_BUFFER_SECONDS,
   debug: false,
+  plugins: {},
 };
+
 
 /**
  * MxfPlayer renders all video through the native <video> element via MSE.
@@ -393,13 +437,17 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
   loadUrl(url: string): void {
     this.setup();
-    const cmd: WorkerCommand = { type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse' };
+    const plugins = this.config.plugins?.videoDecoder
+      ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
+    const cmd: WorkerCommand = { type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins };
     this.worker!.postMessage(cmd);
   }
 
   loadFile(file: File): void {
     this.setup();
-    const cmd: WorkerCommand = { type: 'initFile', file, debug: this.config.debug, videoMode: 'mse' };
+    const plugins = this.config.plugins?.videoDecoder
+      ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
+    const cmd: WorkerCommand = { type: 'initFile', file, debug: this.config.debug, videoMode: 'mse', plugins };
     this.worker!.postMessage(cmd);
   }
 
@@ -438,7 +486,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
   private createWorker(): Worker {
     const workerUrl = new URL('./demux-worker.js', import.meta.url);
-    return new Worker(workerUrl);
+    return new Worker(workerUrl, { type: 'module' });
   }
 
   private async onWorkerMessage(event: WorkerEvent): Promise<void> {

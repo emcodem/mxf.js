@@ -1,5 +1,5 @@
 export { MxfPlayer } from './mxf-player.js';
-export type { MxfConfig } from './mxf-player.js';
+export type { MxfConfig, VideoDecoderPluginConfig } from './mxf-player.js';
 export type { MxfPlayerEvents, ManifestData, TimecodeBundle, TimecodeSource, ManifestTimecode } from './events.js';
 export type { IndexMode } from './mxf-file.js';
 export type { MxfTrack, MxfPackage, MxfMetadata, MxfTimecodeTrack } from './parser/metadata.js';

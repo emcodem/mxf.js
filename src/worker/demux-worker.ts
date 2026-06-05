@@ -17,12 +17,15 @@ import type { ReorderInputFrame } from '../essence/reorder-resolver.js';
 import { SparseKeyframeIndex } from '../essence/sparse-keyframe-index.js';
 import { selectNoIndexLongGopRun, NOINDEX_GOP_LOOKAHEAD } from './longgop-noindex.js';
 import { decodePcmElements } from '../audio/pcm.js';
-import { WorkerCommand, WorkerEvent, TimecodeAnchor } from './worker-messages.js';
+import { WorkerCommand, WorkerEvent, TimecodeAnchor, WorkerPluginConfig } from './worker-messages.js';
 import type { EssenceFrame } from '../essence/essence-extractor.js';
 import { timecodeToFrameCount, Timecode } from '../parser/timecode.js';
 import { ScrubSegmentCache } from './scrub-segment-cache.js';
 import { FetchQueue } from './fetch-queue.js';
 import { Mpeg2Pipeline } from './mpeg2-pipeline.js';
+import type { ITranscodePipeline } from './mpeg2-pipeline.js';
+import { WasmTranscodePipeline } from './wasm-transcode-pipeline.js';
+import { WasmFfmpegDecoder } from '../codec/wasm-ffmpeg-decoder.js';
 import { ensureKernels } from '../codec/wasm/kernels.js';
 import {
   SCRUB_PREVIEW_LOOKAHEAD_SECONDS,
@@ -45,9 +48,11 @@ let storedEditRateDenominator = 1;
 // are unconditional; these are progress/diagnostic lines that would otherwise spam every consumer.
 let workerDebug = false;
 
-// MPEG-2 → H.264 transcode pipeline (null when source is not MPEG-2). Owns the persistent
-// decoder + encoder, the display-order edit-unit counter, and the held-anchor decode loop.
-let mpeg2Pipeline: Mpeg2Pipeline | null = null;
+// Active transcode pipeline: the native JS MPEG-2 pipeline OR a wasm-backed plugin pipeline.
+// Only one is set at a time; null for the H.264 remux path (no transcode needed).
+let transcodePipeline: ITranscodePipeline | null = null;
+// Config for the wasm plugin, carried from the init command so handleInit can use it.
+let activePluginConfig: WorkerPluginConfig | null = null;
 
 // H.264 Long-GOP (XAVC-L) reorder state: set during handleInit when B-frames are detected. The
 // fetch path then reconstructs PTS/DTS via the index temporalOffset (Tier 1) or parsed POC (Tier 2).
@@ -166,7 +171,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
   loader = loader_;
   workerDebug = debug;
   mxfFile = new MxfFile(loader, debug);
-  mpeg2Pipeline = null;
+  transcodePipeline = null;
   longGop = null;
   longGopBoundaryPending = true;
   sparseKf = null;
@@ -204,6 +209,79 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
     const durationSec = pd
       ? Number(metadata.duration) * (metadata.editRateDenominator / metadata.editRateNumerator)
       : 0;
+
+    // -----------------------------------------------------------------------
+    // Wasm decoder plugin path — overrides native decoders when pd.codec matches
+    // -----------------------------------------------------------------------
+    if (activePluginConfig && pd?.codec === activePluginConfig.mxfCodec) {
+      let firstVideoFrame: EssenceFrame | null = null;
+      for (const probeCount of [2, 50]) {
+        const extractor = new EssenceExtractor(loader_, bootstrap);
+        for await (const frame of extractor.fetchFrames(0n, probeCount)) {
+          if (frame.trackType === 'video') { firstVideoFrame = frame; break; }
+        }
+        if (firstVideoFrame) break;
+      }
+      if (!firstVideoFrame) {
+        postError(`Plugin (${activePluginConfig.ffmpegCodec}): no video frames found`, true);
+        return;
+      }
+
+      let decoder: WasmFfmpegDecoder;
+      try {
+        decoder = await WasmFfmpegDecoder.load(activePluginConfig.moduleUrl, activePluginConfig.ffmpegCodec);
+      } catch (e) {
+        postError(`Plugin load failed for '${activePluginConfig.ffmpegCodec}': ${e instanceof Error ? e.message : String(e)}`, true);
+        return;
+      }
+
+      let pipeline: WasmTranscodePipeline;
+      try {
+        pipeline = await WasmTranscodePipeline.create(
+          decoder, firstVideoFrame.data,
+          storedEditRateNumerator, storedEditRateDenominator,
+          0, 0,
+        );
+      } catch (e) {
+        postError(`Plugin (${activePluginConfig.ffmpegCodec}): ${e instanceof Error ? e.message : String(e)}`, true);
+        return;
+      }
+      transcodePipeline = pipeline;
+
+      fragmenter!.enableTranscodeMode(pipeline.sps, pipeline.pps, pipeline.codedWidth, pipeline.codedHeight, pipeline.displayWidth, pipeline.displayHeight);
+      const initSeg = fragmenter!.buildInitSegment(false);
+      if (workerDebug) console.log('[worker] wasm plugin init OK',
+        `codec: ${activePluginConfig.ffmpegCodec}`,
+        'sps:', Array.from(pipeline.sps).map(b=>b.toString(16).padStart(2,'0')).join(' '),
+        `dims: ${pipeline.displayWidth}x${pipeline.displayHeight} (coded: ${pipeline.codedWidth}x${pipeline.codedHeight})`,
+        'initSeg bytes:', initSeg.length,
+      );
+
+      post({
+        type: 'manifest',
+        duration: durationSec,
+        editRateNumerator: storedEditRateNumerator,
+        editRateDenominator: storedEditRateDenominator,
+        tracks: metadata.packages.flatMap(p => p.tracks),
+        timecodes: manifestTimecodes(metadata),
+        pictureDescriptor: pd,
+        soundDescriptor: sd,
+        displayWidth: pipeline.displayWidth,
+        displayHeight: pipeline.displayHeight,
+        aspectRatio: pd?.aspectRatioNum && pd?.aspectRatioDen ? { num: pd.aspectRatioNum, den: pd.aspectRatioDen } : null,
+        videoCodecSupported: true,
+        pcmMseSupported: false,
+        resolvedVideoCodec: pipeline.codecString,
+        resolvedVideoMode: 'mse',
+        indexMode: bootstrap.indexMode,
+        longGop: false,
+        audioChannelCount,
+      });
+
+      const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
+      post({ type: 'initSegment', data: initBuf }, [initBuf]);
+      return;
+    }
 
     // -----------------------------------------------------------------------
     // MPEG-2 path: transcode to H.264 so MSE / native video element can play
@@ -244,7 +322,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
         postError('MPEG-2: VideoEncoder did not produce SPS/PPS', true);
         return;
       }
-      mpeg2Pipeline = pipeline;
+      transcodePipeline = pipeline;
 
       // Use coded (MB-aligned) dimensions for the avc1 box. Chrome's WebCodecs VideoEncoder does not
       // insert frame_cropping_flag in the SPS even when displayHeight < codedHeight (e.g. 1080 vs
@@ -454,7 +532,7 @@ async function handleFetchSegment(
     // keyframe (SparseKeyframeIndex floor, else the essence start), classify IDRs, retain only the
     // enclosing GOP run, and record discovered keyframes. Memory-safe (scanned-past frames are
     // discarded), so even a cold seek that rescans from the start doesn't buffer the whole file.
-    const noIndexLongGop = !!longGop && !mpeg2Pipeline && bootstrap.indexMode === 'none';
+    const noIndexLongGop = !!longGop && !transcodePipeline && bootstrap.indexMode === 'none';
     if (noIndexLongGop) {
       // Resume the scan at the nearest known keyframe (else the essence start), reading enough to
       // cover the window plus a lookahead to reach the next IDR (GOP boundary).
@@ -472,7 +550,7 @@ async function handleFetchSegment(
       fetchStart = run.startStorageEU;
       lgNextFrame = run.nextFrame;
     } else {
-      if (longGop && !mpeg2Pipeline) {
+      if (longGop && !transcodePipeline) {
         const segs = bootstrap.indexSegments, vid = bootstrap.essenceBodySID;
         const kStart = findKeyframeFloor(segs, BigInt(startFrame), vid);
         const kEnd = findKeyframeCeil(segs, BigInt(startFrame + frameCount), vid);
@@ -485,12 +563,12 @@ async function handleFetchSegment(
       // consecutive frame range (no keyframe snapping) to avoid re-feeding pictures it has
       // already decoded. Long-GOP also fetches exact (from the snapped keyframe). Seeks land on a
       // keyframe anyway, where exact and snapped agree.
-      const exact = !!mpeg2Pipeline || !!longGop;
+      const exact = !!transcodePipeline || !!longGop;
 
       // MPEG-2 forward play: if the previous segment speculatively prefetched THIS exact chunk, its
       // bytes are already downloading/done — await that instead of starting the read serially after
       // the previous decode. Otherwise read fresh (and drop any non-matching speculation).
-      const specHit = !!mpeg2Pipeline && !!speculativePrefetch
+      const specHit = !!transcodePipeline && !!speculativePrefetch
         && speculativePrefetch.startFrame === fetchStart
         && speculativePrefetch.frameCount === fetchCount
         && speculativePrefetch.gen === gen;
@@ -518,7 +596,7 @@ async function handleFetchSegment(
       // on the network thread DURING this segment's decode (which otherwise blocks the event loop and
       // idles the network). Forward MPEG-2 only; skip at EOF (short read) and for previews / stretched
       // keyframe fetches (non-contiguous and superseded constantly).
-      if (mpeg2Pipeline && !isScrubPreview && stretchToFrames === 0 && videoFrames.length === fetchCount) {
+      if (transcodePipeline && !isScrubPreview && stretchToFrames === 0 && videoFrames.length === fetchCount) {
         const nextStart = fetchStart + fetchCount;
         const ab = new AbortController();
         const promise = readRawFrames(nextStart, fetchCount, ab.signal);
@@ -532,13 +610,13 @@ async function handleFetchSegment(
     // -----------------------------------------------------------------------
     // MPEG-2 → H.264 transcode
     // -----------------------------------------------------------------------
-    if (mpeg2Pipeline) {
+    if (transcodePipeline) {
       // Speculative cache-fill jobs carry the keyframe they should decode from (the primary preview
       // already ran and left the decoder positioned elsewhere); reset to that frame before decoding.
-      if (resetToFrame !== undefined) mpeg2Pipeline.reset(resetToFrame);
+      if (resetToFrame !== undefined) transcodePipeline.reset(resetToFrame);
 
       if (videoFrames.length > 0) {
-        const pipeline = mpeg2Pipeline;
+        const pipeline = transcodePipeline;
 
         // The decoder holds its final I/P anchor back for display reordering. During normal playback
         // keep it held so the next segment emits it in order; flush it only at end-of-stream (fewer
@@ -772,7 +850,7 @@ function handleSeek(targetFrame: number): void {
 
   // Resets the decoder's references + resumes the edit-unit counter from the keyframe (no-op for
   // the H.264 path, where there is no pipeline and the counter is unused).
-  mpeg2Pipeline?.reset(nearestKeyframe);
+  transcodePipeline?.reset(nearestKeyframe);
   // The next fetch is the first of a new GOP run: drop open-GOP leading B's so the keyframe lands first.
   longGopBoundaryPending = true;
 
@@ -819,7 +897,7 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
 
   // Seek part (mirrors handleSeek): supersede in-flight work and reset the decoder to the keyframe.
   fetchQ.supersede();
-  mpeg2Pipeline?.reset(keyframe);
+  transcodePipeline?.reset(keyframe);
   // This preview run starts a fresh GOP: drop open-GOP leading B's so the keyframe paints first.
   longGopBoundaryPending = true;
 
@@ -839,9 +917,9 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
   // shared decoder before decoding; and `cacheOnly` so it posts nothing to the player. It is
   // superseded cleanly by any real drag (fetchQ.supersede() kills it mid-decode via the gen check).
   //
-  // Only enqueue for MPEG-2 (mpeg2Pipeline present) with a real index (so findKeyframeCeil works);
-  // H.264 scrub previews are already cheap and don't need this.
-  if (mpeg2Pipeline && bootstrap.indexMode !== 'none') {
+  // Only enqueue for the transcode path (JS or wasm) with a real index (so findKeyframeCeil works);
+  // H.264 remux scrub previews are already cheap and don't need this.
+  if (transcodePipeline && bootstrap.indexMode !== 'none') {
     const segs = bootstrap.indexSegments;
     const vid = bootstrap.essenceBodySID;
     const nextKf = findKeyframeCeil(segs, BigInt(keyframe + 1), vid);
@@ -867,10 +945,12 @@ type CommandHandlers = { [K in WorkerCommand['type']]: (cmd: Extract<WorkerComma
 const commandHandlers: CommandHandlers = {
   initUrl: (cmd) => {
     videoMode = cmd.videoMode ?? 'mse';
+    activePluginConfig = cmd.plugins?.videoDecoder ?? null;
     handleInit(new HttpLoader(cmd.url), cmd.debug).catch(e => postError(String(e), true));
   },
   initFile: (cmd) => {
     videoMode = cmd.videoMode ?? 'mse';
+    activePluginConfig = cmd.plugins?.videoDecoder ?? null;
     handleInit(new FileLoader(cmd.file), cmd.debug).catch(e => postError(String(e), true));
   },
   fetchSegment: (cmd) => {
