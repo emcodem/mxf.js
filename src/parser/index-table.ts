@@ -214,17 +214,31 @@ export function resolveEntryMeta(
   };
 }
 
-/** Largest keyframe edit unit ≤ `editUnit` (long-GOP seek snap), using {@link isKeyframeEntry}. */
+/**
+ * Largest keyframe edit unit ≤ `editUnit` (long-GOP seek snap), using {@link isKeyframeEntry}.
+ *
+ * Scans backward from `editUnit`; if it reaches the start of the covering segment without finding a
+ * keyframe, it continues into the immediately preceding segment (the GOP-head I-frame can live across
+ * an index-segment boundary — common with incremental per-partition indexing where a segment starts
+ * mid-GOP on a non-keyframe). Bounded by the segment count. Returns null if no preceding segment
+ * covers the boundary (a real gap) or no keyframe exists at all.
+ */
 export function findKeyframeFloor(
   segments: IndexTableSegment[],
   editUnit: bigint,
   videoBodySID = 0,
 ): bigint | null {
-  const hit = entrySegmentFor(segments, editUnit, videoBodySID);
-  if (!hit) return null;
-  const { seg } = hit;
-  for (let i = hit.idx; i >= 0; i--) {
-    if (isKeyframeEntry(seg, seg.entries[i])) return seg.indexStartPosition + BigInt(i);
+  let cursor = editUnit;
+  for (let guard = 0; guard <= segments.length; guard++) {
+    const hit = entrySegmentFor(segments, cursor, videoBodySID);
+    if (!hit) return null;
+    const { seg } = hit;
+    for (let i = hit.idx; i >= 0; i--) {
+      if (isKeyframeEntry(seg, seg.entries[i])) return seg.indexStartPosition + BigInt(i);
+    }
+    // Start of this segment reached with no keyframe — step into the previous segment's last entry.
+    if (seg.indexStartPosition <= 0n) return null;
+    cursor = seg.indexStartPosition - 1n;
   }
   return null;
 }

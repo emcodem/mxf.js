@@ -9,7 +9,15 @@ export interface KLVPacket {
 
 const KEY_LENGTH = 16;
 
-export function readKLV(buffer: ArrayBuffer, offset: number): KLVPacket {
+/**
+ * Read a KLV's KEY + LENGTH only, WITHOUT requiring the value bytes to be resident in `buffer`.
+ * The 16-byte key + BER length live at the very start of the KLV, so this succeeds even when the
+ * value runs past the read window (e.g. a large index segment or essence element only partially
+ * fetched). Use it to discover a KLV's `totalLength` (to skip it, or to fetch exactly its bytes)
+ * from a small probe read. Unlike {@link readKLV} it does NOT throw on a truncated value — only on
+ * a truncated key/length.
+ */
+export function readKLVHeader(buffer: ArrayBuffer, offset: number): KLVPacket {
   const view = new DataView(buffer);
   const u8 = new Uint8Array(buffer);
 
@@ -27,18 +35,24 @@ export function readKLV(buffer: ArrayBuffer, offset: number): KLVPacket {
   const { length: valueLength, bytesRead } = decodeBerLength(view, berOffset);
   const valueOffset = berOffset + bytesRead;
 
-  if (valueOffset + valueLength > buffer.byteLength) {
-    throw new Error(
-      `KLV: value extends beyond buffer (offset=${valueOffset}, length=${valueLength}, bufLen=${buffer.byteLength})`
-    );
-  }
-
   return {
     key,
     valueOffset,
     valueLength,
     totalLength: KEY_LENGTH + bytesRead + valueLength,
   };
+}
+
+export function readKLV(buffer: ArrayBuffer, offset: number): KLVPacket {
+  const pkt = readKLVHeader(buffer, offset);
+
+  if (pkt.valueOffset + pkt.valueLength > buffer.byteLength) {
+    throw new Error(
+      `KLV: value extends beyond buffer (offset=${pkt.valueOffset}, length=${pkt.valueLength}, bufLen=${buffer.byteLength})`
+    );
+  }
+
+  return pkt;
 }
 
 export class KLVIterator {

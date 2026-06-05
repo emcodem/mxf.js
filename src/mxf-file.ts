@@ -1,5 +1,5 @@
 import { ILoader } from './loader/loader.js';
-import { KLVIterator, readKLV } from './core/klv.js';
+import { KLVIterator, readKLV, readKLVHeader } from './core/klv.js';
 import { parsePartitionPack, PartitionPack } from './parser/partition.js';
 import { parsePrimerPack, PrimerPack } from './parser/primer.js';
 import { parseHeaderMetadata, MxfMetadata } from './parser/metadata.js';
@@ -21,6 +21,7 @@ import {
   HEADER_METADATA_MIN_READ,
   HEADER_METADATA_FALLBACK_READ,
   ESSENCE_SCAN_WINDOW,
+  INDEX_SEGMENT_MAX,
 } from './core/constants.js';
 
 export interface RandomIndexPackEntry {
@@ -139,12 +140,20 @@ export class MxfFile {
       const { partitions, segments } = await this.collectMultiPartitionIndex(ripEntries, fileSize);
       if (partitions.length > 0) {
         this.mergeIndexSegments(indexSegments, segments);
+        const es = Number(essenceStart);
+        // The essence-bearing partition whose bodyOffset is 0 is the identity base: a stream offset
+        // there maps to `essenceStart + so`. When the FIRST essence lives in the header partition
+        // (file offset 0, e.g. this Omneon file), collectMultiPartitionIndex skips it (its offset-0
+        // RIP entry is excluded), so seed the base here from the already-resolved essenceStart.
+        // Without it, partition-1 offsets would remap against the next partition's base (wrong).
+        if (!partitions.some(p => p.bodyOffset === 0)) {
+          partitions.unshift({ bodyOffset: 0, essenceFileStart: es });
+        }
         // For a stream offset SO, find the body partition whose essence it falls in (largest
         // bodyOffset ≤ SO) and map: fileOffset = partition.essenceFileStart + (SO − bodyOffset).
         // Expressed relative to essenceStart so the resolver's `essenceStart + streamOffset` is
         // unchanged. Single-partition files yield an identity remap (bodyOffset 0, essenceFileStart
         // === essenceStart), so this is safe to always apply to multi-segment VBE files.
-        const es = Number(essenceStart);
         const mapStreamOffset = (so: number): number => {
           let p = partitions[0];
           for (const q of partitions) { if (q.bodyOffset <= so) p = q; else break; }
@@ -348,14 +357,20 @@ export class MxfFile {
    * (`bodyOffset`, from the partition pack) and the file offset of its first essence element, then
    * the caller remaps every index entry's `streamOffset` to a file offset via this table.
    *
-   * Bounded: one ~256 KB read per body partition.
+   * Bounded: a small probe read per body partition (PP + index region + first essence element fit
+   * in PROBE for the common case). A per-partition index larger than PROBE — e.g. a long Long-GOP
+   * clip whose VBE index runs ~166 KB/partition — costs one extra targeted read per oversized index
+   * segment, read at the segment's own self-describing KLV length (never guessing a window size, and
+   * never trusting the partition pack's indexByteCount, which can be wrong/garbage).
    */
   private async collectMultiPartitionIndex(
     rip: RandomIndexPackEntry[],
     fileSize: number
   ): Promise<{ partitions: { bodyOffset: number; essenceFileStart: number }[]; segments: IndexTableSegment[] }> {
     const MAX_SCANS = 4096;
-    const WINDOW = 64 * 1024; // PP + index region + first essence element fit comfortably
+    const MAX_KLV_ITERS = 4096;      // per-partition walk guard
+    const PROBE = 64 * 1024;         // initial / re-probe read covering a KLV header (+ small values)
+    const KLV_HEADER_MAX = 25;       // 16-byte key + up to 9-byte BER long-form length
     const partitions: { bodyOffset: number; essenceFileStart: number }[] = [];
     const segments: IndexTableSegment[] = [];
     let scans = 0;
@@ -367,27 +382,53 @@ export class MxfFile {
       if (partOffset <= 0 || partOffset >= fileSize) continue;
 
       try {
-        const buf = await this.loader.fetchRange(
-          partOffset, Math.min(partOffset + WINDOW, fileSize) - 1, 'bootstrap: body partition + index');
+        let buf = await this.loader.fetchRange(
+          partOffset, Math.min(partOffset + PROBE, fileSize) - 1, 'bootstrap: body partition + index');
+        let bufStart = partOffset;
         const ppStart = KLVIterator.skipRunIn(buf);
         const pp = parsePartitionPack(buf, partOffset);
         const afterPP = ppStart + readKLV(buf, ppStart).totalLength;
 
-        // Walk: collect any index segments, then stop at the first essence element (its file offset
-        // is this partition's essence start, the anchor for bodyOffset). peekKey() avoids readKLV
-        // choking on the large essence value that won't fit in the window.
+        // Walk KLV HEADERS from an absolute file offset so we can stride past KLVs whose value isn't
+        // resident in the probe buffer (a large index segment or the essence element). Collect index
+        // segments, then stop at the first essence element (its file offset is this partition's
+        // essence start, the anchor for bodyOffset).
+        let abs = partOffset + afterPP;
         let essenceFileStart = -1;
-        const iter = new KLVIterator(buf, afterPP);
-        while (iter.hasMore()) {
-          const key = iter.peekKey();
-          if (!key) break;
-          if (isGenericContainerElement(key)) { essenceFileStart = partOffset + iter.offset; break; }
-          const pkt = iter.next();
-          if (!pkt) break;
-          if (isIndexTableSegment(pkt.key)) {
-            try { segments.push(parseIndexTableSegment(buf, pkt)); } catch { /* skip malformed */ }
+        for (let it = 0; it < MAX_KLV_ITERS; it++) {
+          // Ensure the KLV header at `abs` is resident; re-probe a small window if not.
+          if (abs < bufStart || abs + KLV_HEADER_MAX > bufStart + buf.byteLength) {
+            const hEnd = Math.min(abs + PROBE, fileSize) - 1;
+            if (hEnd < abs) break;
+            buf = await this.loader.fetchRange(abs, hEnd, 'bootstrap: body partition index walk');
+            bufStart = abs;
           }
+
+          let hdr: ReturnType<typeof readKLVHeader>;
+          try { hdr = readKLVHeader(buf, abs - bufStart); }
+          catch { break; } // truncated header near EOF — give up on this partition's walk
+
+          if (isGenericContainerElement(hdr.key)) { essenceFileStart = abs; break; }
+
+          if (isIndexTableSegment(hdr.key) && hdr.valueLength > 0 && hdr.valueLength <= INDEX_SEGMENT_MAX) {
+            if (abs - bufStart + hdr.totalLength <= buf.byteLength) {
+              // Value resident in the probe buffer — parse in place.
+              try { segments.push(parseIndexTableSegment(buf, hdr)); } catch { /* skip malformed */ }
+            } else {
+              // Value runs past the window — fetch exactly this KLV (key+len+value) and parse it.
+              const segEnd = Math.min(abs + hdr.totalLength, fileSize) - 1;
+              if (segEnd >= abs) {
+                try {
+                  const segBuf = await this.loader.fetchRange(abs, segEnd, 'bootstrap: oversized index segment');
+                  segments.push(parseIndexTableSegment(segBuf, readKLV(segBuf, 0)));
+                } catch { /* skip malformed */ }
+              }
+            }
+          }
+
+          abs += hdr.totalLength; // stride by the KLV's self-declared length (fill / metadata / index)
         }
+
         if (essenceFileStart < 0) continue; // couldn't locate essence in this partition — skip it
         partitions.push({ bodyOffset: Number(pp.bodyOffset), essenceFileStart });
       } catch { /* skip this partition */ }
