@@ -29,7 +29,7 @@ class C {
     this.listeners.clear();
   }
 }
-const T = 2, B = 0.25, w = 3, A = 6, D = 0.75;
+const y = 2, B = 0.5, w = 3, A = 6, D = y + 0.5;
 class S extends C {
   constructor(e, t = !1) {
     super(), this.mediaSource = null, this.objectURL = null, this.sourceBuffers = /* @__PURE__ */ new Map(), this.queues = /* @__PURE__ */ new Map(), this.processing = /* @__PURE__ */ new Map(), this.video = e, this.debug = t;
@@ -363,12 +363,12 @@ class W {
     o.forEach((d, m) => (m % 2 === 0 ? u : h).push(d)), o.length === 1 && (h.length = 0, h.push(o[0]));
     const c = t.createBuffer(2, a, r), l = (d, m) => {
       if (m.length === 0) return;
-      const R = 1 / m.length;
+      const F = 1 / m.length;
       for (let p = 0; p < a; p++) {
         let b = 0;
-        const F = p * i;
-        for (const x of m) b += s[F + x];
-        d[p] = b * R;
+        const x = p * i;
+        for (const T of m) b += s[x + T];
+        d[p] = b * F;
       }
     };
     l(c.getChannelData(0), u), l(c.getChannelData(1), h);
@@ -490,7 +490,7 @@ function g(n) {
 function k(n, e) {
   return e && (n === 30 || n === 60);
 }
-function y(n) {
+function R(n) {
   return n === 60 ? 4 : 2;
 }
 function $(n) {
@@ -498,7 +498,7 @@ function $(n) {
   if (e <= 0) return 0;
   let t = ((n.hours * 60 + n.minutes) * 60 + n.seconds) * e + n.frames;
   if (k(e, n.dropFrame)) {
-    const s = y(e), i = n.hours * 60 + n.minutes;
+    const s = R(e), i = n.hours * 60 + n.minutes;
     t -= s * (i - Math.floor(i / 10));
   }
   return t;
@@ -508,7 +508,7 @@ function v(n, e, t) {
   let s = n < 0 ? 0 : Math.floor(n);
   const i = k(e, t);
   if (i) {
-    const h = y(e), c = e * 600 - h * 9, l = e * 60 - h, f = Math.floor(s / c), d = s % c;
+    const h = R(e), c = e * 600 - h * 9, l = e * 60 - h, f = Math.floor(s / c), d = s % c;
     s += h * 9 * f + (d > h ? h * Math.floor((d - h) / l) : 0);
   }
   const r = s % e, a = Math.floor(s / e) % 60, o = Math.floor(s / (e * 60)) % 60;
@@ -544,7 +544,7 @@ class O extends C {
     ), this.video.addEventListener("seeking", () => this.onVideoSeeking()), this.video.addEventListener("seeked", () => this.onVideoSeeked()), this.video.addEventListener("timeupdate", () => this.onTimeUpdate()), this.video.addEventListener("waiting", () => this.onVideoWaiting()), this.video.addEventListener("playing", () => {
       this.startupGating = !1, this.setBuffering(!1);
     }), this.video.addEventListener("canplay", () => this.maybeResumePlayback()), this.video.addEventListener("play", () => {
-      this.playIntent = !0, this.audio.resume();
+      this.playIntent = !0, this.audio.resume(), this.startupGating && !this.video.paused && this.bufferedAhead() < this.resumeTargetSeconds() && (this.video.pause(), this.maybeResumePlayback());
     }), this.startVideoFrameCallback();
   }
   startVideoFrameCallback() {
@@ -797,7 +797,7 @@ class O extends C {
     const t = e.pictureDescriptor, s = e.soundDescriptor;
     this.editRateNumerator = e.editRateNumerator, this.editRateDenominator = e.editRateDenominator, this.audio.setEditRate(e.editRateNumerator, e.editRateDenominator), this.scrub.setStream(e.duration, e.editRateNumerator, e.editRateDenominator);
     const i = e.editRateNumerator / e.editRateDenominator;
-    this.framesPerChunk = Math.ceil(i * T), this.rampChunkFrames = Math.max(w, Math.ceil(i * B)), this.startupGating = !0, this.manifestTimecodes = e.timecodes ?? [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.manifest = {
+    this.framesPerChunk = Math.ceil(i * y), this.rampChunkFrames = Math.max(w, Math.ceil(i * B)), this.startupGating = !0, this.manifestTimecodes = e.timecodes ?? [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.manifest = {
       duration: e.duration,
       editRateNumerator: e.editRateNumerator,
       editRateDenominator: e.editRateDenominator,
@@ -913,6 +913,13 @@ class O extends C {
     var e;
     return ((e = this.mseController) == null ? void 0 : e.getBufferedAhead("video", this.video.currentTime)) ?? 0;
   }
+  /** Seconds of forward buffer required before (re)starting playback: RESUME_BUFFER_SECONDS, capped at
+   *  what remains to the end so the final fraction of a clip can still start. Shared by the startup
+   *  gate (maybeResumePlayback) and the autoplay/native-start interception in the 'play' handler. */
+  resumeTargetSeconds() {
+    const e = Math.max(0, this.duration - this.video.currentTime);
+    return Math.min(this.config.resumeBufferSeconds, Math.max(0, e - 0.05));
+  }
   /** Update + emit the buffering state, but only when it actually changes. */
   setBuffering(e) {
     this.isBuffering !== e && (this.isBuffering = e, this.emit("buffering", { buffering: e, bufferedSeconds: this.bufferedAhead() }));
@@ -931,8 +938,8 @@ class O extends C {
       this.setBuffering(!1);
       return;
     }
-    const e = this.editRateNumerator / this.editRateDenominator, t = Math.round(this.manifest.duration * e), s = this.nextFetchFrame >= t, i = Math.max(0, this.manifest.duration - this.video.currentTime), r = Math.min(this.config.resumeBufferSeconds, Math.max(0, i - 0.05));
-    this.bufferedAhead() >= r || s ? (this.startupGating = !1, this.setBuffering(!1), this.video.play().catch(() => {
+    const e = this.editRateNumerator / this.editRateDenominator, t = Math.round(this.manifest.duration * e), s = this.nextFetchFrame >= t, i = this.resumeTargetSeconds();
+    this.bufferedAhead() >= i || s ? (this.startupGating = !1, this.setBuffering(!1), this.video.play().catch(() => {
     })) : (this.setBuffering(!0), this.fetchNextChunk());
   }
   /**

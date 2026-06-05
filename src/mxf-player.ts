@@ -146,7 +146,23 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // must not be read as the user pausing; only the pause() method clears intent.
     // Resume the PCM AudioContext here too: this fires within the user gesture for element-initiated
     // play (native controls / a direct video.play()), so audio unlocks even when play() isn't used.
-    this.video.addEventListener('play', () => { this.playIntent = true; this.audio.resume(); });
+    this.video.addEventListener('play', () => {
+      this.playIntent = true;
+      this.audio.resume();
+      // Native/autoplay start (<video autoplay>, native controls, or a consumer calling video.play())
+      // begins playback at the browser's HAVE_FUTURE_DATA point — a thin ~0.2 s buffer — which would
+      // otherwise BYPASS the one-shot startup gate (maybeResumePlayback only acts on a paused element).
+      // On a decode-bound source (MPEG-2 transcode runs only ~1.2× realtime) the playhead then
+      // immediately catches the buffer frontier and stutters through several `waiting` events before
+      // production pulls ahead. If the gate is still armed and we're not yet buffered to the resume
+      // target, re-pause and route through it so playback starts ONCE from a healthy buffer.
+      // maybeResumePlayback clears startupGating before it calls video.play(), so our own intended
+      // start never bounces back through here.
+      if (this.startupGating && !this.video.paused && this.bufferedAhead() < this.resumeTargetSeconds()) {
+        this.video.pause();
+        this.maybeResumePlayback();
+      }
+    });
 
     // Per-rendered-frame timecode: requestVideoFrameCallback's mediaTime is the EXACT composited
     // frame's time, so the timecode never lags the picture. Self-reschedules; timeupdate is the
@@ -792,6 +808,14 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     return this.mseController?.getBufferedAhead('video', this.video.currentTime) ?? 0;
   }
 
+  /** Seconds of forward buffer required before (re)starting playback: RESUME_BUFFER_SECONDS, capped at
+   *  what remains to the end so the final fraction of a clip can still start. Shared by the startup
+   *  gate (maybeResumePlayback) and the autoplay/native-start interception in the 'play' handler. */
+  private resumeTargetSeconds(): number {
+    const remaining = Math.max(0, this.duration - this.video.currentTime);
+    return Math.min(this.config.resumeBufferSeconds, Math.max(0, remaining - 0.05));
+  }
+
   /** Update + emit the buffering state, but only when it actually changes. */
   private setBuffering(buffering: boolean): void {
     if (this.isBuffering === buffering) return;
@@ -815,8 +839,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     const fps = this.editRateNumerator / this.editRateDenominator;
     const totalFrames = Math.round(this.manifest.duration * fps);
     const fetchedToEof = this.nextFetchFrame >= totalFrames;
-    const remaining = Math.max(0, this.manifest.duration - this.video.currentTime);
-    const target = Math.min(this.config.resumeBufferSeconds, Math.max(0, remaining - 0.05));
+    const target = this.resumeTargetSeconds();
 
     if (this.bufferedAhead() >= target || fetchedToEof) {
       // Disarm the one-shot gate on the play ATTEMPT, not on the 'playing' event: if the element

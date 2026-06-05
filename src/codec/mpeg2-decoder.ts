@@ -1,6 +1,8 @@
 // Ported from C:\dev\jsmpeg2_git\jsmpeg (buffer.js + mpeg2.js).
 // Stripped to decode-only: no canvas, no TS demuxer, no player infrastructure.
 
+import { getKernels, type Kernels } from './wasm/kernels.js';
+
 // The VLC/DC tree builders below self-test at module load. Set globalThis.MXFJS_DEBUG_VLC = true
 // to print the per-table self-test summaries (off by default so importing the library is silent).
 // A self-test *failure* still logs unconditionally — it means a table is corrupt, which is a real
@@ -585,6 +587,9 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
   private mbWidth = 0;
   private mbHeight = 0;
   private mbSize = 0;
+  // WASM pixel kernels, if available at construction (else null → pure-JS plane buffers + ops).
+  // Captured once: the worker awaits ensureKernels() before constructing decoders.
+  private readonly kernels: Kernels | null = getKernels();
   private codedWidth = 0;
   private codedHeight = 0;
   private codedSize = 0;
@@ -826,6 +831,34 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
 
     const chromaSize = this.chromaFormat === 2
       ? (this.codedSize >> 1) : (this.codedSize >> 2);
+
+    // WASM path: back the planes with views over the WASM arena (slot 0=current, 1=forward,
+    // 2=backward) so the kernels operate on them with no per-block boundary copy. The buffer never
+    // grows again (ensureMemory ran at load), so the views stay valid; plane rotation just relabels
+    // which view object is current/forward/backward. Zeroed to match the JS new-array initial state
+    // exactly (the arena may carry stale bytes from a prior decoder sharing this instance).
+    const k = this.kernels;
+    if (k && this.codedSize <= k.maxYBytes && chromaSize <= k.maxCBytes) {
+      const buf = k.memory.buffer;
+      const vY = (ptr: number) => ({ a: new Uint8ClampedArray(buf, ptr, this.codedSize), a32: new Uint32Array(buf, ptr, this.codedSize >> 2) });
+      const vC = (ptr: number) => ({ a: new Uint8ClampedArray(buf, ptr, chromaSize), a32: new Uint32Array(buf, ptr, chromaSize >> 2) });
+      let w = vY(k.planeY[0]);  this.currentY  = w.a; this.currentY32  = w.a32;
+      w = vC(k.planeCr[0]); this.currentCr = w.a; this.currentCr32 = w.a32;
+      w = vC(k.planeCb[0]); this.currentCb = w.a; this.currentCb32 = w.a32;
+      w = vY(k.planeY[1]);  this.forwardY  = w.a; this.forwardY32  = w.a32;
+      w = vC(k.planeCr[1]); this.forwardCr = w.a; this.forwardCr32 = w.a32;
+      w = vC(k.planeCb[1]); this.forwardCb = w.a; this.forwardCb32 = w.a32;
+      w = vY(k.planeY[2]);  this.backwardY  = w.a; this.backwardY32  = w.a32;
+      w = vC(k.planeCr[2]); this.backwardCr = w.a; this.backwardCr32 = w.a32;
+      w = vC(k.planeCb[2]); this.backwardCb = w.a; this.backwardCb32 = w.a32;
+      this.currentY.fill(0);  this.currentCr.fill(0);  this.currentCb.fill(0);
+      this.forwardY.fill(0);  this.forwardCr.fill(0);  this.forwardCb.fill(0);
+      this.backwardY.fill(0); this.backwardCr.fill(0); this.backwardCb.fill(0);
+      // The coefficient loop in decodeBlock writes into blockData; back it with the WASM IDCT-source
+      // buffer so the residual kernels read it with no copy.
+      this.blockData = new Int32Array(buf, k.idctSrc, 64);
+      return;
+    }
 
     const makeY  = () => { const a = new Uint8ClampedArray(this.codedSize);  return { a, a32: new Uint32Array(a.buffer) }; };
     const makeCh = () => { const a = new Uint8ClampedArray(chromaSize); return { a, a32: new Uint32Array(a.buffer) }; };
@@ -1819,7 +1852,16 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       }
     }
 
-    if (this.macroblockIntra) {
+    const k = this.kernels;
+    if (k) {
+      // WASM path: blockData is a view over the kernel's IDCT-source buffer, and destArray is a view
+      // over the WASM plane arena — so the kernel reads the coefficients and writes the residual into
+      // the plane with no boundary copy. destArray.byteOffset is the plane's base in WASM memory.
+      const intra = this.macroblockIntra ? 1 : 0;
+      if (n === 1) k.dcBlock(destArray.byteOffset, destIndex, scan, intra, (this.blockData[0] + 128) >> 8, destArray.length);
+      else k.idctAddBlock(destArray.byteOffset, destIndex, scan, intra, destArray.length);
+      for (let i = 0; i < tc; i++) this.blockData[touched[i]] = 0;
+    } else if (this.macroblockIntra) {
       if (n === 1) {
         copyValue((this.blockData[0] + 128) >> 8, destArray, destIndex, scan);
         for (let i = 0; i < tc; i++) this.blockData[touched[i]] = 0;

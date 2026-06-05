@@ -48,8 +48,13 @@ export const SEQ_HARD_CAP = 64 * 1024 * 1024;
 export const CHUNK_DURATION_SECONDS = 2;
 /** Target media duration of the FIRST cold-start fetch, so play-to-first-frame is fast on thin
  *  lines. The full CHUNK_DURATION_SECONDS chunk (~2 s ≈ 12.5 MB for 50 Mbit XDCAM) would block
- *  first paint on ~2 s of download; the cold-start fetch ramps from this up to the full size. */
-export const FIRST_CHUNK_DURATION_SECONDS = 0.25;
+ *  first paint on ~2 s of download; the cold-start fetch ramps from this up to the full size.
+ *  Kept modest so the FIRST decode (which gates first paint) stays small on a thin line, but not so
+ *  tiny that the early ramp chunks are decode-bound below realtime — a decode-bound source (MPEG-2
+ *  transcode ≈1.15× realtime) needs the ramp to reach a sustaining size before the resume gate
+ *  releases, or playback starts on a buffer the small early chunks can't keep ahead of and re-stalls
+ *  once (the residual cold-start stutter). 0.5 s balances first-paint latency against that. */
+export const FIRST_CHUNK_DURATION_SECONDS = 0.5;
 /** Floor on any ramped chunk, independent of frame rate. 3 is the IBBP (XDCAM HD Long-GOP) decode
  *  minimum: I + enough following coded frames to flush the held display-0 anchor out (the
  *  intervening B's need their backward P reference). For real XDCAM HD rates this floor never binds
@@ -60,8 +65,19 @@ export const BACK_BUFFER_SECONDS = 6;
 /** Minimum buffered-ahead seconds required before (re)starting playback after a cold start, a seek,
  *  or a stall. Small so resume stays responsive (the first picture is shown as soon as it decodes,
  *  while still "buffering"), but large enough that playback doesn't immediately re-stall and stutter
- *  on a thin/decode-bound source. Surfaced to the UI via the `buffering` event while the gate holds. */
-export const RESUME_BUFFER_SECONDS = 0.75;
+ *  on a thin/decode-bound source. Surfaced to the UI via the `buffering` event while the gate holds.
+ *
+ *  Sized to exceed ONE chunk's production latency. The decoder is serial (one chunk at a time), so
+ *  delivery is lumpy: nothing for the chunk's decode time, then a whole CHUNK_DURATION_SECONDS lands
+ *  at once. On a decode-bound source (MPEG-2 → H.264 ≈1.15× realtime) a full 50-frame chunk takes
+ *  ~1.7 s to produce while delivering 2 s — so any cushion smaller than that chunk drains to empty
+ *  before the next one arrives and playback re-stalls exactly once (observed at 0.75 s and 1.5 s).
+ *  Requiring ≥ CHUNK_DURATION_SECONDS + 0.5 guarantees more than one chunk of cushion, so the next
+ *  chunk's production gap can't empty the buffer. The first picture is still shown immediately
+ *  (paused) while this fills, so the cost is a longer "buffering" before MOTION starts, not before the
+ *  frame appears. Snappier start would mean smaller chunks (more network round-trips) — see
+ *  CHUNK_DURATION_SECONDS. */
+export const RESUME_BUFFER_SECONDS = CHUNK_DURATION_SECONDS + 0.5;
 
 // ── Scrub preview (demux-worker.ts) ──────────────────────────────────────────
 /** Max cached scrub-preview segments (LRU, keyed by GOP-head keyframe edit unit). */

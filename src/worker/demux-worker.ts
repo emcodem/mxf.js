@@ -23,6 +23,7 @@ import { timecodeToFrameCount, Timecode } from '../parser/timecode.js';
 import { ScrubSegmentCache } from './scrub-segment-cache.js';
 import { FetchQueue } from './fetch-queue.js';
 import { Mpeg2Pipeline } from './mpeg2-pipeline.js';
+import { ensureKernels } from '../codec/wasm/kernels.js';
 import {
   SCRUB_PREVIEW_LOOKAHEAD_SECONDS,
   SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES,
@@ -138,6 +139,29 @@ function postError(message: string, fatal = false): void {
   post({ type: 'error', message, fatal });
 }
 
+// Load the WASM pixel kernels once, from kernels.wasm sitting beside this worker script (the build
+// copies it to dist/). Best-effort: any failure (missing file, strict-CSP block, instantiate error)
+// leaves getKernels() null and the decoder runs the pure-JS path. Logs which path is active so the
+// browser console can confirm acceleration engaged.
+let kernelsAttempted = false;
+async function loadKernelsOnce(): Promise<void> {
+  if (kernelsAttempted) return;
+  kernelsAttempted = true;
+  try {
+    const loc = (self as unknown as { location?: { href: string } }).location;
+    if (!loc) { console.warn('[mxf.js] no worker location → MPEG-2 JS decode path'); return; }
+    const url = new URL('kernels.wasm', loc.href).href;
+    const resp = await fetch(url);
+    if (!resp.ok) { console.warn(`[mxf.js] kernels.wasm fetch ${resp.status} → MPEG-2 JS decode path`); return; }
+    const k = await ensureKernels(await resp.arrayBuffer());
+    console.log(k
+      ? '[mxf.js] MPEG-2 decode: WASM kernels active'
+      : '[mxf.js] kernels.wasm failed to instantiate → MPEG-2 JS decode path');
+  } catch (e) {
+    console.warn('[mxf.js] kernels.wasm load error → MPEG-2 JS decode path:', e);
+  }
+}
+
 async function handleInit(loader_: ILoader, debug = false): Promise<void> {
   loader = loader_;
   workerDebug = debug;
@@ -185,6 +209,10 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
     // MPEG-2 path: transcode to H.264 so MSE / native video element can play
     // -----------------------------------------------------------------------
     if (pd?.codec === 'mpeg2') {
+      // Load the WASM pixel kernels (if available) BEFORE constructing any decoder — the decoder
+      // captures getKernels() at construction. Failure is non-fatal (JS fallback).
+      await loadKernelsOnce();
+
       // Find the first video frame for the probe-decode. The index path fetches the WHOLE requested
       // range in one HTTP read before yielding (essence-extractor.ts), so the old `fetchFrames(0n, 50)`
       // pulled ~50 edit units (~2 s of bytes on a thin line) just to grab frame 0 — then the cold-start
@@ -676,7 +704,14 @@ async function handleFetchSegment(
     // A read aborted by a seek/scrub supersession is expected — the next fetch is already queued, so
     // swallow it (and any error once superseded) rather than surfacing a spurious error to the player.
     const aborted = (e instanceof Error && e.name === 'AbortError') || signal?.aborted || gen !== fetchQ.currentGeneration;
-    if (!aborted) postError(`Failed to fetch segment: ${e instanceof Error ? e.message : String(e)}`);
+    if (!aborted) {
+      postError(`Failed to fetch segment: ${e instanceof Error ? e.message : String(e)}`);
+      // Robustness: a non-aborted forward-fetch error must NOT wedge playback forever. Without a
+      // segmentDone the player's fetchPending stays true and it never fetches again (the playhead
+      // drains to the frontier and hard-stalls). Post it so the player clears fetchPending and
+      // advances to the next chunk — a single bad chunk becomes a gap/glitch, not a permanent freeze.
+      if (!isScrubPreview) post({ type: 'segmentDone' });
+    }
   } finally {
     // Always answer a scrub preview, even when superseded (gen mismatch returns above) or errored,
     // so the player's single-flight pump can fire the next preview at the latest dragged position.

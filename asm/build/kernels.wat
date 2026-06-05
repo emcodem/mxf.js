@@ -1,18 +1,22 @@
 (module
  (type $0 (func (result i32)))
- (type $1 (func))
- (memory $0 1)
+ (type $1 (func (param i32) (result i32)))
+ (type $2 (func))
+ (type $3 (func (param i32 i32 i32 i32 i32)))
+ (type $4 (func (param i32 i32 i32 i32 i32 i32)))
+ (memory $0 192)
  (export "idctSrcPtr" (func $asm/kernels/idctSrcPtr))
  (export "idctDstPtr" (func $asm/kernels/idctDstPtr))
+ (export "maxYBytes" (func $asm/kernels/maxYBytes))
+ (export "maxCBytes" (func $asm/kernels/maxCBytes))
+ (export "planeYPtr" (func $asm/kernels/planeYPtr))
+ (export "planeCrPtr" (func $asm/kernels/planeCrPtr))
+ (export "planeCbPtr" (func $asm/kernels/planeCbPtr))
  (export "idct" (func $asm/kernels/idct))
+ (export "idctAddBlock" (func $asm/kernels/idctAddBlock))
+ (export "dcBlock" (func $asm/kernels/dcBlock))
  (export "memory" (memory $0))
- (func $asm/kernels/idctSrcPtr (result i32)
-  i32.const 1024
- )
- (func $asm/kernels/idctDstPtr (result i32)
-  i32.const 1280
- )
- (func $asm/kernels/idct
+ (func $asm/kernels/idctCore
   (local $0 i32)
   (local $1 i32)
   (local $2 i32)
@@ -444,6 +448,335 @@
     i32.add
     local.set $0
     br $for-loop|1
+   end
+  end
+ )
+ (func $asm/kernels/planeYPtr (param $0 i32) (result i32)
+  local.get $0
+  i32.const 4177920
+  i32.mul
+  i32.const 1536
+  i32.add
+ )
+ (func $asm/kernels/planeCrPtr (param $0 i32) (result i32)
+  local.get $0
+  i32.const 4177920
+  i32.mul
+  i32.const 2090496
+  i32.add
+ )
+ (func $asm/kernels/planeCbPtr (param $0 i32) (result i32)
+  local.get $0
+  i32.const 4177920
+  i32.mul
+  i32.const 3134976
+  i32.add
+ )
+ (func $asm/kernels/maxYBytes (result i32)
+  i32.const 2088960
+ )
+ (func $asm/kernels/maxCBytes (result i32)
+  i32.const 1044480
+ )
+ (func $asm/kernels/idctSrcPtr (result i32)
+  i32.const 1024
+ )
+ (func $asm/kernels/idctDstPtr (result i32)
+  i32.const 1280
+ )
+ (func $asm/kernels/idctAddBlock (param $0 i32) (param $1 i32) (param $2 i32) (param $3 i32) (param $4 i32)
+  (local $5 i32)
+  (local $6 i32)
+  (local $7 i32)
+  (local $8 i32)
+  call $asm/kernels/idctCore
+  local.get $3
+  if
+   loop $for-loop|0
+    local.get $5
+    i32.const 8
+    i32.lt_s
+    if
+     i32.const 0
+     local.set $3
+     loop $for-loop|1
+      local.get $3
+      i32.const 8
+      i32.lt_s
+      if
+       local.get $1
+       local.get $3
+       i32.add
+       local.tee $7
+       local.get $4
+       i32.lt_s
+       local.get $7
+       i32.const 0
+       i32.ge_s
+       i32.and
+       if
+        local.get $0
+        local.get $7
+        i32.add
+        i32.const 255
+        local.get $3
+        local.get $6
+        i32.add
+        i32.const 2
+        i32.shl
+        i32.const 1280
+        i32.add
+        i32.load
+        local.tee $7
+        local.get $7
+        i32.const 255
+        i32.gt_s
+        select
+        i32.const 0
+        local.get $7
+        i32.const 0
+        i32.ge_s
+        select
+        i32.store8
+       end
+       local.get $3
+       i32.const 1
+       i32.add
+       local.set $3
+       br $for-loop|1
+      end
+     end
+     local.get $6
+     i32.const 8
+     i32.add
+     local.set $6
+     local.get $1
+     local.get $2
+     i32.const 8
+     i32.add
+     i32.add
+     local.set $1
+     local.get $5
+     i32.const 1
+     i32.add
+     local.set $5
+     br $for-loop|0
+    end
+   end
+  else
+   loop $for-loop|2
+    local.get $5
+    i32.const 8
+    i32.lt_s
+    if
+     i32.const 0
+     local.set $3
+     loop $for-loop|3
+      local.get $3
+      i32.const 8
+      i32.lt_s
+      if
+       local.get $1
+       local.get $3
+       i32.add
+       local.tee $7
+       local.get $4
+       i32.lt_s
+       local.get $7
+       i32.const 0
+       i32.ge_s
+       i32.and
+       if
+        local.get $3
+        local.get $6
+        i32.add
+        i32.const 2
+        i32.shl
+        i32.const 1280
+        i32.add
+        i32.load
+        local.get $0
+        local.get $7
+        i32.add
+        local.tee $8
+        i32.load8_u
+        i32.add
+        local.set $7
+        local.get $8
+        i32.const 255
+        local.get $7
+        local.get $7
+        i32.const 255
+        i32.gt_s
+        select
+        i32.const 0
+        local.get $7
+        i32.const 0
+        i32.ge_s
+        select
+        i32.store8
+       end
+       local.get $3
+       i32.const 1
+       i32.add
+       local.set $3
+       br $for-loop|3
+      end
+     end
+     local.get $6
+     i32.const 8
+     i32.add
+     local.set $6
+     local.get $1
+     local.get $2
+     i32.const 8
+     i32.add
+     i32.add
+     local.set $1
+     local.get $5
+     i32.const 1
+     i32.add
+     local.set $5
+     br $for-loop|2
+    end
+   end
+  end
+ )
+ (func $asm/kernels/idct
+  call $asm/kernels/idctCore
+ )
+ (func $asm/kernels/dcBlock (param $0 i32) (param $1 i32) (param $2 i32) (param $3 i32) (param $4 i32) (param $5 i32)
+  (local $6 i32)
+  (local $7 i32)
+  (local $8 i32)
+  local.get $3
+  if
+   i32.const 255
+   local.get $4
+   local.get $4
+   i32.const 255
+   i32.gt_s
+   select
+   i32.const 0
+   local.get $4
+   i32.const 0
+   i32.ge_s
+   select
+   local.set $4
+   loop $for-loop|0
+    local.get $6
+    i32.const 8
+    i32.lt_s
+    if
+     i32.const 0
+     local.set $3
+     loop $for-loop|1
+      local.get $3
+      i32.const 8
+      i32.lt_s
+      if
+       local.get $1
+       local.get $3
+       i32.add
+       local.tee $7
+       local.get $5
+       i32.lt_s
+       local.get $7
+       i32.const 0
+       i32.ge_s
+       i32.and
+       if
+        local.get $0
+        local.get $7
+        i32.add
+        local.get $4
+        i32.store8
+       end
+       local.get $3
+       i32.const 1
+       i32.add
+       local.set $3
+       br $for-loop|1
+      end
+     end
+     local.get $1
+     local.get $2
+     i32.const 8
+     i32.add
+     i32.add
+     local.set $1
+     local.get $6
+     i32.const 1
+     i32.add
+     local.set $6
+     br $for-loop|0
+    end
+   end
+  else
+   loop $for-loop|2
+    local.get $6
+    i32.const 8
+    i32.lt_s
+    if
+     i32.const 0
+     local.set $3
+     loop $for-loop|3
+      local.get $3
+      i32.const 8
+      i32.lt_s
+      if
+       local.get $1
+       local.get $3
+       i32.add
+       local.tee $7
+       local.get $5
+       i32.lt_s
+       local.get $7
+       i32.const 0
+       i32.ge_s
+       i32.and
+       if
+        local.get $0
+        local.get $7
+        i32.add
+        local.tee $8
+        i32.load8_u
+        local.get $4
+        i32.add
+        local.set $7
+        local.get $8
+        i32.const 255
+        local.get $7
+        local.get $7
+        i32.const 255
+        i32.gt_s
+        select
+        i32.const 0
+        local.get $7
+        i32.const 0
+        i32.ge_s
+        select
+        i32.store8
+       end
+       local.get $3
+       i32.const 1
+       i32.add
+       local.set $3
+       br $for-loop|3
+      end
+     end
+     local.get $1
+     local.get $2
+     i32.const 8
+     i32.add
+     i32.add
+     local.set $1
+     local.get $6
+     i32.const 1
+     i32.add
+     local.set $6
+     br $for-loop|2
+    end
    end
   end
  )

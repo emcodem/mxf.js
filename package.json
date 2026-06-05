@@ -11,7 +11,7 @@
   "scripts": {
     "dev": "vite",
     "asbuild": "asc asm/kernels.ts -o asm/build/kernels.wasm -t asm/build/kernels.wat --runtime stub -O3 --noAssert",
-    "build": "vite build && vite build --config vite.worker.config.ts",
+    "build": "npm run asbuild && vite build && vite build --config vite.worker.config.ts && node scripts/copy-wasm.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
