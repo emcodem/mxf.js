@@ -19,6 +19,25 @@ export interface YUVFrame {
   isKeyframe: boolean;
 }
 
+/**
+ * The decoder surface the MPEG-2 transcode pipeline depends on. Extracted so a WASM-accelerated
+ * implementation (SIMD IDCT / motion-comp kernels) can be swapped in behind feature detection while
+ * the pure-JS {@link Mpeg2Decoder} remains the default and the correctness oracle. The bitstream
+ * parser, VLC and dequant stay in JS in the hybrid design; only the pixel kernels move to WASM, so
+ * this same surface (write raw ES → decode() drains pictures via the onFrame callback → flush the
+ * held anchor → reset on seek) holds for both implementations.
+ */
+export interface Mpeg2DecoderImpl {
+  /** Feed raw MPEG-2 elementary-stream bytes (one or more access units). */
+  write(data: ArrayBuffer): void;
+  /** Decode one picture if a complete one is buffered; fires onFrame for emitted (display-order) frames. */
+  decode(): boolean;
+  /** Emit the final held I/P anchor (call at end-of-segment / end-of-stream). */
+  flush(): void;
+  /** Drop buffered bitstream + held anchor for a seek, keeping the parsed sequence header. */
+  reset(): void;
+}
+
 // ---------------------------------------------------------------------------
 // BitBuffer (buffer.js)
 // ---------------------------------------------------------------------------
@@ -541,7 +560,7 @@ const START = { SEQUENCE: 0xB3, SLICE_FIRST: 0x01, SLICE_LAST: 0xAF, PICTURE: 0x
 
 // ---------------------------------------------------------------------------
 
-export class Mpeg2Decoder {
+export class Mpeg2Decoder implements Mpeg2DecoderImpl {
   private bits: BitBuffer;
   private onFrame: (frame: YUVFrame) => void;
 
@@ -1342,6 +1361,10 @@ export class Mpeg2Decoder {
       const intV = mvv >> 1, halfV = mvv & 1;
       const colBase = (this.mbCol << 4) + intH;
       const dstColBase = this.mbCol << 4;
+      // Interior MBs (the vast majority) read a fully in-bounds source rectangle, so the per-pixel
+      // column clamp is a no-op there — skip it and the per-pixel half-pel branch via a hoisted
+      // clampless loop. Edge MBs keep the original clamped path; both produce identical output.
+      const colInside = colBase >= 0 && colBase + 15 + (halfH ? 1 : 0) < W;
       for (let m = 0; m < 8; m++) {
         const dstRow = (this.mbRow << 4) + (m << 1) + dstParity;
         if (dstRow >= H) break;
@@ -1351,17 +1374,30 @@ export class Mpeg2Decoder {
         let r1 = halfV ? r0 + 2 : r0;
         if (r1 >= H) r1 = H - 1;
         const o0 = r0 * W, o1 = r1 * W, dstBase = dstRow * W + dstColBase;
-        for (let n = 0; n < 16; n++) {
-          let c0 = colBase + n;
-          c0 = c0 < 0 ? 0 : c0 >= W ? W - 1 : c0;
-          const c1 = halfH && c0 + 1 < W ? c0 + 1 : c0;
-          let val: number;
-          if (halfH && halfV) val = (refY[o0 + c0] + refY[o0 + c1] + refY[o1 + c0] + refY[o1 + c1] + 2) >> 2;
-          else if (halfH)     val = (refY[o0 + c0] + refY[o0 + c1] + 1) >> 1;
-          else if (halfV)     val = (refY[o0 + c0] + refY[o1 + c0] + 1) >> 1;
-          else                val = refY[o0 + c0];
-          const di = dstBase + n;
-          curY[di] = accumulate ? ((curY[di] + val + 1) >> 1) : val;
+        if (colInside) {
+          const a0 = o0 + colBase, a1 = o1 + colBase;
+          if (halfH && halfV) {
+            for (let n = 0; n < 16; n++) { const val = (refY[a0+n] + refY[a0+n+1] + refY[a1+n] + refY[a1+n+1] + 2) >> 2; const di = dstBase + n; curY[di] = accumulate ? ((curY[di] + val + 1) >> 1) : val; }
+          } else if (halfH) {
+            for (let n = 0; n < 16; n++) { const val = (refY[a0+n] + refY[a0+n+1] + 1) >> 1; const di = dstBase + n; curY[di] = accumulate ? ((curY[di] + val + 1) >> 1) : val; }
+          } else if (halfV) {
+            for (let n = 0; n < 16; n++) { const val = (refY[a0+n] + refY[a1+n] + 1) >> 1; const di = dstBase + n; curY[di] = accumulate ? ((curY[di] + val + 1) >> 1) : val; }
+          } else {
+            for (let n = 0; n < 16; n++) { const val = refY[a0+n]; const di = dstBase + n; curY[di] = accumulate ? ((curY[di] + val + 1) >> 1) : val; }
+          }
+        } else {
+          for (let n = 0; n < 16; n++) {
+            let c0 = colBase + n;
+            c0 = c0 < 0 ? 0 : c0 >= W ? W - 1 : c0;
+            const c1 = halfH && c0 + 1 < W ? c0 + 1 : c0;
+            let val: number;
+            if (halfH && halfV) val = (refY[o0 + c0] + refY[o0 + c1] + refY[o1 + c0] + refY[o1 + c1] + 2) >> 2;
+            else if (halfH)     val = (refY[o0 + c0] + refY[o0 + c1] + 1) >> 1;
+            else if (halfV)     val = (refY[o0 + c0] + refY[o1 + c0] + 1) >> 1;
+            else                val = refY[o0 + c0];
+            const di = dstBase + n;
+            curY[di] = accumulate ? ((curY[di] + val + 1) >> 1) : val;
+          }
         }
       }
 
@@ -1377,6 +1413,7 @@ export class Mpeg2Decoder {
       const cIntV = cmvv >> 1, cHalfV = cmvv & 1;
       const cColBase = (this.mbCol << 3) + cIntH;
       const cDstColBase = this.mbCol << 3;
+      const cColInside = cColBase >= 0 && cColBase + 7 + (cHalfH ? 1 : 0) < cw;
       for (let m = 0; m < cFieldRows; m++) {
         const dstRow = cDstRowOrigin + (m << 1) + dstParity;
         if (dstRow >= cH) break;
@@ -1386,26 +1423,39 @@ export class Mpeg2Decoder {
         let r1 = cHalfV ? r0 + 2 : r0;
         if (r1 >= cH) r1 = cH - 1;
         const o0 = r0 * cw, o1 = r1 * cw, dstBase = dstRow * cw + cDstColBase;
-        for (let n = 0; n < 8; n++) {
-          let c0 = cColBase + n;
-          c0 = c0 < 0 ? 0 : c0 >= cw ? cw - 1 : c0;
-          const c1 = cHalfH && c0 + 1 < cw ? c0 + 1 : c0;
-          let cr: number, cb: number;
+        if (cColInside) {
+          const a0 = o0 + cColBase, a1 = o1 + cColBase;
           if (cHalfH && cHalfV) {
-            cr = (refCr[o0 + c0] + refCr[o0 + c1] + refCr[o1 + c0] + refCr[o1 + c1] + 2) >> 2;
-            cb = (refCb[o0 + c0] + refCb[o0 + c1] + refCb[o1 + c0] + refCb[o1 + c1] + 2) >> 2;
+            for (let n = 0; n < 8; n++) { const cr = (refCr[a0+n]+refCr[a0+n+1]+refCr[a1+n]+refCr[a1+n+1]+2)>>2; const cb = (refCb[a0+n]+refCb[a0+n+1]+refCb[a1+n]+refCb[a1+n+1]+2)>>2; const di = dstBase + n; curCr[di] = accumulate ? ((curCr[di]+cr+1)>>1) : cr; curCb[di] = accumulate ? ((curCb[di]+cb+1)>>1) : cb; }
           } else if (cHalfH) {
-            cr = (refCr[o0 + c0] + refCr[o0 + c1] + 1) >> 1;
-            cb = (refCb[o0 + c0] + refCb[o0 + c1] + 1) >> 1;
+            for (let n = 0; n < 8; n++) { const cr = (refCr[a0+n]+refCr[a0+n+1]+1)>>1; const cb = (refCb[a0+n]+refCb[a0+n+1]+1)>>1; const di = dstBase + n; curCr[di] = accumulate ? ((curCr[di]+cr+1)>>1) : cr; curCb[di] = accumulate ? ((curCb[di]+cb+1)>>1) : cb; }
           } else if (cHalfV) {
-            cr = (refCr[o0 + c0] + refCr[o1 + c0] + 1) >> 1;
-            cb = (refCb[o0 + c0] + refCb[o1 + c0] + 1) >> 1;
+            for (let n = 0; n < 8; n++) { const cr = (refCr[a0+n]+refCr[a1+n]+1)>>1; const cb = (refCb[a0+n]+refCb[a1+n]+1)>>1; const di = dstBase + n; curCr[di] = accumulate ? ((curCr[di]+cr+1)>>1) : cr; curCb[di] = accumulate ? ((curCb[di]+cb+1)>>1) : cb; }
           } else {
-            cr = refCr[o0 + c0]; cb = refCb[o0 + c0];
+            for (let n = 0; n < 8; n++) { const cr = refCr[a0+n]; const cb = refCb[a0+n]; const di = dstBase + n; curCr[di] = accumulate ? ((curCr[di]+cr+1)>>1) : cr; curCb[di] = accumulate ? ((curCb[di]+cb+1)>>1) : cb; }
           }
-          const di = dstBase + n;
-          curCr[di] = accumulate ? ((curCr[di] + cr + 1) >> 1) : cr;
-          curCb[di] = accumulate ? ((curCb[di] + cb + 1) >> 1) : cb;
+        } else {
+          for (let n = 0; n < 8; n++) {
+            let c0 = cColBase + n;
+            c0 = c0 < 0 ? 0 : c0 >= cw ? cw - 1 : c0;
+            const c1 = cHalfH && c0 + 1 < cw ? c0 + 1 : c0;
+            let cr: number, cb: number;
+            if (cHalfH && cHalfV) {
+              cr = (refCr[o0 + c0] + refCr[o0 + c1] + refCr[o1 + c0] + refCr[o1 + c1] + 2) >> 2;
+              cb = (refCb[o0 + c0] + refCb[o0 + c1] + refCb[o1 + c0] + refCb[o1 + c1] + 2) >> 2;
+            } else if (cHalfH) {
+              cr = (refCr[o0 + c0] + refCr[o0 + c1] + 1) >> 1;
+              cb = (refCb[o0 + c0] + refCb[o0 + c1] + 1) >> 1;
+            } else if (cHalfV) {
+              cr = (refCr[o0 + c0] + refCr[o1 + c0] + 1) >> 1;
+              cb = (refCb[o0 + c0] + refCb[o1 + c0] + 1) >> 1;
+            } else {
+              cr = refCr[o0 + c0]; cb = refCb[o0 + c0];
+            }
+            const di = dstBase + n;
+            curCr[di] = accumulate ? ((curCr[di] + cr + 1) >> 1) : cr;
+            curCb[di] = accumulate ? ((curCb[di] + cb + 1) >> 1) : cb;
+          }
         }
       }
     }
@@ -1595,16 +1645,15 @@ export class Mpeg2Decoder {
     const rowBase = this.mbRow << 4; const colBase = this.mbCol << 4;
     const srcBase = (rowBase + fV) * width + colBase + fH;
     const destBase = rowBase * width + colBase;
-    for (let row = 0; row < 16; row++) {
-      for (let col = 0; col < 16; col++) {
-        const s = srcBase + row * width + col; const d = destBase + row * width + col;
-        let val: number;
-        if (oddH && oddV) val = (sY[s] + sY[s+1] + sY[s+width] + sY[s+width+1] + 2) >> 2;
-        else if (oddH) val = (sY[s] + sY[s+1] + 1) >> 1;
-        else if (oddV) val = (sY[s] + sY[s+width] + 1) >> 1;
-        else val = sY[s];
-        dY[d] = (dY[d] + val + 1) >> 1;
-      }
+    // Half-pel mode is constant across the MB — hoist the 4-way branch out of the inner loop.
+    if (oddH && oddV) {
+      for (let row = 0; row < 16; row++) { let s = srcBase + row*width, d = destBase + row*width; for (let col = 0; col < 16; col++, s++, d++) { const val = (sY[s]+sY[s+1]+sY[s+width]+sY[s+width+1]+2)>>2; dY[d] = (dY[d]+val+1)>>1; } }
+    } else if (oddH) {
+      for (let row = 0; row < 16; row++) { let s = srcBase + row*width, d = destBase + row*width; for (let col = 0; col < 16; col++, s++, d++) { const val = (sY[s]+sY[s+1]+1)>>1; dY[d] = (dY[d]+val+1)>>1; } }
+    } else if (oddV) {
+      for (let row = 0; row < 16; row++) { let s = srcBase + row*width, d = destBase + row*width; for (let col = 0; col < 16; col++, s++, d++) { const val = (sY[s]+sY[s+width]+1)>>1; dY[d] = (dY[d]+val+1)>>1; } }
+    } else {
+      for (let row = 0; row < 16; row++) { let s = srcBase + row*width, d = destBase + row*width; for (let col = 0; col < 16; col++, s++, d++) { const val = sY[s]; dY[d] = (dY[d]+val+1)>>1; } }
     }
     const hw = this.halfWidth;
     let cFH: number; let cFV: number; let cOddH: boolean; let cOddV: boolean; let cRowBase: number; let cChromaRows: number;
@@ -1616,16 +1665,14 @@ export class Mpeg2Decoder {
     const cColBase = this.mbCol << 3;
     const cSrcBase = (cRowBase + cFV) * hw + cColBase + cFH;
     const cDestBase = cRowBase * hw + cColBase;
-    for (let row = 0; row < cChromaRows; row++) {
-      for (let col = 0; col < 8; col++) {
-        const s = cSrcBase + row * hw + col; const d = cDestBase + row * hw + col;
-        let cr: number; let cb: number;
-        if (cOddH && cOddV) { cr = (sCr[s]+sCr[s+1]+sCr[s+hw]+sCr[s+hw+1]+2)>>2; cb = (sCb[s]+sCb[s+1]+sCb[s+hw]+sCb[s+hw+1]+2)>>2; }
-        else if (cOddH)     { cr = (sCr[s]+sCr[s+1]+1)>>1; cb = (sCb[s]+sCb[s+1]+1)>>1; }
-        else if (cOddV)     { cr = (sCr[s]+sCr[s+hw]+1)>>1; cb = (sCb[s]+sCb[s+hw]+1)>>1; }
-        else                { cr = sCr[s]; cb = sCb[s]; }
-        dCr[d] = (dCr[d] + cr + 1) >> 1; dCb[d] = (dCb[d] + cb + 1) >> 1;
-      }
+    if (cOddH && cOddV) {
+      for (let row = 0; row < cChromaRows; row++) { let s = cSrcBase + row*hw, d = cDestBase + row*hw; for (let col = 0; col < 8; col++, s++, d++) { const cr = (sCr[s]+sCr[s+1]+sCr[s+hw]+sCr[s+hw+1]+2)>>2; const cb = (sCb[s]+sCb[s+1]+sCb[s+hw]+sCb[s+hw+1]+2)>>2; dCr[d] = (dCr[d]+cr+1)>>1; dCb[d] = (dCb[d]+cb+1)>>1; } }
+    } else if (cOddH) {
+      for (let row = 0; row < cChromaRows; row++) { let s = cSrcBase + row*hw, d = cDestBase + row*hw; for (let col = 0; col < 8; col++, s++, d++) { const cr = (sCr[s]+sCr[s+1]+1)>>1; const cb = (sCb[s]+sCb[s+1]+1)>>1; dCr[d] = (dCr[d]+cr+1)>>1; dCb[d] = (dCb[d]+cb+1)>>1; } }
+    } else if (cOddV) {
+      for (let row = 0; row < cChromaRows; row++) { let s = cSrcBase + row*hw, d = cDestBase + row*hw; for (let col = 0; col < 8; col++, s++, d++) { const cr = (sCr[s]+sCr[s+hw]+1)>>1; const cb = (sCb[s]+sCb[s+hw]+1)>>1; dCr[d] = (dCr[d]+cr+1)>>1; dCb[d] = (dCb[d]+cb+1)>>1; } }
+    } else {
+      for (let row = 0; row < cChromaRows; row++) { let s = cSrcBase + row*hw, d = cDestBase + row*hw; for (let col = 0; col < 8; col++, s++, d++) { const cr = sCr[s]; const cb = sCb[s]; dCr[d] = (dCr[d]+cr+1)>>1; dCb[d] = (dCb[d]+cb+1)>>1; } }
     }
   }
 
@@ -1802,7 +1849,7 @@ export class Mpeg2Decoder {
 // Two-pass row/column IDCT. The row pass reads `src` and writes `dst`; the column pass operates
 // in place on `dst` (reading the row-pass results). Keeping `src` untouched lets the caller clear
 // only the sparse coefficient positions afterward instead of zeroing all 64 entries.
-function idct(src: Int32Array, dst: Int32Array): void {
+export function idct(src: Int32Array, dst: Int32Array): void {
   let b1: number, b3: number, b4: number, b6: number, b7: number, tmp1: number, tmp2: number, m0: number;
   let x0: number, x1: number, x2: number, x3: number, x4: number, y3: number, y4: number, y5: number, y6: number, y7: number;
 

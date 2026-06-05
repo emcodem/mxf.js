@@ -10,6 +10,7 @@
   ],
   "scripts": {
     "dev": "vite",
+    "asbuild": "asc asm/kernels.ts -o asm/build/kernels.wasm -t asm/build/kernels.wat --runtime stub -O3 --noAssert",
     "build": "vite build && vite build --config vite.worker.config.ts",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -20,6 +21,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "assemblyscript": "^0.28.18",
     "puppeteer": "^24.43.1",
     "tslib": "^2.6.3",
     "typescript": "^5.5.2",
