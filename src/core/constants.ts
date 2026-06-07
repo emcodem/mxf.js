@@ -87,12 +87,20 @@ export const RESUME_BUFFER_SECONDS = CHUNK_DURATION_SECONDS + 0.5;
 // ── Scrub preview (demux-worker.ts) ──────────────────────────────────────────
 /** Max cached scrub-preview segments (LRU, keyed by GOP-head keyframe edit unit). */
 export const SCRUB_CACHE_MAX = 128;
-/** Contiguous lookahead decoded at a scrub-preview keyframe so a paused <video> paints.
- *  Kept short (0.2 s) because each MPEG-2 preview frame costs ~32 ms to decode+encode; the old 0.4 s
- *  (11 frames at 25 fps) was conservative. 0.2 s (6 frames) is enough for Chrome to settle a paused
- *  seek, halving per-preview decode time (~220 ms → ~4.5 new-GOP previews/s vs the old ~2.4/s).
- *  If a particular browser won't paint this little, raise to 0.3 s. MIN_LOOKAHEAD_FRAMES (= 4)
- *  is the fps-independent floor and is unchanged. */
+/** Contiguous lookahead decoded at a scrub-preview keyframe so a paused <video> paints — TRANSCODE
+ *  path (MPEG-2 / wasm plugin). Kept short (0.2 s) because each transcoded preview frame costs
+ *  ~32 ms to decode+encode; the old 0.4 s (11 frames at 25 fps) was conservative. 0.2 s (6 frames)
+ *  is enough for Chrome to settle a paused seek on the HD sources this path serves, halving
+ *  per-preview decode time (~220 ms → ~4.5 new-GOP previews/s vs the old ~2.4/s). MIN_LOOKAHEAD_FRAMES
+ *  (= 4) is the fps-independent floor and is unchanged. */
 export const SCRUB_PREVIEW_LOOKAHEAD_SECONDS = 0.2;
+/** Contiguous lookahead for the REMUX path (H.264 / AVC-Intra — no decode, just repackage).
+ *  Must be LONGER: a high-bitrate UHD all-intra source (e.g. AVC-Intra Class 300, 3840×2160p50)
+ *  will NOT let a paused <video> paint a seek into a 0.2 s isolated range — Chrome holds at
+ *  readyState HAVE_METADATA and never fires 'seeked', so scrub frames never update. Empirically
+ *  ~0.2 s fails and ~1.0 s settles reliably at 4K; 1.0 s is used because remux is cheap (no decode,
+ *  the per-preview cost is just bytes read + repackaged) so the extra frames don't slow the pump.
+ *  For HD the same 1.0 s is small in bytes (~5 MB) and harmless. */
+export const SCRUB_PREVIEW_LOOKAHEAD_SECONDS_REMUX = 1.0;
 /** Floor on the lookahead frame count (independent of frame rate). */
 export const SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES = 4;

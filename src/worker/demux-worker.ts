@@ -29,6 +29,7 @@ import { WasmFfmpegDecoder } from '../codec/wasm-ffmpeg-decoder.js';
 import { ensureKernels } from '../codec/wasm/kernels.js';
 import {
   SCRUB_PREVIEW_LOOKAHEAD_SECONDS,
+  SCRUB_PREVIEW_LOOKAHEAD_SECONDS_REMUX,
   SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES,
 } from '../core/constants.js';
 
@@ -897,12 +898,15 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
   // Fetch a small CONTIGUOUS run of real frames starting AT the keyframe (the player renders the
   // keyframe, not the mid-GOP target — standard keyframe-granularity scrub). A paused <video> paints
   // a seek into a contiguous multi-frame region (exactly why scrubbing the already-buffered area
-  // works) but will NOT settle on a lone stretched sample. SCRUB_PREVIEW_LOOKAHEAD_SECONDS of
-  // contiguous future data is enough to paint, while keeping the per-preview decode small — critical
-  // for MPEG-2, where decoding a whole GOP+lookahead per preview saturated the worker so nothing
-  // painted. Constant per keyframe (independent of target) so it stays cacheable.
+  // works) but will NOT settle on a lone stretched sample, NOR on too short an isolated run: a
+  // high-bitrate UHD all-intra source holds at readyState HAVE_METADATA on a 0.2 s range and never
+  // paints. So the REMUX path (no decode — cheap to extend) uses a longer lookahead; the TRANSCODE
+  // path (MPEG-2/wasm, decode-bound, HD) keeps the short one so the per-preview decode stays small
+  // (decoding a whole GOP+lookahead per preview saturated the worker so nothing painted). Constant
+  // per keyframe (independent of target) so it stays cacheable.
   const fps = storedEditRateNumerator / storedEditRateDenominator;
-  const runFrames = 1 + Math.max(SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES, Math.round(fps * SCRUB_PREVIEW_LOOKAHEAD_SECONDS));
+  const lookaheadSeconds = transcodePipeline ? SCRUB_PREVIEW_LOOKAHEAD_SECONDS : SCRUB_PREVIEW_LOOKAHEAD_SECONDS_REMUX;
+  const runFrames = 1 + Math.max(SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES, Math.round(fps * lookaheadSeconds));
 
   // Seek part (mirrors handleSeek): supersede in-flight work and reset the decoder to the keyframe.
   // Storage-base labelling (useDisplayBase=false): a scrub preview is throwaway and only needs the
