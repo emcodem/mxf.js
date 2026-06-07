@@ -1462,7 +1462,7 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       // ---- chroma ----
       // 4:2:2 → 8 wide × 8 field lines, horizontal MV halved, vertical unchanged.
       // 4:2:0 → 8 wide × 4 field lines, both MV components halved.
-      const cmvh = mvh >> 1;
+      const cmvh = mvh < 0 ? -(-mvh >> 1) : (mvh >> 1); // trunc-div, not floor (MPEG-2 spec §7.6.3.1)
       const cmvv = is422 ? mvv : ((mvv / 2) | 0);
       const cFieldRows = is422 ? 8 : 4;
       const cMbRowOrigin = is422 ? (this.mbRow << 3) : (this.mbRow << 2); // field-line origin
@@ -1603,7 +1603,7 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
     scan = width - 8;
 
     if (this.chromaFormat === 2) {
-      const chromaMvH = motionH >> 1;
+      const chromaMvH = motionH < 0 ? -(-motionH >> 1) : (motionH >> 1); // trunc-div, not floor
       const cH = chromaMvH >> 1;
       const cV = motionV >> 1;
       const cOddH = (chromaMvH & 1) === 1;
@@ -1624,8 +1624,8 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       return;
     }
 
-    const chromaMvH420 = motionH >> 1;
-    const chromaMvV420 = motionV >> 1;
+    const chromaMvH420 = motionH < 0 ? -(-motionH >> 1) : (motionH >> 1); // trunc-div, not floor
+    const chromaMvV420 = motionV < 0 ? -(-motionV >> 1) : (motionV >> 1);
     H = chromaMvH420 >> 1;
     V = chromaMvV420 >> 1;
     oddH = (chromaMvH420 & 1) === 1;
@@ -1719,9 +1719,12 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
     const hw = this.halfWidth;
     let cFH: number; let cFV: number; let cOddH: boolean; let cOddV: boolean; let cRowBase: number; let cChromaRows: number;
     if (this.chromaFormat === 2) {
-      const bwdChH = bwdH >> 1; cFH = bwdChH >> 1; cFV = bwdV >> 1; cOddH = (bwdChH & 1) === 1; cOddV = (bwdV & 1) === 1; cRowBase = this.mbRow << 4; cChromaRows = 16;
+      const bwdChH = bwdH < 0 ? -(-bwdH >> 1) : (bwdH >> 1); // trunc-div, not floor
+      cFH = bwdChH >> 1; cFV = bwdV >> 1; cOddH = (bwdChH & 1) === 1; cOddV = (bwdV & 1) === 1; cRowBase = this.mbRow << 4; cChromaRows = 16;
     } else {
-      const bwdChH4 = bwdH >> 1; const bwdChV4 = bwdV >> 1; cFH = bwdChH4 >> 1; cFV = bwdChV4 >> 1; cOddH = (bwdChH4 & 1) === 1; cOddV = (bwdChV4 & 1) === 1; cRowBase = this.mbRow << 3; cChromaRows = 8;
+      const bwdChH4 = bwdH < 0 ? -(-bwdH >> 1) : (bwdH >> 1); // trunc-div, not floor
+      const bwdChV4 = bwdV < 0 ? -(-bwdV >> 1) : (bwdV >> 1);
+      cFH = bwdChH4 >> 1; cFV = bwdChV4 >> 1; cOddH = (bwdChH4 & 1) === 1; cOddV = (bwdChV4 & 1) === 1; cRowBase = this.mbRow << 3; cChromaRows = 8;
     }
     const cColBase = this.mbCol << 3;
     const cSrcBase = (cRowBase + cFV) * hw + cColBase + cFH;
