@@ -655,16 +655,13 @@ async function handleFetchSegment(
         // fill the cache for the next drag. All real posting is skipped.
         if (seg && !cacheOnly) {
           if (workerDebug) console.log('[worker] videoSegment', seg.length, 'bytes,', chunks.length, 'chunks, first chunk keyframe:', chunks[0]?.isKeyframe, 'first chunk editUnit:', chunks[0] ? Number(chunks[0].editUnit) : -1, keyframePreview ? `(keyframe preview, stretch ${stretchToFrames}f)` : '');
-          // The decoder's display reorder isn't tracked per-frame here, so emit a single base anchor:
-          // the earliest source TC (displays first in a forward GOP) at the first displayed edit unit.
-          // Exact for continuous timecode; best-effort across a mid-segment jump (next segment re-anchors).
-          let tcAnchors: TimecodeAnchor[] | undefined;
-          const tcs = videoFrames.map(f => f.systemTimecode).filter((t): t is Timecode => !!t);
-          if (tcs.length > 0 && chunks.length > 0) {
-            let ref = tcs[0], minFc = timecodeToFrameCount(tcs[0]);
-            for (const t of tcs) { const fc = timecodeToFrameCount(t); if (fc < minFc) { minFc = fc; ref = t; } }
-            tcAnchors = [{ editUnit: Number(chunks[0].editUnit), frameCount: minFc, base: ref.base, dropFrame: ref.dropFrame }];
-          }
+          // Anchor by videoFrames storage editUnit (same approach as the XAVC-L path): detects
+          // timecode discontinuities (jumps) within the segment, including single-frame outliers.
+          // For XDCAM HD (MXF stores in display order), storage editUnit == presentation editUnit,
+          // so anchors map exactly. For B-frame files where storage ≠ display order, any jump lands
+          // within the reorder distance — the same best-effort the XAVC-L path accepts.
+          const built = buildTcAnchors(videoFrames.map(f => ({ editUnit: Number(f.editUnit), tc: f.systemTimecode })));
+          const tcAnchors: TimecodeAnchor[] | undefined = built.length ? built : undefined;
           post(
             { type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: startFrame, systemTcAnchors: tcAnchors },
             [seg.buffer],
