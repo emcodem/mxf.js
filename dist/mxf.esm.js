@@ -568,14 +568,20 @@ class G extends y {
   /**
    * Resolve the timecode bundle for the frame at `timeSeconds` and emit `timecode` on change. Fed by
    * both rVFC (mediaTime, exact) and timeupdate (currentTime, fallback); deduped by edit unit so the
-   * two never double-emit. The edit unit is `round(time × fps)` — exact for any rendered frame
-   * because every fMP4 sample timestamp is edit-unit-derived.
+   * two never double-emit.
+   *
+   * The edit unit is `floor(time × fps)`, NOT round: a <video> presents the frame whose presentation
+   * interval [N/fps, (N+1)/fps) contains the current time, i.e. frame `floor(time × fps)`. When the
+   * playhead lands mid-frame (a seek to an arbitrary currentTime, e.g. 4.900 s at 25 fps = frame
+   * 122.5), `round` would jump to 123 while the element still shows 122 — so the timecode read a
+   * frame ahead of the picture. `floor` ties the timecode to the frame actually on screen; the small
+   * epsilon absorbs float error so an exactly-aligned rVFC mediaTime (N/fps) doesn't fall to N−1.
    */
   updateTimecode(e) {
     if (!this.manifest) return;
     const t = this.editRateNumerator / this.editRateDenominator;
     if (!(t > 0)) return;
-    const s = Math.max(0, Math.round(e * t));
+    const s = Math.max(0, Math.floor(e * t + 1e-6));
     if (s === this.lastTimecodeEditUnit) return;
     this.lastTimecodeEditUnit = s;
     const i = this.computeTimecodeBundle(s);

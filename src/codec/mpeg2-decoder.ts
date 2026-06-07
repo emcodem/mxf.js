@@ -19,6 +19,10 @@ export interface YUVFrame {
   height: number;
   chromaFormat: number;   // 1 = 4:2:0, 2 = 4:2:2
   isKeyframe: boolean;
+  /** picture_header temporal_reference of the source picture (display order within its GOP). The I at
+   *  a GOP head displays at gopStartStorageEU + temporalReference, which the transcode pipeline uses to
+   *  label post-seek frames with their true presentation edit unit. */
+  temporalReference: number;
 }
 
 /**
@@ -628,6 +632,11 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
 
   // picture state
   private pictureType = 0;
+  // Display-reorder temporal_reference (see YUVFrame.temporalReference). `cur*` is the value of the
+  // picture currently being decoded; `held*` is the value of the I/P held back as the reorder anchor
+  // (emitted later, when the next I/P arrives or on flush).
+  private curTempRef = 0;
+  private heldTempRef = 0;
   private hasHeldAnchor = false;
   // Type of the frame currently held back as the display-reorder anchor (the I/P in forwardY).
   // Tracked separately because at emit time `pictureType` is the NEXT picture being decoded, so it
@@ -711,7 +720,7 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
   flush(): void {
     if (this.hasHeldAnchor) {
       if (!this.suppressUntilKeyframe || this.heldAnchorIsKeyframe) {
-        this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr, this.heldAnchorIsKeyframe);
+        this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr, this.heldAnchorIsKeyframe, this.heldTempRef);
         if (this.heldAnchorIsKeyframe) this.suppressUntilKeyframe = false;
       }
       this.hasHeldAnchor = false;
@@ -890,7 +899,9 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
   // -------------------------------------------------------------------------
 
   private decodePicture(): void {
-    this.bits.skip(10); // temporal_reference
+    // temporal_reference gives this picture's display position within its GOP; captured so the emitted
+    // frame (and the held anchor) carry it for presentation-edit-unit labelling of post-seek frames.
+    this.curTempRef = this.bits.read(10);
     this.pictureType = this.bits.read(3);
     this.bits.skip(16); // vbv_delay
 
@@ -943,12 +954,13 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
         // is the random-access keyframe.
         const key = this.heldAnchorIsKeyframe;
         if (!this.suppressUntilKeyframe || key) {
-          this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr, key);
+          this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr, key, this.heldTempRef);
           if (key) this.suppressUntilKeyframe = false;
         }
       }
       this.hasHeldAnchor = true;
       this.heldAnchorIsKeyframe = this.pictureType === PICTURE_TYPE.INTRA; // the frame now held
+      this.heldTempRef = this.curTempRef;     // temporal_reference of the picture now held as the anchor
       // Rotate buffers: current → forward, forward → backward, backward → current
       let tmp = this.backwardY; let tmp32 = this.backwardY32;
       this.backwardY = this.forwardY; this.backwardY32 = this.forwardY32;
@@ -968,12 +980,15 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       // B-frame: emit immediately, no rotation — unless still suppressing leading B's after a reset
       // (those reference a previous GOP we no longer have).
       if (!this.suppressUntilKeyframe) {
-        this.emitFrame(this.currentY, this.currentCb, this.currentCr, false);
+        this.emitFrame(this.currentY, this.currentCb, this.currentCr, false, this.curTempRef);
       }
     }
   }
 
-  private emitFrame(y: Uint8ClampedArray, cb: Uint8ClampedArray, cr: Uint8ClampedArray, isKeyframe: boolean): void {
+  private emitFrame(
+    y: Uint8ClampedArray, cb: Uint8ClampedArray, cr: Uint8ClampedArray, isKeyframe: boolean,
+    temporalReference: number,
+  ): void {
     this.onFrame({
       y, cb, cr,
       codedWidth: this.codedWidth,
@@ -982,6 +997,7 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       height: this.height,
       chromaFormat: this.chromaFormat,
       isKeyframe,
+      temporalReference,
     });
   }
 

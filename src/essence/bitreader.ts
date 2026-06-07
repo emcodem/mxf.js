@@ -60,6 +60,56 @@ export class BitReader {
 }
 
 /**
+ * Minimal MSB-first bit writer, the inverse of {@link BitReader}. Used to rewrite an SPS RBSP
+ * (e.g. inject frame_cropping). Bits accumulate MSB-first; {@link toBytes} flushes the final
+ * partial byte with trailing zero bits, matching RBSP byte alignment.
+ */
+export class BitWriter {
+  private readonly bytes: number[] = [];
+  private cur = 0;
+  private nbits = 0;
+
+  /** Write a single bit (u(1)). */
+  u1(bit: number): void {
+    this.cur = (this.cur << 1) | (bit & 1);
+    if (++this.nbits === 8) {
+      this.bytes.push(this.cur);
+      this.cur = 0;
+      this.nbits = 0;
+    }
+  }
+
+  /** Write `n` bits of `val`, big-endian (u(n)). */
+  u(val: number, n: number): void {
+    for (let i = n - 1; i >= 0; i--) this.u1((val >>> i) & 1);
+  }
+
+  /** Write an unsigned Exp-Golomb value (ue(v)). */
+  ue(val: number): void {
+    const code = val + 1;
+    let len = 0;
+    for (let t = code; t > 0; t >>>= 1) len++;
+    for (let i = 0; i < len - 1; i++) this.u1(0); // leading zeros
+    for (let i = len - 1; i >= 0; i--) this.u1((code >>> i) & 1);
+  }
+
+  /** Copy `count` raw bits starting at bit offset `from` of `src` (MSB-first). */
+  copyBits(src: Uint8Array, from: number, count: number): void {
+    for (let i = 0; i < count; i++) {
+      const p = from + i;
+      this.u1((src[p >> 3] >> (7 - (p & 7))) & 1);
+    }
+  }
+
+  /** Flush to bytes; any partial final byte is zero-padded on the right. */
+  toBytes(): Uint8Array {
+    const out = this.bytes.slice();
+    if (this.nbits !== 0) out.push((this.cur << (8 - this.nbits)) & 0xff);
+    return new Uint8Array(out);
+  }
+}
+
+/**
  * Remove H.264 emulation-prevention bytes from a NAL payload: any 0x03 that follows two 0x00 bytes
  * (the `00 00 03` → `00 00` rule) is dropped, yielding the raw byte sequence payload (RBSP).
  *

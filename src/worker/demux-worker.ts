@@ -115,7 +115,9 @@ function post(event: WorkerEvent, transferables: Transferable[] = []): void {
  * Compress per-frame System Item timecodes into the minimal set of anchors: keep the first, then
  * keep only frames whose timecode breaks linear continuation from the previous kept anchor (a
  * "jump", or a base/drop-frame change). A continuous segment → one anchor; the player interpolates
- * the rest. `pairs` are (presentation edit unit, timecode) — undefined timecodes are dropped.
+ * the rest. `pairs` are (content-package/storage edit unit, timecode) — the System Item TC counts
+ * linearly per content package, so the player's nearest-anchor + offset reconstructs it at any
+ * presentation query (see the call sites). Undefined timecodes are dropped.
  */
 function buildTcAnchors(pairs: { editUnit: number; tc?: Timecode }[]): TimecodeAnchor[] {
   const sorted = pairs.filter(p => p.tc).sort((a, b) => a.editUnit - b.editUnit);
@@ -611,9 +613,10 @@ async function handleFetchSegment(
     // MPEG-2 → H.264 transcode
     // -----------------------------------------------------------------------
     if (transcodePipeline) {
-      // Speculative cache-fill jobs carry the keyframe they should decode from (the primary preview
-      // already ran and left the decoder positioned elsewhere); reset to that frame before decoding.
-      if (resetToFrame !== undefined) transcodePipeline.reset(resetToFrame);
+      // Speculative cache-fill jobs carry the keyframe (storage EU) they should decode from (the
+      // primary preview already ran and left the decoder positioned elsewhere). Storage-base labelling
+      // (useDisplayBase=false) matches the scrub preview path it fills the cache for.
+      if (resetToFrame !== undefined) transcodePipeline.reset(resetToFrame, false);
 
       if (videoFrames.length > 0) {
         const pipeline = transcodePipeline;
@@ -655,11 +658,15 @@ async function handleFetchSegment(
         // fill the cache for the next drag. All real posting is skipped.
         if (seg && !cacheOnly) {
           if (workerDebug) console.log('[worker] videoSegment', seg.length, 'bytes,', chunks.length, 'chunks, first chunk keyframe:', chunks[0]?.isKeyframe, 'first chunk editUnit:', chunks[0] ? Number(chunks[0].editUnit) : -1, keyframePreview ? `(keyframe preview, stretch ${stretchToFrames}f)` : '');
-          // Anchor by videoFrames storage editUnit (same approach as the XAVC-L path): detects
-          // timecode discontinuities (jumps) within the segment, including single-frame outliers.
-          // For XDCAM HD (MXF stores in display order), storage editUnit == presentation editUnit,
-          // so anchors map exactly. For B-frame files where storage ≠ display order, any jump lands
-          // within the reorder distance — the same best-effort the XAVC-L path accepts.
+          // System Item timecode anchors, keyed by the content-package (STORAGE) edit unit — NOT the
+          // picture's presentation slot. The System Item TC is presentation-timeline metadata: it
+          // counts linearly per content package (verified monotonic on this file: cp118=…04:18,
+          // cp119=…04:19, …), independent of the coded picture that shares the package. Carrying it
+          // through the decoder's B-frame reorder (decode ≠ display order) scrambles it; keying by
+          // storage edit unit keeps the run linear (→ ~1 anchor/segment) and the player's
+          // nearest-anchor + offset reconstructs base+editUnit at any presentation query. Exact for
+          // continuous TC; a genuine TC jump lands within the reorder distance of its frame — the same
+          // best-effort the XAVC-L path accepts. (See src/parser/CLAUDE.md.)
           const built = buildTcAnchors(videoFrames.map(f => ({ editUnit: Number(f.editUnit), tc: f.systemTimecode })));
           const tcAnchors: TimecodeAnchor[] | undefined = built.length ? built : undefined;
           post(
@@ -796,8 +803,10 @@ async function handleFetchSegment(
       if (!isScrubPreview && !cacheOnly) post({ type: 'segmentDone' });
     }
   } finally {
-    // Always answer a scrub preview, even when superseded (gen mismatch returns above) or errored,
-    // so the player's single-flight pump can fire the next preview at the latest dragged position.
+    // Always answer a scrub preview, even when superseded (gen mismatch returns above) or errored, so
+    // the player's single-flight pump can fire the next preview at the latest dragged position. The
+    // scrub path labels chunks from the keyframe's storage EU (useDisplayBase=false), so the playhead
+    // seeks onto that same edit unit.
     if (isScrubPreview) post({ type: 'previewDone', seq: previewSeq!, editUnit: startFrame });
   }
 }
@@ -845,8 +854,11 @@ function handleSeek(targetFrame: number): void {
       : gopLengthFromKeyframe(bootstrap.indexSegments, BigInt(nearestKeyframe));
   }
 
-  // Resets the decoder's references + resumes the edit-unit counter from the keyframe (no-op for
-  // the H.264 path, where there is no pipeline and the counter is unused).
+  // Resets the decoder's references + resumes the edit-unit counter at the keyframe (STORAGE edit
+  // unit). useDisplayBase=true (default): the pipeline relabels the random-access I to its true
+  // PRESENTATION edit unit (storage + the I's temporal_reference, read at decode) and counts display
+  // order from there — so the post-seek playhead lands on the right picture even though Long-GOP
+  // stores in decode order. No-op for the H.264 path (no pipeline; resolveReorder handles its reorder).
   transcodePipeline?.reset(nearestKeyframe);
   // The next fetch is the first of a new GOP run: drop open-GOP leading B's so the keyframe lands first.
   longGopBoundaryPending = true;
@@ -893,8 +905,10 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
   const runFrames = 1 + Math.max(SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES, Math.round(fps * SCRUB_PREVIEW_LOOKAHEAD_SECONDS));
 
   // Seek part (mirrors handleSeek): supersede in-flight work and reset the decoder to the keyframe.
+  // Storage-base labelling (useDisplayBase=false): a scrub preview is throwaway and only needs the
+  // chunks + previewDone to share one base; the accurate settle on release lands the exact frame.
   fetchQ.supersede();
-  transcodePipeline?.reset(keyframe);
+  transcodePipeline?.reset(keyframe, false);
   // This preview run starts a fresh GOP: drop open-GOP leading B's so the keyframe paints first.
   longGopBoundaryPending = true;
 

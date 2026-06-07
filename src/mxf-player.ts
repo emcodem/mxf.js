@@ -230,14 +230,20 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   /**
    * Resolve the timecode bundle for the frame at `timeSeconds` and emit `timecode` on change. Fed by
    * both rVFC (mediaTime, exact) and timeupdate (currentTime, fallback); deduped by edit unit so the
-   * two never double-emit. The edit unit is `round(time × fps)` — exact for any rendered frame
-   * because every fMP4 sample timestamp is edit-unit-derived.
+   * two never double-emit.
+   *
+   * The edit unit is `floor(time × fps)`, NOT round: a <video> presents the frame whose presentation
+   * interval [N/fps, (N+1)/fps) contains the current time, i.e. frame `floor(time × fps)`. When the
+   * playhead lands mid-frame (a seek to an arbitrary currentTime, e.g. 4.900 s at 25 fps = frame
+   * 122.5), `round` would jump to 123 while the element still shows 122 — so the timecode read a
+   * frame ahead of the picture. `floor` ties the timecode to the frame actually on screen; the small
+   * epsilon absorbs float error so an exactly-aligned rVFC mediaTime (N/fps) doesn't fall to N−1.
    */
   private updateTimecode(timeSeconds: number): void {
     if (!this.manifest) return;
     const fps = this.editRateNumerator / this.editRateDenominator;
     if (!(fps > 0)) return;
-    const editUnit = Math.max(0, Math.round(timeSeconds * fps));
+    const editUnit = Math.max(0, Math.floor(timeSeconds * fps + 1e-6));
     if (editUnit === this.lastTimecodeEditUnit) return;
     this.lastTimecodeEditUnit = editUnit;
     const bundle = this.computeTimecodeBundle(editUnit);

@@ -111,14 +111,18 @@ export class Mp4Fragmenter {
           // first keyframe; surface that it couldn't rather than guessing.
           throw new Error('Cannot build H.264 init segment: SPS/PPS unavailable (extraction from the first keyframe failed)');
         }
-        codecBox = avc1(w, h, this.spsNALUs, this.ppsNALUs, paspBox);
+        // Declare the active (display) dimensions in the avc1 box and track header. For the transcode
+        // path these differ from the coded size (e.g. 1080 vs 1088) and the SPS now carries a matching
+        // frame_cropping (see addSpsFrameCropping), so the player renders the active picture only. For
+        // native H.264 there are no separate display dims, so dispW/dispH fall back to the coded dims.
+        codecBox = avc1(dispW, dispH, this.spsNALUs, this.ppsNALUs, paspBox);
       } else {
-        codecBox = mp4v(w, h, paspBox);
+        codecBox = mp4v(dispW, dispH, paspBox);
       }
 
       const videoStbl = stbl(stsd(codecBox));
       const videomdia = mdia(videoTimescale, durationTicks, 'vide', vmhd(), videoStbl);
-      const videoTkhd = tkhd(VIDEO_TRACK_ID, durationTicks, w, h, true);
+      const videoTkhd = tkhd(VIDEO_TRACK_ID, durationTicks, dispW, dispH, true);
       tracks.push(trak(videoTkhd, videomdia));
     }
 

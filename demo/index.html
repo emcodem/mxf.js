@@ -440,6 +440,11 @@
           `Audio: ${sd?.codec ?? 'unknown'} ${sd?.sampleRate}Hz ${sd?.channelCount}ch`;
         log(`Manifest loaded: ${data.duration.toFixed(2)}s, ${data.tracks.length} tracks`);
         seekBar.max = data.duration;
+        // Frame-granular slider: one native step (incl. a click-then-arrow on the focused thumb) =
+        // exactly one frame, so dragging/stepping lands on frame boundaries instead of 0.1 s (2.5
+        // frames). The player snaps the displayed frame to floor(time·fps) regardless, but this keeps
+        // the slider value itself frame-aligned.
+        if (fps > 0) seekBar.step = 1 / fps;
         timeDur.textContent = fmt(data.duration);
         playback.style.display = 'flex';
         playBtn.disabled = false;
@@ -665,9 +670,13 @@
     }
 
     document.addEventListener('keydown', (e) => {
-      // Don't hijack keys while typing in the URL/latency/bandwidth inputs.
+      // Don't hijack keys while typing in the URL/latency/bandwidth inputs. EXCEPTION: the transport
+      // arrow keys (frame-step / ±10s) must still work when the seek bar (an <input type=range>) has
+      // focus — otherwise the browser's native range step hijacks them (stepping by the slider's 0.1 s
+      // step = 2.5 frames at 25 fps, skipping frames). The switch below preventDefaults them.
       const tag = (e.target.tagName || '').toUpperCase();
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) return;
+      const onSeekBar = e.target === seekBar && e.key.startsWith('Arrow');
+      if (!onSeekBar && (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable)) return;
       if (!player || playBtn.disabled) return;
       if (e.ctrlKey || e.metaKey || e.altKey) return;
 

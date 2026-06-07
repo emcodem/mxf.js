@@ -113,7 +113,10 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
     return `avc1.${p}${c}${l}`;
   }
 
-  reset(toFrame: number): void {
+  // `useDisplayBase` is accepted for interface parity with the JS pipeline but unused: the wasm decoder
+  // reorders internally and does not expose per-picture temporal_reference, so it cannot relabel to the
+  // keyframe's true presentation edit unit. Seek labelling stays storage-based for this path.
+  reset(toFrame: number, _useDisplayBase = true): void {
     this.editUnitCounter = BigInt(toFrame);
     this.firstFrameOfSegment = true;
     this.suppressUntilKey = true;

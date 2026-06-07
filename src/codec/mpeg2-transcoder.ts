@@ -1,4 +1,5 @@
 import type { YUVFrame } from './mpeg2-decoder.js';
+import { addSpsFrameCropping } from '../essence/avc-tools.js';
 
 export interface TranscodedChunk {
   data: ArrayBuffer;   // H.264 AVCC format
@@ -90,7 +91,14 @@ export class Mpeg2Transcoder {
             // and constraint_set1 (bit 6), which are valid for Baseline/Main Profile.
             const sps = result.sps.slice();
             sps[2] = sps[2] & 0xc0;
-            this._spspps = { sps, pps: result.pps };
+            // Chrome's VideoEncoder never emits frame_cropping even when displayHeight < codedHeight
+            // (e.g. 1080 vs the MB-padded 1088). Without it the player renders the padded bottom rows
+            // (the MPEG-2 encoder edge-replicates the last line there → a smeared bottom MB row).
+            // Inject the crop so the SPS's natural size matches the display dims declared in avc1/tkhd.
+            const cropped = addSpsFrameCropping(
+              sps, this.codedWidth, this.codedHeight, this.displayWidth, this.displayHeight,
+            );
+            this._spspps = { sps: cropped ?? sps, pps: result.pps };
             this._codecStr = metadata.decoderConfig.codec ?? null;
           }
         }
