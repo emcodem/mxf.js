@@ -778,14 +778,23 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
     // a sequence header without custom matrices correctly reverts to defaults.
     this.intraQuantMatrix = DEFAULT_INTRA_QUANT_MATRIX;
     this.nonIntraQuantMatrix = DEFAULT_NON_INTRA_QUANT_MATRIX;
+    // Chroma matrices default to the luma matrices. The sequence header carries no
+    // separate chroma matrix (only quant_matrix_extension does), so chroma MUST follow
+    // luma here. Omitting this leaves chroma on a stale/default matrix while luma uses a
+    // custom one — e.g. XDCAM HD422 loads a custom intra matrix in the sequence header,
+    // which produced texture-correlated chroma-only errors (luma perfect, chroma wrong).
+    this.chromaIntraQuantMatrix = DEFAULT_INTRA_QUANT_MATRIX;
+    this.chromaNonIntraQuantMatrix = DEFAULT_NON_INTRA_QUANT_MATRIX;
 
     if (this.bits.read(1)) { // custom intra quant matrix
       for (let i = 0; i < 64; i++) this.customIntraQuantMatrix[ZIG_ZAG[i]] = this.bits.read(8);
       this.intraQuantMatrix = this.customIntraQuantMatrix;
+      this.chromaIntraQuantMatrix = this.customIntraQuantMatrix; // default chroma follows luma
     }
     if (this.bits.read(1)) { // custom non-intra quant matrix
       for (let i = 0; i < 64; i++) this.customNonIntraQuantMatrix[ZIG_ZAG[i]] = this.bits.read(8);
       this.nonIntraQuantMatrix = this.customNonIntraQuantMatrix;
+      this.chromaNonIntraQuantMatrix = this.customNonIntraQuantMatrix; // default chroma follows luma
     }
 
     const nextCode = this.bits.findNextStartCode();
@@ -1437,7 +1446,7 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       // ---- chroma ----
       // 4:2:2 → 8 wide × 8 field lines, horizontal MV halved, vertical unchanged.
       // 4:2:0 → 8 wide × 4 field lines, both MV components halved.
-      const cmvh = (mvh / 2) | 0;
+      const cmvh = mvh >> 1;
       const cmvv = is422 ? mvv : ((mvv / 2) | 0);
       const cFieldRows = is422 ? 8 : 4;
       const cMbRowOrigin = is422 ? (this.mbRow << 3) : (this.mbRow << 2); // field-line origin
@@ -1578,9 +1587,10 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
     scan = width - 8;
 
     if (this.chromaFormat === 2) {
-      const cH = (motionH / 2) >> 1;
+      const chromaMvH = motionH >> 1;
+      const cH = chromaMvH >> 1;
       const cV = motionV >> 1;
-      const cOddH = ((motionH / 2) & 1) === 1;
+      const cOddH = (chromaMvH & 1) === 1;
       const cOddV = (motionV & 1) === 1;
       let cSrc = ((this.mbRow << 4) + cV) * width + (this.mbCol << 3) + cH;
       let cDest = (this.mbRow << 4) * width + (this.mbCol << 3);
@@ -1598,10 +1608,12 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       return;
     }
 
-    H = (motionH / 2) >> 1;
-    V = (motionV / 2) >> 1;
-    oddH = ((motionH / 2) & 1) === 1;
-    oddV = ((motionV / 2) & 1) === 1;
+    const chromaMvH420 = motionH >> 1;
+    const chromaMvV420 = motionV >> 1;
+    H = chromaMvH420 >> 1;
+    V = chromaMvV420 >> 1;
+    oddH = (chromaMvH420 & 1) === 1;
+    oddV = (chromaMvV420 & 1) === 1;
 
     src  = ((this.mbRow << 3) + V) * width + (this.mbCol << 3) + H;
     dest = (this.mbRow * width + this.mbCol) << 1;
@@ -1691,9 +1703,9 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
     const hw = this.halfWidth;
     let cFH: number; let cFV: number; let cOddH: boolean; let cOddV: boolean; let cRowBase: number; let cChromaRows: number;
     if (this.chromaFormat === 2) {
-      cFH = (bwdH / 2) >> 1; cFV = bwdV >> 1; cOddH = ((bwdH / 2) & 1) === 1; cOddV = (bwdV & 1) === 1; cRowBase = this.mbRow << 4; cChromaRows = 16;
+      const bwdChH = bwdH >> 1; cFH = bwdChH >> 1; cFV = bwdV >> 1; cOddH = (bwdChH & 1) === 1; cOddV = (bwdV & 1) === 1; cRowBase = this.mbRow << 4; cChromaRows = 16;
     } else {
-      cFH = (bwdH/2) >> 1; cFV = (bwdV/2) >> 1; cOddH = ((bwdH/2) & 1) === 1; cOddV = ((bwdV/2) & 1) === 1; cRowBase = this.mbRow << 3; cChromaRows = 8;
+      const bwdChH4 = bwdH >> 1; const bwdChV4 = bwdV >> 1; cFH = bwdChH4 >> 1; cFV = bwdChV4 >> 1; cOddH = (bwdChH4 & 1) === 1; cOddV = (bwdChV4 & 1) === 1; cRowBase = this.mbRow << 3; cChromaRows = 8;
     }
     const cColBase = this.mbCol << 3;
     const cSrcBase = (cRowBase + cFV) * hw + cColBase + cFH;
@@ -1841,11 +1853,18 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       const hw = this.halfWidth;
       destArray = ((block & 1) === 0) ? this.currentCb : this.currentCr;
       if (this.chromaFormat === 2) {
-        // 4:2:2 chroma blocks stay frame-organized even in a field-DCT macroblock:
-        // block 4/5 = top 8 lines, block 6/7 = bottom 8 lines.
+        // 4:2:2 chroma has TWO blocks per component (16 lines), so field DCT applies to
+        // chroma too (ISO 13818-2 6.1.3, Fig 6-14) — unlike 4:2:0 where the single 8-line
+        // chroma block is always frame-organized. In a field-DCT MB the first chroma block
+        // (4/5) is the top field, the second (6/7) the bottom field, interleaved line-by-line.
         const cmbBase = ((this.mbRow << 4) * hw) + (this.mbCol << 3);
-        scan = hw - 8;
-        destIndex = cmbBase + ((block < 6) ? 0 : (hw << 3));
+        if (fieldDct) {
+          scan = (hw << 1) - 8;
+          destIndex = cmbBase + ((block < 6) ? 0 : hw);
+        } else {
+          scan = hw - 8;
+          destIndex = cmbBase + ((block < 6) ? 0 : (hw << 3));
+        }
       } else {
         scan = hw - 8;
         destIndex = ((this.mbRow * this.codedWidth) << 2) + (this.mbCol << 3);
