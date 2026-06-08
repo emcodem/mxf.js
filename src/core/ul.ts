@@ -50,6 +50,21 @@ export function ulStartsWith(key: Uint8Array, prefix: Uint8Array): boolean {
   return true;
 }
 
+/**
+ * Match a PictureEssenceCoding UL against a prefix, ignoring byte 7 (the SMPTE
+ * item-designator / registry-version byte, which varies across spec revisions while
+ * the remainder uniquely identifies the codec). Use 0x7f as the placeholder at
+ * position 7 in the prefix array — it is never compared.
+ */
+export function ulMatchEssenceCodingPrefix(ul: Uint8Array, prefix: Uint8Array): boolean {
+  if (ul.length < prefix.length) return false;
+  for (let i = 0; i < prefix.length; i++) {
+    if (i === 7) continue;
+    if (ul[i] !== prefix[i]) return false;
+  }
+  return true;
+}
+
 function ul(...bytes: number[]): Uint8Array {
   return new Uint8Array(bytes);
 }
