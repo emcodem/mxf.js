@@ -29,8 +29,6 @@ export const FOOTER_INDEX_MAX = 64 * 1024 * 1024;
 export const HEADER_METADATA_MIN_READ = 1024 * 1024;
 /** Header-metadata read when headerByteCount is absent/zero. */
 export const HEADER_METADATA_FALLBACK_READ = 2 * 1024 * 1024;
-/** Window scanned from a partition pack to find where the essence container actually starts. */
-export const ESSENCE_SCAN_WINDOW = 1024 * 1024;
 /** Upper bound on a single per-partition index-segment read in collectMultiPartitionIndex. A KLV
  *  declares its own length, but a corrupt/garbage BER length must not trigger a huge read — an index
  *  segment is ~11 bytes/frame, so 100 MB covers ~9M frames per partition, far beyond any real file
