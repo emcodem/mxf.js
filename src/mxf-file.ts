@@ -6,7 +6,6 @@ import { parseHeaderMetadata, MxfMetadata } from './parser/metadata.js';
 import { parseIndexTableSegment, IndexTableSegment, classifyIndexMode } from './parser/index-table.js';
 import {
   isPartitionPack,
-  isPrimerPack,
   isIndexTableSegment,
   isGenericContainerElement,
   ulEquals,
@@ -189,10 +188,14 @@ export class MxfFile {
       const pkt = iter.next();
       if (!pkt) break;
 
-      // Stop if we accidentally hit another partition pack
-      if (isPrimerPack(pkt.key)) {
-        primer = parsePrimerPack(metaBuf, pkt);
-        metadataStart = iter.offset; // metadata sets begin right after the primer
+      // Detect Primer Pack by invariant tail bytes [8..15] = 0D 01 02 01 01 05 01 00,
+      // regardless of byte 5 (0x53 spec-conformant, 0x05 non-conformant). Context-safe:
+      // Footer Open Pack shares these bytes but cannot precede header metadata sets.
+      const k = pkt.key;
+      if (k[8] === 0x0d && k[9] === 0x01 && k[10] === 0x02 && k[11] === 0x01
+       && k[12] === 0x01 && k[13] === 0x05 && k[14] === 0x01 && k[15] === 0x00) {
+        try { primer = parsePrimerPack(metaBuf, pkt); } catch { /* non-conformant — keep empty primer */ }
+        metadataStart = iter.offset;
         continue;
       }
 
