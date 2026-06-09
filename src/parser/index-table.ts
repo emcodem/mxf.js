@@ -134,6 +134,7 @@ export interface EntryMeta {
 }
 
 const predictionFlagCache = new WeakMap<IndexTableSegment, boolean>();
+const smpteRaFlagCache    = new WeakMap<IndexTableSegment, boolean>();
 
 /**
  * Whether a segment populates the MPEG picture-coding "prediction" bits (flags & 0x30). ffmpeg-style
@@ -150,14 +151,39 @@ export function segUsesPredictionFlags(seg: IndexTableSegment): boolean {
 }
 
 /**
- * Auto-detecting keyframe predicate for a VBE index entry. If the segment populates the prediction
- * bits (see {@link segUsesPredictionFlags}) a keyframe is one whose picture-coding bits are clear
- * (`(flags & 0x30) === 0`, i.e. intra-coded); otherwise the legacy random-access test
- * (`(flags & 0x80) === 0`) is used. This is the predicate the long-GOP path resolves through; the
- * MPEG-2 / XAVC-Intra sites keep their original `(flags & 0x80) === 0` test untouched.
+ * Whether a segment uses the SMPTE 377M RandomAccess convention: bit 7 = 1 marks an I-frame
+ * (random-access point). This is the inverse of the legacy convention used by some MXF writers
+ * (bit 7 = 0 = keyframe). Detected by checking that the first entry has bit 7 set — index
+ * segments normally begin on an I-frame, so the convention is unambiguous without scanning all
+ * entries. Only applied when no prediction bits (0x30) are present (which selects the ffmpeg path).
+ * Memoized per segment.
+ */
+function segUsesSmpteRandomAccessFlags(seg: IndexTableSegment): boolean {
+  let cached = smpteRaFlagCache.get(seg);
+  if (cached === undefined) {
+    if (seg.entries.length === 0) {
+      cached = false;
+    } else {
+      const first = seg.entries[0];
+      cached = (first.flags & 0x80) !== 0 && !seg.entries.some(e => (e.flags & 0x30) !== 0);
+    }
+    smpteRaFlagCache.set(seg, cached);
+  }
+  return cached;
+}
+
+/**
+ * Auto-detecting keyframe predicate for a VBE index entry. Three-way detection:
+ * 1. If the segment has ffmpeg-style prediction bits (0x30), a keyframe has those bits clear.
+ * 2. If the segment uses the SMPTE 377M RandomAccess convention (first entry bit 7 = 1), a
+ *    keyframe has bit 7 set (`(flags & 0x80) !== 0`).
+ * 3. Otherwise the legacy convention is assumed: bit 7 = 0 = keyframe (`(flags & 0x80) === 0`).
+ * This is the predicate the long-GOP path resolves through; the MPEG-2 / XAVC-Intra sites keep
+ * their original `(flags & 0x80) === 0` test untouched.
  */
 export function isKeyframeEntry(seg: IndexTableSegment, entry: IndexEntry): boolean {
-  if (segUsesPredictionFlags(seg)) return (entry.flags & 0x30) === 0;
+  if (segUsesPredictionFlags(seg))      return (entry.flags & 0x30) === 0;
+  if (segUsesSmpteRandomAccessFlags(seg)) return (entry.flags & 0x80) !== 0;
   return (entry.flags & 0x80) === 0;
 }
 
@@ -388,7 +414,7 @@ export function resolveFrameOffset(
 
   if (entryIdx >= seg.entries.length) return null;
   const entry = seg.entries[entryIdx];
-  const isKeyframe = (entry.flags & 0x80) === 0; // flag bit 7 set means NOT a keyframe in some variants
+  const isKeyframe = isKeyframeEntry(seg, entry);
   const nearestIdx = entryIdx + entry.keyFrameOffset;
   const nearestEU = seg.indexStartPosition + BigInt(nearestIdx);
   const kfEntry = seg.entries[nearestIdx] ?? entry;
@@ -422,7 +448,7 @@ export function gopLengthFromKeyframe(
 
   const startIdx = Number(keyframeEditUnit - seg.indexStartPosition);
   for (let i = startIdx + 1; i < seg.entries.length; i++) {
-    if ((seg.entries[i].flags & 0x80) === 0) return i - startIdx;
+    if (isKeyframeEntry(seg, seg.entries[i])) return i - startIdx;
   }
   // No further keyframe in this segment: hold to the end of the segment.
   return Math.max(1, seg.entries.length - startIdx);
@@ -457,7 +483,7 @@ export function resolveExactFrameOffset(
   const entry = seg.entries[entryIdx];
   return {
     byteOffset: essenceContainerStart + entry.streamOffset,
-    isKeyframe: (entry.flags & 0x80) === 0,
+    isKeyframe: isKeyframeEntry(seg, entry),
     nearestKeyframeEditUnit: editUnit,
   };
 }
