@@ -29,7 +29,7 @@ class R {
     this.listeners.clear();
   }
 }
-const y = 1, E = 0.5, A = 3, D = 6, N = y + 0.5;
+const y = 1, E = 0.5, D = 3, A = 6, N = y + 0.5;
 class v extends R {
   constructor(e, i = !1) {
     super(), this.mediaSource = null, this.objectURL = null, this.sourceBuffers = /* @__PURE__ */ new Map(), this.queues = /* @__PURE__ */ new Map(), this.processing = /* @__PURE__ */ new Map(), this.video = e, this.debug = i;
@@ -70,7 +70,7 @@ class v extends R {
    * enough to remove.
    */
   trimBackBuffer(e) {
-    const i = e - D;
+    const i = e - A;
     if (!(i <= 0))
       for (const [t, s] of this.sourceBuffers) {
         if (s.buffered.length === 0) continue;
@@ -471,10 +471,10 @@ const P = 40, I = 0.25, $ = 0.08, U = 2, W = 30, l = class l {
     const c = i.createBuffer(2, a, r), m = (u, g) => {
       if (g.length !== 0)
         for (let p = 0; p < a; p++) {
-          let x = 0;
+          let b = 0;
           const w = p * s;
-          for (const B of g) x += t[w + B];
-          u[p] = x;
+          for (const B of g) b += t[w + B];
+          u[p] = b;
         }
     };
     m(c.getChannelData(0), d), m(c.getChannelData(1), h);
@@ -567,7 +567,7 @@ l.DIAG_CAP = 512, l.DIAG_WINDOW = 3;
 let k = l;
 class q {
   constructor(e, i, t, s) {
-    this.video = e, this.requestPreview = i, this.settle = t, this.resume = s, this.active = !1, this.cycle = 0, this.latestFrame = null, this.seq = 0, this.watchdog = null, this.wasPlaying = !1, this.suppressSeeking = !1, this.hasStream = !1, this.duration = 0, this.editRateNumerator = 25, this.editRateDenominator = 1;
+    this.video = e, this.requestPreview = i, this.settle = t, this.resume = s, this.active = !1, this.cycle = 0, this.latestFrame = null, this.seq = 0, this.watchdog = null, this.wasPlaying = !1, this.suppressSeeking = !1, this.hasStream = !1, this.duration = 0, this.maxSeekTime = 0, this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
   /** True while a scrub is in progress (beginScrub→endScrub). */
   get isActive() {
@@ -576,6 +576,8 @@ class q {
   /** Record stream parameters once the manifest arrives (enables scrubTo/endScrub). */
   setStream(e, i, t) {
     this.hasStream = !0, this.duration = e, this.editRateNumerator = i, this.editRateDenominator = t;
+    const s = i / t, r = Math.round(e * s);
+    this.maxSeekTime = Math.max(0, (r - 1) / s);
   }
   /**
    * If the next 'seeking' event was caused by us moving currentTime (preview render / settle),
@@ -597,7 +599,7 @@ class q {
    */
   scrubTo(e) {
     if (!this.hasStream || !this.active) return;
-    const i = Math.max(0, Math.min(e, this.duration));
+    const i = Math.max(0, Math.min(e, this.maxSeekTime));
     this.latestFrame = Math.round(i * this.editRateNumerator / this.editRateDenominator), this.pump();
   }
   /**
@@ -607,7 +609,7 @@ class q {
    */
   endScrub(e) {
     if (!this.active || (this.active = !1, this.latestFrame = null, this.cycle = 0, this.clearWatchdog(), !this.hasStream)) return;
-    const i = Math.max(0, Math.min(e ?? this.video.currentTime, this.duration));
+    const i = Math.max(0, Math.min(e ?? this.video.currentTime, this.maxSeekTime));
     this.suppressSeeking = i !== this.video.currentTime, this.video.currentTime = i, this.settle(i), this.wasPlaying && this.resume();
   }
   /**
@@ -653,7 +655,7 @@ class q {
 function S(o) {
   return (o < 10 ? "0" : "") + o;
 }
-function b(o, e) {
+function x(o, e) {
   return e && (o === 30 || o === 60);
 }
 function T(o) {
@@ -663,16 +665,16 @@ function V(o) {
   const e = o.base;
   if (e <= 0) return 0;
   let i = ((o.hours * 60 + o.minutes) * 60 + o.seconds) * e + o.frames;
-  if (b(e, o.dropFrame)) {
+  if (x(e, o.dropFrame)) {
     const t = T(e), s = o.hours * 60 + o.minutes;
     i -= t * (s - Math.floor(s / 10));
   }
   return i;
 }
-function C(o, e, i) {
+function F(o, e, i) {
   if (e <= 0) return { hours: 0, minutes: 0, seconds: 0, frames: 0, dropFrame: !1, base: e };
   let t = o < 0 ? 0 : Math.floor(o);
-  const s = b(e, i);
+  const s = x(e, i);
   if (s) {
     const h = T(e), c = e * 600 - h * 9, m = e * 60 - h, f = Math.floor(t / c), u = t % c;
     t += h * 9 * f + (u > h ? h * Math.floor((u - h) / m) : 0);
@@ -680,8 +682,8 @@ function C(o, e, i) {
   const r = t % e, a = Math.floor(t / e) % 60, n = Math.floor(t / (e * 60)) % 60;
   return { hours: Math.floor(t / (e * 3600)) % 24, minutes: n, seconds: a, frames: r, dropFrame: s, base: e };
 }
-function F(o) {
-  const e = b(o.base, o.dropFrame) ? ";" : ":";
+function C(o) {
+  const e = x(o.base, o.dropFrame) ? ";" : ":";
   return `${S(o.hours)}:${S(o.minutes)}:${S(o.seconds)}${e}${S(o.frames)}`;
 }
 function G(o, e = 0) {
@@ -760,7 +762,7 @@ class _ extends R {
       s.editUnit <= e && (!i || s.editUnit > i.editUnit) && (i = s);
     if (!i) return null;
     const t = i.frameCount + (e - i.editUnit);
-    return F(C(t, i.base, i.dropFrame));
+    return C(F(t, i.base, i.dropFrame));
   }
   /** Build the full timecode bundle (system + computed package TCs) for a rendered edit unit. */
   computeTimecodeBundle(e) {
@@ -769,7 +771,7 @@ class _ extends R {
     t !== null && i.push({ source: "system", text: t, reliable: !0 });
     const s = ((d = this.manifest) == null ? void 0 : d.indexMode) !== "none", r = this.editRateNumerator / this.editRateDenominator;
     for (const h of this.manifestTimecodes) {
-      const c = h.editRateDenominator > 0 ? h.editRateNumerator / h.editRateDenominator : r, m = r > 0 ? Math.round(e * (c / r)) : e, f = F(C(h.position + m, h.base, h.dropFrame));
+      const c = h.editRateDenominator > 0 ? h.editRateNumerator / h.editRateDenominator : r, m = r > 0 ? Math.round(e * (c / r)) : e, f = C(F(h.position + m, h.base, h.dropFrame));
       i.push({ source: h.source, text: f, reliable: s });
     }
     const a = { system: 0, material: 1, source: 2, file: 3 };
@@ -797,6 +799,16 @@ class _ extends R {
   get duration() {
     var e;
     return ((e = this.manifest) == null ? void 0 : e.duration) ?? 0;
+  }
+  /** Time (seconds) of the LAST displayable frame. `duration` is the END of that frame, so a seek to
+   *  `duration` resolves to frame index `totalFrames` — one PAST the last valid frame (`totalFrames-1`).
+   *  The worker can't decode a frame there and the element paints nothing (it clamps the playhead back
+   *  to the buffered end → "no picture change" at the very end of the clip). Seek/scrub targets clamp
+   *  to this instead so the end of the timeline lands on the real final frame. */
+  get lastFrameTime() {
+    if (!this.manifest) return 0;
+    const e = this.editRateNumerator / this.editRateDenominator, i = Math.round(this.manifest.duration * e);
+    return Math.max(0, (i - 1) / e);
   }
   get paused() {
     return this.video.paused;
@@ -838,7 +850,7 @@ class _ extends R {
   /** Seek to a time in seconds. The <video> 'seeking' event drives the worker fetch. */
   seek(e) {
     if (!this.manifest) return;
-    const i = Math.max(0, Math.min(e, this.manifest.duration));
+    const i = Math.max(0, Math.min(e, this.lastFrameTime));
     this.video.currentTime = i;
   }
   /**
@@ -997,7 +1009,7 @@ class _ extends R {
     const i = e.pictureDescriptor, t = e.soundDescriptor;
     this.editRateNumerator = e.editRateNumerator, this.editRateDenominator = e.editRateDenominator, this.audio.setEditRate(e.editRateNumerator, e.editRateDenominator), this.scrub.setStream(e.duration, e.editRateNumerator, e.editRateDenominator);
     const s = e.editRateNumerator / e.editRateDenominator;
-    this.framesPerChunk = Math.ceil(s * y), this.rampChunkFrames = Math.max(A, Math.ceil(s * E)), this.startupGating = !0, this.manifestTimecodes = e.timecodes ?? [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.manifest = {
+    this.framesPerChunk = Math.ceil(s * y), this.rampChunkFrames = Math.max(D, Math.ceil(s * E)), this.startupGating = !0, this.manifestTimecodes = e.timecodes ?? [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.manifest = {
       duration: e.duration,
       editRateNumerator: e.editRateNumerator,
       editRateDenominator: e.editRateDenominator,
@@ -1102,11 +1114,16 @@ class _ extends R {
   }
   initiateSeek(e, i) {
     if (!this.manifest) return;
-    this.fetchPending = !0, this.startupGating = !0, this.video.paused || (this.video.pause(), this.setBuffering(!0)), this.activeSeekMode = i, this.previewParked = !1, this.bufferFull = !1, this.seekTargetFrame = Math.round(
-      e * this.editRateNumerator / this.editRateDenominator
-    ), this.pendingSeeks++, this.audio.onSeek();
-    const t = { type: "seek", targetFrame: this.seekTargetFrame };
-    this.worker.postMessage(t);
+    this.fetchPending = !0, this.startupGating = !0, this.video.paused || (this.video.pause(), this.setBuffering(!0)), this.activeSeekMode = i, this.previewParked = !1, this.bufferFull = !1;
+    const t = Math.round(
+      this.manifest.duration * this.editRateNumerator / this.editRateDenominator
+    );
+    this.seekTargetFrame = Math.max(0, Math.min(
+      Math.round(e * this.editRateNumerator / this.editRateDenominator),
+      t - 1
+    )), this.pendingSeeks++, this.audio.onSeek();
+    const s = { type: "seek", targetFrame: this.seekTargetFrame };
+    this.worker.postMessage(s);
   }
   onTimeUpdate() {
     var t, s, r;
@@ -1185,8 +1202,8 @@ class _ extends R {
 export {
   _ as MxfPlayer,
   G as decodeSmpte12mBcd,
-  F as formatTimecode,
-  C as frameCountToTimecode,
+  C as formatTimecode,
+  F as frameCountToTimecode,
   V as timecodeToFrameCount
 };
 //# sourceMappingURL=mxf.esm.js.map

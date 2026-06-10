@@ -312,6 +312,18 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     return this.manifest?.duration ?? 0;
   }
 
+  /** Time (seconds) of the LAST displayable frame. `duration` is the END of that frame, so a seek to
+   *  `duration` resolves to frame index `totalFrames` — one PAST the last valid frame (`totalFrames-1`).
+   *  The worker can't decode a frame there and the element paints nothing (it clamps the playhead back
+   *  to the buffered end → "no picture change" at the very end of the clip). Seek/scrub targets clamp
+   *  to this instead so the end of the timeline lands on the real final frame. */
+  get lastFrameTime(): number {
+    if (!this.manifest) return 0;
+    const fps = this.editRateNumerator / this.editRateDenominator;
+    const totalFrames = Math.round(this.manifest.duration * fps);
+    return Math.max(0, (totalFrames - 1) / fps);
+  }
+
   get paused(): boolean {
     return this.video.paused;
   }
@@ -377,7 +389,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   /** Seek to a time in seconds. The <video> 'seeking' event drives the worker fetch. */
   seek(timeSeconds: number): void {
     if (!this.manifest) return;
-    const clamped = Math.max(0, Math.min(timeSeconds, this.manifest.duration));
+    const clamped = Math.max(0, Math.min(timeSeconds, this.lastFrameTime));
     this.video.currentTime = clamped;
   }
 
@@ -853,9 +865,16 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // applies — clear it so the post-seek fetch isn't blocked (otherwise a seek can stall forever).
     this.bufferFull = false;
 
-    this.seekTargetFrame = Math.round(
-      targetTime * this.editRateNumerator / this.editRateDenominator
+    // Clamp to a real frame: a target at/after `duration` rounds to `totalFrames` (one past the last
+    // frame), which the worker can't decode — the seek then resolves to nothing and the element shows
+    // no picture. totalFrames-1 is the last displayable frame.
+    const totalFrames = Math.round(
+      this.manifest.duration * this.editRateNumerator / this.editRateDenominator
     );
+    this.seekTargetFrame = Math.max(0, Math.min(
+      Math.round(targetTime * this.editRateNumerator / this.editRateDenominator),
+      totalFrames - 1,
+    ));
     this.pendingSeeks++;
 
     // Stop audio scheduled for the old position and drop the anchor so the scheduler re-locks to the

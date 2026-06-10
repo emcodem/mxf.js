@@ -813,7 +813,9 @@
       if (seeking) return;       // a slider drag owns the scrub session — ignore keyboard skip
       resetSpeed();              // cancel any J/L fast motion
       const base = kbScrubbing ? kbScrubTarget : player.currentTime;
-      kbScrubTarget = Math.max(0, Math.min(base + delta, player.duration));
+      // Clamp to the last real frame, not duration (= end of that frame): a target at duration lands
+      // one frame past EOF and paints nothing, leaving the thumb short of the end. See lastFrameTime.
+      kbScrubTarget = Math.max(0, Math.min(base + delta, player.lastFrameTime));
       if (!kbScrubbing) { kbScrubbing = true; player.beginScrub(); }
       seekBar.value = kbScrubTarget;          // thumb follows the accumulated target, not the preview
       timeCur.textContent = fmt(kbScrubTarget);

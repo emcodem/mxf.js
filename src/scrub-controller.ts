@@ -38,6 +38,7 @@ export class ScrubController {
 
   private hasStream = false;
   private duration = 0;
+  private maxSeekTime = 0;   // time of the last displayable frame (see setStream); seek targets clamp here
   private editRateNumerator = 25;
   private editRateDenominator = 1;
 
@@ -62,6 +63,12 @@ export class ScrubController {
     this.duration = duration;
     this.editRateNumerator = editRateNumerator;
     this.editRateDenominator = editRateDenominator;
+    // `duration` is the END of the last frame; clamping targets to it lands on frame `totalFrames`,
+    // one past the last decodable frame (totalFrames-1), which paints nothing. Clamp to the last
+    // frame's start time instead so scrubbing/skipping to the end settles on the real final picture.
+    const fps = editRateNumerator / editRateDenominator;
+    const totalFrames = Math.round(duration * fps);
+    this.maxSeekTime = Math.max(0, (totalFrames - 1) / fps);
   }
 
   /**
@@ -91,7 +98,7 @@ export class ScrubController {
    */
   scrubTo(timeSeconds: number): void {
     if (!this.hasStream || !this.active) return;
-    const clamped = Math.max(0, Math.min(timeSeconds, this.duration));
+    const clamped = Math.max(0, Math.min(timeSeconds, this.maxSeekTime));
     this.latestFrame = Math.round(clamped * this.editRateNumerator / this.editRateDenominator);
     this.pump();
   }
@@ -108,7 +115,7 @@ export class ScrubController {
     this.cycle = Cycle.Idle;
     this.clearWatchdog();
     if (!this.hasStream) return;
-    const target = Math.max(0, Math.min(timeSeconds ?? this.video.currentTime, this.duration));
+    const target = Math.max(0, Math.min(timeSeconds ?? this.video.currentTime, this.maxSeekTime));
     // Move the playhead to the released position ourselves and suppress the resulting 'seeking'
     // event so it isn't double-handled — the accurate settle is driven explicitly below.
     this.suppressSeeking = target !== this.video.currentTime;
