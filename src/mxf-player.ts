@@ -367,7 +367,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.playIntent = false;
     this.video.pause();
     this.audio.onSeek();   // stop audio at once — the playhead is frozen
-    this.audio.suspend();
+    // Deliberately NOT suspending the AudioContext: the scheduler already goes silent while the element
+    // is paused (tick gates on !paused, and onSeek stopped the live sources). suspend()/resume() are
+    // async and race on rapid pause/play, which left the context briefly suspended → audio dropouts.
+    // Keeping it running (idle-silent) makes resume instant and glitch-free.
     this.setBuffering(false);
   }
 

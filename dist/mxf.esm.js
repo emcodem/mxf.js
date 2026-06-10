@@ -255,10 +255,12 @@ class W {
   /**
    * Choose which source channels are played (0-based). Selected channels are mixed to stereo by
    * selection-order parity (1st→L, 2nd→R, 3rd→L…); a single channel plays centre; empty mutes.
-   * Takes effect on the next tick (≤TICK_MS) by re-mixing the in-flight lookahead.
+   * Re-mixes the in-flight lookahead immediately so the change is effectively instant.
    */
   setActiveChannels(e) {
-    this.active = [...new Set(e.filter((t) => Number.isInteger(t) && t >= 0))].sort((t, s) => t - s), this.stopSources(), this.runId++;
+    this.active = [...new Set(e.filter((s) => Number.isInteger(s) && s >= 0))].sort((s, i) => s - i), this.stopSources(), this.runId++;
+    const t = this.video;
+    this.anchored && this.cxt && !t.paused && !t.seeking && Math.abs(t.playbackRate - 1) <= 0.01 && this.pump(t.currentTime);
   }
   /**
    * Record a (descriptor- or stream-derived) channel count, clamp the active selection to it, and
@@ -698,7 +700,7 @@ class _ extends y {
     this.previewParked && this.manifest && this.initiateSeek(this.video.currentTime, "accurate"), this.playIntent = !0, this.startupGating = !0, this.audio.resume(), this.maybeResumePlayback();
   }
   pause() {
-    this.playIntent = !1, this.video.pause(), this.audio.onSeek(), this.audio.suspend(), this.setBuffering(!1);
+    this.playIntent = !1, this.video.pause(), this.audio.onSeek(), this.setBuffering(!1);
   }
   /** Seek to a time in seconds. The <video> 'seeking' event drives the worker fetch. */
   seek(e) {

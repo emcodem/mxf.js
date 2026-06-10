@@ -131,14 +131,21 @@ export class WebAudioController {
   /**
    * Choose which source channels are played (0-based). Selected channels are mixed to stereo by
    * selection-order parity (1st→L, 2nd→R, 3rd→L…); a single channel plays centre; empty mutes.
-   * Takes effect on the next tick (≤TICK_MS) by re-mixing the in-flight lookahead.
+   * Re-mixes the in-flight lookahead immediately so the change is effectively instant.
    */
   setActiveChannels(channels: number[]): void {
     this.active = [...new Set(channels.filter(c => Number.isInteger(c) && c >= 0))].sort((a, b) => a - b);
-    // Re-mix already-scheduled audio: stop the live sources and bump the run so the next tick reschedules
-    // the lookahead with the new selection (anchor unchanged → no resync, just a re-mix of ~LOOKAHEAD s).
+    // Re-mix already-scheduled audio with the new selection: stop the live sources and bump the run so
+    // chunks reschedule (anchor unchanged → no resync, just a re-mix of ~LOOKAHEAD s). Re-pump NOW
+    // instead of waiting up to TICK_MS for the next tick — that wait left the output silent between the
+    // stop and the reschedule, an audible dropout on every channel toggle. The reschedule restarts the
+    // chunk straddling the playhead at the current offset, so it's seamless. Only when actively playing
+    // and anchored; paused/seeking/fast-motion is left for the next tick to re-lock as usual.
     this.stopSources();
     this.runId++;
+    const v = this.video;
+    if (this.anchored && this.cxt && !v.paused && !v.seeking && Math.abs(v.playbackRate - 1) <= 0.01)
+      this.pump(v.currentTime);
   }
 
   /**
