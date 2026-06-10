@@ -69,6 +69,25 @@
     #debugLog.hide-EVT  .cat-EVT,
     #debugLog.hide-VID  .cat-VID,
     #debugLog.hide-MSG  .cat-MSG { display: none; }
+
+    /* ─── VU METER ──────────────────────────────────────────────────────────────────────────────
+       Per-channel level meter that sits above each channel checkbox. The fill grows from the bottom
+       and its height encodes the level (−60…0 dBFS). The colour scale is anchored to the TRACK, not
+       the fill: green up to the −18 dBFS line (70 % of the 48 px track), red above it. The fill's
+       gradient is sized to the full track height (background-size 100% 48px, anchored bottom-left),
+       so whatever slice of it the fill exposes lines up with the absolute scale. A muted (unselected)
+       channel ignores the colour scale and renders flat grey. 70 % MUST equal (−18−(−60))/(0−(−60)).
+       JS counterpart lives in the matching `--- VU METER ---` script block. */
+    .vu-channel { display: inline-flex; flex-direction: column; align-items: center; gap: 4px;
+                  margin-right: 10px; vertical-align: bottom; }
+    .vu-meter   { position: relative; width: 10px; height: 48px; background: #1c1c1c;
+                  border: 1px solid #333; border-radius: 2px; overflow: hidden; }
+    .vu-fill    { position: absolute; left: 0; right: 0; bottom: 0; height: 0%;
+                  background: linear-gradient(to top, #19c37d 0%, #19c37d 70%, #ff4d4d 70%, #ff4d4d 100%);
+                  background-size: 100% 48px; background-position: left bottom; background-repeat: no-repeat;
+                  transition: height 0.05s linear; }
+    .vu-fill.muted { background: #6a6a6a; }
+    /* ─── END VU METER ──────────────────────────────────────────────────────────────────────── */
   </style>
 </head>
 <body>
@@ -119,6 +138,8 @@
 
   <div id="audioChannels" style="display:none; margin:8px 0; font:13px/1.6 system-ui,sans-serif;">
     <span style="color:#666">Audio channels:</span>
+    <label style="display:inline-flex; align-items:center; gap:4px; margin-right:14px; vertical-align:bottom;">
+      <input type="checkbox" id="channelAll"> all</label>
     <span id="channelBoxes"></span>
   </div>
 
@@ -158,6 +179,7 @@
     const TC_LABEL = { system: 'SYS', material: 'MP', source: 'SP', file: 'FP' };
     const audioChannelsEl = document.getElementById('audioChannels');
     const channelBoxesEl  = document.getElementById('channelBoxes');
+    const channelAllEl    = document.getElementById('channelAll');
     const bufferingOverlay = document.getElementById('bufferingOverlay');
     let player = null;
     let seeking = false;
@@ -366,27 +388,144 @@
     // events. Completely inert (no globals set) during normal use.
     const E2E = new URLSearchParams(location.search).has('e2e');
 
+    // ─── VU METER ───────────────────────────────────────────────────────────────────────────────
+    // Per-channel audio level meters drawn above the channel checkboxes. Levels come from the
+    // player's `pcm-audio` event, which carries the full interleaved PCM for ALL source channels —
+    // regardless of which are routed to the stereo mix — so every channel, played or muted, shows
+    // its true signal.
+    //
+    // The meters are PLAYHEAD-SYNCED, not arrival-synced: pcm-audio arrives ahead of playback (the
+    // player buffers a look-ahead), so we retain recent chunks time-addressed by media time and,
+    // each animation frame, measure the level at video.currentTime — i.e. the audio you're actually
+    // hearing. A peak detector with instant attack + per-frame decay gives the classic VU bounce.
+    // Active (checked) channels render on the green→red scale (red above −18 dBFS); unselected ones
+    // render flat grey. The colours/geometry live in the matching `--- VU METER ---` CSS block.
+    const vu = (() => {
+      const FLOOR_DB  = -60;   // bottom of the scale
+      const WINDOW_MS = 30;    // level = peak |sample| over this window ending at the playhead
+      const DECAY     = 0.85;  // per-frame fall-off (attack is instant)
+      // NOTE: the green→red split (−18 dBFS) is the literal 70% stop in the .vu-fill CSS gradient,
+      // which equals (−18 − FLOOR_DB) / (0 − FLOOR_DB). Keep the two in sync if FLOOR_DB changes.
+
+      const chunks = [];       // retained PCM: { start, end, samples, ch, rate } (media-time addressed)
+      let bars = [];           // per channel index: { fill, checkbox, level }
+      let raf = null;
+
+      const dbToPct = (db) => Math.max(0, Math.min(1, (db - FLOOR_DB) / (0 - FLOOR_DB))) * 100;
+
+      // The single chunk whose media-time span contains t (chunks are short, a linear scan is cheap).
+      function chunkAt(t) {
+        for (const c of chunks) if (t >= c.start && t < c.end) return c;
+        return null;
+      }
+
+      function frame() {
+        if (!bars.length) { raf = null; return; }
+        raf = requestAnimationFrame(frame);
+        const t = video.currentTime;
+        // Only meter while genuinely playing at the playhead — same gate the audio controller uses
+        // (paused/seeking, and rate≠1 during J/L fast motion mutes audio). Otherwise decay to floor.
+        const audible = !video.paused && !video.seeking && Math.abs(video.playbackRate - 1) <= 0.01;
+        const c = audible ? chunkAt(t) : null;
+        let endIdx = 0, win = 0;
+        if (c) {
+          const spc = Math.floor(c.samples.length / c.ch);
+          endIdx = Math.min(spc, Math.round((t - c.start) * c.rate));
+          win = Math.round((WINDOW_MS / 1000) * c.rate);
+        }
+        for (let ch = 0; ch < bars.length; ch++) {
+          const b = bars[ch];
+          let peak = 0;
+          if (c && ch < c.ch) {
+            for (let i = Math.max(0, endIdx - win); i < endIdx; i++) {
+              const v = Math.abs(c.samples[i * c.ch + ch]);
+              if (v > peak) peak = v;
+            }
+          }
+          b.level = Math.max(peak, b.level * DECAY);   // instant attack, smooth decay
+          const db = b.level > 1e-5 ? 20 * Math.log10(b.level) : FLOOR_DB;
+          b.fill.style.height = dbToPct(db).toFixed(1) + '%';
+          b.fill.classList.toggle('muted', !b.checkbox.checked);  // unselected → grey
+        }
+      }
+
+      return {
+        // Forget all chunks/bars (new file or rebuilt selector) and stop the render loop.
+        reset() { chunks.length = 0; bars = []; if (raf) { cancelAnimationFrame(raf); raf = null; } },
+
+        // Build + return a meter element for channel `ch`, registering its fill for the render loop.
+        bar(ch, checkbox) {
+          const meter = document.createElement('span');
+          meter.className = 'vu-meter';
+          const fill = document.createElement('span');
+          fill.className = 'vu-fill';
+          meter.appendChild(fill);
+          bars[ch] = { fill, checkbox, level: 0 };
+          if (!raf) raf = requestAnimationFrame(frame);
+          return meter;
+        },
+
+        // Retain a decoded PCM chunk addressed by its media time, then bound memory by dropping
+        // chunks well behind / far ahead of the playhead (orphans from look-ahead and abandoned seeks).
+        feed({ samples, sampleRate, channelCount, editUnit }) {
+          if (!fps || !channelCount || !samples?.length) return;
+          const start = editUnit / fps;   // same edit-rate mapping the player uses for audio
+          const spc = Math.floor(samples.length / channelCount);
+          chunks.push({ start, end: start + spc / sampleRate, samples, ch: channelCount, rate: sampleRate });
+          const t = video.currentTime;
+          for (let i = chunks.length - 1; i >= 0; i--)
+            if (chunks[i].end < t - 2 || chunks[i].start > t + 30) chunks.splice(i, 1);
+        },
+      };
+    })();
+    // ─── END VU METER ─────────────────────────────────────────────────────────────────────────
+
+    // Push the current checkbox selection to the player. Shared by the per-channel boxes and the
+    // "all" master so the player only ever sees the one source of truth (the checked boxes).
+    function applyChannelSelection() {
+      const sel = [...channelBoxesEl.querySelectorAll('input:checked')].map(c => parseInt(c.value, 10));
+      player?.setAudioChannels(sel);
+      log(`Audio channels → ${sel.map(c => c + 1).join(', ') || 'none (muted)'}`);
+    }
+
+    // Reflect the per-channel state on the "all" master: checked when every channel is on, unchecked
+    // when none, indeterminate (the dash) when mixed.
+    function syncSelectAll() {
+      const boxes = [...channelBoxesEl.querySelectorAll('input')];
+      const on = boxes.filter(c => c.checked).length;
+      channelAllEl.checked = boxes.length > 0 && on === boxes.length;
+      channelAllEl.indeterminate = on > 0 && on < boxes.length;
+    }
+
+    // Master toggle (wired once — the per-channel boxes are rebuilt per file, this element isn't):
+    // force every channel to the master state, push once, then re-sync to clear indeterminate.
+    channelAllEl.addEventListener('change', () => {
+      channelBoxesEl.querySelectorAll('input').forEach(c => { c.checked = channelAllEl.checked; });
+      applyChannelSelection();
+      syncSelectAll();
+    });
+
     // Build one checkbox per source audio channel. Checked channels are played (mixed to stereo);
     // default is the first pair (1 + 2). Any change pushes the new selection to the player.
     function buildChannelSelector(channelCount, activeChannels) {
       channelBoxesEl.innerHTML = '';
+      vu.reset();   // --- VU METER --- drop stale chunks/bars before re-registering them below
       const active = new Set(activeChannels);
       for (let i = 0; i < channelCount; i++) {
         const label = document.createElement('label');
-        label.style.marginRight = '10px';
+        label.className = 'vu-channel';   // --- VU METER --- column layout: meter stacked over checkbox
         const cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.value = String(i);
         cb.checked = active.has(i);
-        cb.addEventListener('change', () => {
-          const sel = [...channelBoxesEl.querySelectorAll('input:checked')].map(c => parseInt(c.value, 10));
-          player?.setAudioChannels(sel);
-          log(`Audio channels → ${sel.map(c => c + 1).join(', ') || 'none (muted)'}`);
-        });
-        label.append(cb, ` ${i + 1}`);
+        cb.addEventListener('change', () => { applyChannelSelection(); syncSelectAll(); });
+        const num = document.createElement('span');
+        num.textContent = String(i + 1);
+        label.append(vu.bar(i, cb), cb, num);   // --- VU METER --- meter element sits above the checkbox
         channelBoxesEl.appendChild(label);
       }
       audioChannelsEl.style.display = channelCount > 0 ? 'block' : 'none';
+      syncSelectAll();   // initialise the "all" master from the freshly-built default selection
     }
 
     function fmt(s) {
@@ -417,6 +556,7 @@
       playback.style.display = 'none';
       audioChannelsEl.style.display = 'none';
       channelBoxesEl.innerHTML = '';
+      vu.reset();   // --- VU METER --- tear down meters/chunks from the previous file
       playBtn.disabled = true;
       seekBar.value = 0;
       timeCur.textContent = '0:00';
@@ -498,6 +638,9 @@
         log(`Audio: ${channelCount} channel(s); playing ${activeChannels.map(c => c + 1).join(', ')}`);
         buildChannelSelector(channelCount, activeChannels);
       });
+
+      // --- VU METER --- feed decoded interleaved PCM (all channels) to the per-channel meters.
+      player.on('pcm-audio', (e) => vu.feed(e));
 
       if (E2E) {
         window.__mxfPlayer = player;
