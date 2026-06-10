@@ -49,46 +49,80 @@ export function planeCbPtr(s: i32): i32 { return (slotBase(s) + <usize>(MAX_Y + 
 // @ts-ignore: decorator
 @inline function st(base: usize, i: i32, v: i32): void { store<i32>(base + (<usize>i << 2), v); }
 
+// W constants matching ff_simple_idct_int16_8bit (libavcodec/simple_idct_template.c, BIT_DEPTH==8).
+const W1: i32 = 22725, W2: i32 = 21407, W3: i32 = 19266, W4: i32 = 16383;
+const W5: i32 = 12873, W6: i32 =  8867, W7: i32 =  4520;
+const ROW_SHIFT: i32 = 11, ROW_ROUND: i32 = 1 << (ROW_SHIFT - 1); // 1024
+// ff_simple_idct folds the column rounding into the DC term as W4*(c0 + COL_DC_BIAS), where
+// COL_DC_BIAS = (1<<(COL_SHIFT-1))/W4 = 32 → W4*32 = 524256 (NOT the exact 524288). Matching this
+// is required for bit-exactness with `-idct simple`. DC_SHIFT=3 is the row DC-only broadcast scale.
+const COL_SHIFT: i32 = 20, COL_DC_BIAS: i32 = 32, DC_SHIFT: i32 = 3;
+
 /**
- * Two-pass row/column inverse DCT, scalar. Reads 64 i32 from SRC, writes 64 i32 to DST.
- * Mirrors `idct(src, dst)` in src/codec/mpeg2-decoder.ts exactly: same constants (473, 196, 362),
- * same `>> 8` rounding with `+128`, same dataflow. i32 wraps like JS `>>`-coerced arithmetic, and
- * the inputs are ranged (jsmpeg-derived) so intermediates stay within i32 — so the result is
- * identical to the JS float64-then-ToInt32 path.
+ * Two-pass 8×8 IDCT matching ff_simple_idct_int16_8bit. Reads 64 i32 from SRC (raw dequantized
+ * coefficients), writes 64 i32 pixel residuals to DST. i32 mul/shr_s wrap identically to JS's
+ * ToInt32+>> on the same values, so JS and WASM remain bit-exact.
  */
 function idctCore(): void {
-  let b1: i32, b3: i32, b4: i32, b6: i32, b7: i32, tmp1: i32, tmp2: i32, m0: i32;
-  let x0: i32, x1: i32, x2: i32, x3: i32, x4: i32, y3: i32, y4: i32, y5: i32, y6: i32, y7: i32;
+  // Row pass: 1D IDCT across each of 8 rows (read SRC, write DST).
+  for (let r: i32 = 0; r < 8; r++) {
+    const base: i32 = r * 8;
+    const r0: i32 = ld(SRC, base), r1: i32 = ld(SRC, base+1), r2: i32 = ld(SRC, base+2), r3: i32 = ld(SRC, base+3);
+    const r4: i32 = ld(SRC, base+4), r5: i32 = ld(SRC, base+5), r6: i32 = ld(SRC, base+6), r7: i32 = ld(SRC, base+7);
 
-  // Row pass: read SRC, write DST.
-  for (let i = 0; i < 8; i++) {
-    b1 = ld(SRC, 4 * 8 + i); b3 = ld(SRC, 2 * 8 + i) + ld(SRC, 6 * 8 + i); b4 = ld(SRC, 5 * 8 + i) - ld(SRC, 3 * 8 + i);
-    tmp1 = ld(SRC, 1 * 8 + i) + ld(SRC, 7 * 8 + i); tmp2 = ld(SRC, 3 * 8 + i) + ld(SRC, 5 * 8 + i);
-    b6 = ld(SRC, 1 * 8 + i) - ld(SRC, 7 * 8 + i); b7 = tmp1 + tmp2;
-    m0 = ld(SRC, 0 * 8 + i);
-    x4 = ((b6 * 473 - b4 * 196 + 128) >> 8) - b7;
-    x0 = x4 - (((tmp1 - tmp2) * 362 + 128) >> 8);
-    x1 = m0 - b1; x2 = (((ld(SRC, 2 * 8 + i) - ld(SRC, 6 * 8 + i)) * 362 + 128) >> 8) - b3; x3 = m0 + b1;
-    y3 = x1 + x2; y4 = x3 + b3; y5 = x1 - x2; y6 = x3 - b3;
-    y7 = -x0 - ((b4 * 473 + b6 * 196 + 128) >> 8);
-    st(DST, 0 * 8 + i, b7 + y4); st(DST, 1 * 8 + i, x4 + y3); st(DST, 2 * 8 + i, y5 - x0); st(DST, 3 * 8 + i, y6 - y7);
-    st(DST, 4 * 8 + i, y6 + y7); st(DST, 5 * 8 + i, x0 + y5); st(DST, 6 * 8 + i, y3 - x4); st(DST, 7 * 8 + i, y4 - b7);
+    // ff_simple_idct row DC-only shortcut: AC-zero row broadcasts (row[0]<<3) truncated to int16.
+    if ((r1 | r2 | r3 | r4 | r5 | r6 | r7) == 0) {
+      const dc: i32 = ((r0 << DC_SHIFT) << 16) >> 16;
+      st(DST, base, dc); st(DST, base+1, dc); st(DST, base+2, dc); st(DST, base+3, dc);
+      st(DST, base+4, dc); st(DST, base+5, dc); st(DST, base+6, dc); st(DST, base+7, dc);
+      continue;
+    }
+
+    let a0: i32 = W4 * r0 + ROW_ROUND;
+    let a1: i32 = a0, a2: i32 = a0, a3: i32 = a0;
+    a0 += W2 * r2; a1 += W6 * r2; a2 -= W6 * r2; a3 -= W2 * r2;
+
+    let b0: i32 = W1 * r1 + W3 * r3;
+    let b1: i32 = W3 * r1 - W7 * r3;
+    let b2: i32 = W5 * r1 - W1 * r3;
+    let b3: i32 = W7 * r1 - W5 * r3;
+
+    if ((r4 | r5 | r6 | r7) != 0) {
+      a0 += W4 * r4 + W6 * r6; a1 -= W4 * r4 + W2 * r6;
+      a2 -= W4 * r4 - W2 * r6; a3 += W4 * r4 - W6 * r6;
+      b0 += W5 * r5 + W7 * r7; b1 -= W1 * r5 + W5 * r7;
+      b2 += W7 * r5 + W3 * r7; b3 += W3 * r5 - W1 * r7;
+    }
+
+    st(DST, base,   (a0 + b0) >> ROW_SHIFT); st(DST, base+7, (a0 - b0) >> ROW_SHIFT);
+    st(DST, base+1, (a1 + b1) >> ROW_SHIFT); st(DST, base+6, (a1 - b1) >> ROW_SHIFT);
+    st(DST, base+2, (a2 + b2) >> ROW_SHIFT); st(DST, base+5, (a2 - b2) >> ROW_SHIFT);
+    st(DST, base+3, (a3 + b3) >> ROW_SHIFT); st(DST, base+4, (a3 - b3) >> ROW_SHIFT);
   }
-  // Column pass: in place on DST.
-  for (let i = 0; i < 64; i += 8) {
-    b1 = ld(DST, 4 + i); b3 = ld(DST, 2 + i) + ld(DST, 6 + i); b4 = ld(DST, 5 + i) - ld(DST, 3 + i);
-    tmp1 = ld(DST, 1 + i) + ld(DST, 7 + i); tmp2 = ld(DST, 3 + i) + ld(DST, 5 + i);
-    b6 = ld(DST, 1 + i) - ld(DST, 7 + i); b7 = tmp1 + tmp2;
-    m0 = ld(DST, 0 + i);
-    x4 = ((b6 * 473 - b4 * 196 + 128) >> 8) - b7;
-    x0 = x4 - (((tmp1 - tmp2) * 362 + 128) >> 8);
-    x1 = m0 - b1; x2 = (((ld(DST, 2 + i) - ld(DST, 6 + i)) * 362 + 128) >> 8) - b3; x3 = m0 + b1;
-    y3 = x1 + x2; y4 = x3 + b3; y5 = x1 - x2; y6 = x3 - b3;
-    y7 = -x0 - ((b4 * 473 + b6 * 196 + 128) >> 8);
-    st(DST, 0 + i, (b7 + y4 + 128) >> 8); st(DST, 1 + i, (x4 + y3 + 128) >> 8);
-    st(DST, 2 + i, (y5 - x0 + 128) >> 8); st(DST, 3 + i, (y6 - y7 + 128) >> 8);
-    st(DST, 4 + i, (y6 + y7 + 128) >> 8); st(DST, 5 + i, (x0 + y5 + 128) >> 8);
-    st(DST, 6 + i, (y3 - x4 + 128) >> 8); st(DST, 7 + i, (y4 - b7 + 128) >> 8);
+
+  // Column pass: 1D IDCT down each of 8 columns, in-place on DST.
+  for (let c: i32 = 0; c < 8; c++) {
+    const c0: i32 = ld(DST, c), c8: i32 = ld(DST, c+8), c16: i32 = ld(DST, c+16), c24: i32 = ld(DST, c+24);
+    const c32: i32 = ld(DST, c+32), c40: i32 = ld(DST, c+40), c48: i32 = ld(DST, c+48), c56: i32 = ld(DST, c+56);
+
+    let a0: i32 = W4 * (c0 + COL_DC_BIAS);   // ff_simple_idct folds COL rounding into the DC term
+    let a1: i32 = a0, a2: i32 = a0, a3: i32 = a0;
+    a0 += W2 * c16; a1 += W6 * c16; a2 -= W6 * c16; a3 -= W2 * c16;
+
+    let b0: i32 = W1 * c8 + W3 * c24;
+    let b1: i32 = W3 * c8 - W7 * c24;
+    let b2: i32 = W5 * c8 - W1 * c24;
+    let b3: i32 = W7 * c8 - W5 * c24;
+
+    if (c32 != 0) { a0 += W4 * c32; a1 -= W4 * c32; a2 -= W4 * c32; a3 += W4 * c32; }
+    if (c40 != 0) { b0 += W5 * c40; b1 -= W1 * c40; b2 += W7 * c40; b3 += W3 * c40; }
+    if (c48 != 0) { a0 += W6 * c48; a1 -= W2 * c48; a2 += W2 * c48; a3 -= W6 * c48; }
+    if (c56 != 0) { b0 += W7 * c56; b1 -= W5 * c56; b2 += W3 * c56; b3 -= W1 * c56; }
+
+    st(DST, c,    (a0 + b0) >> COL_SHIFT); st(DST, c+8,  (a1 + b1) >> COL_SHIFT);
+    st(DST, c+16, (a2 + b2) >> COL_SHIFT); st(DST, c+24, (a3 + b3) >> COL_SHIFT);
+    st(DST, c+32, (a3 - b3) >> COL_SHIFT); st(DST, c+40, (a2 - b2) >> COL_SHIFT);
+    st(DST, c+48, (a1 - b1) >> COL_SHIFT); st(DST, c+56, (a0 - b0) >> COL_SHIFT);
   }
 }
 

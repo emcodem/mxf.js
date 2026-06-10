@@ -19,6 +19,9 @@ export interface YUVFrame {
   height: number;
   chromaFormat: number;   // 1 = 4:2:0, 2 = 4:2:2
   isKeyframe: boolean;
+  /** Coded picture type of this frame's source picture: 1=I, 2=P, 3=B. Diagnostic (e.g. bitexact
+   *  intra-vs-inter localization); I has isKeyframe=true, but P and B both have isKeyframe=false. */
+  pictureType: number;
   /** picture_header temporal_reference of the source picture (display order within its GOP). The I at
    *  a GOP head displays at gopStartStorageEU + temporalReference, which the transcode pipeline uses to
    *  label post-seek frames with their true presentation edit unit. */
@@ -140,6 +143,14 @@ class BitBuffer {
 
   skip(count: number): void { this.index += count; }
   rewind(count: number): void { this.index = Math.max(this.index - count, 0); }
+
+  /** Read n bits from the current position WITHOUT advancing the index. */
+  peek(count: number): number {
+    const saved = this.index;
+    const val = this.read(count);
+    this.index = saved;
+    return val;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -201,16 +212,6 @@ const DEFAULT_NON_INTRA_QUANT_MATRIX = new Uint8Array([
   16, 16, 16, 16, 16, 16, 16, 16,
 ]);
 
-const PREMULTIPLIER_MATRIX = new Uint8Array([
-  32, 44, 42, 38, 32, 25, 17,  9,
-  44, 62, 58, 52, 44, 35, 24, 12,
-  42, 58, 55, 49, 42, 33, 23, 12,
-  38, 52, 49, 44, 38, 30, 20, 10,
-  32, 44, 42, 38, 32, 25, 17,  9,
-  25, 35, 33, 30, 25, 20, 14,  7,
-  17, 24, 23, 20, 17, 14,  9,  5,
-   9, 12, 12, 10,  9,  7,  5,  2,
-]);
 
 // macroblock_address_increment VLC (ISO 13818-2 Table B-1 / ff_mpeg12_mbAddrIncrTable):
 // [code, bits]. Indices 0..32 map to increments 1..33 (value = index+1). The two trailing
@@ -720,7 +721,8 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
   flush(): void {
     if (this.hasHeldAnchor) {
       if (!this.suppressUntilKeyframe || this.heldAnchorIsKeyframe) {
-        this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr, this.heldAnchorIsKeyframe, this.heldTempRef);
+        this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr, this.heldAnchorIsKeyframe,
+          this.heldAnchorIsKeyframe ? PICTURE_TYPE.INTRA : PICTURE_TYPE.PREDICTIVE, this.heldTempRef);
         if (this.heldAnchorIsKeyframe) this.suppressUntilKeyframe = false;
       }
       this.hasHeldAnchor = false;
@@ -954,7 +956,8 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
         // is the random-access keyframe.
         const key = this.heldAnchorIsKeyframe;
         if (!this.suppressUntilKeyframe || key) {
-          this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr, key, this.heldTempRef);
+          this.emitFrame(this.forwardY, this.forwardCb, this.forwardCr, key,
+            key ? PICTURE_TYPE.INTRA : PICTURE_TYPE.PREDICTIVE, this.heldTempRef);
           if (key) this.suppressUntilKeyframe = false;
         }
       }
@@ -980,14 +983,14 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       // B-frame: emit immediately, no rotation — unless still suppressing leading B's after a reset
       // (those reference a previous GOP we no longer have).
       if (!this.suppressUntilKeyframe) {
-        this.emitFrame(this.currentY, this.currentCb, this.currentCr, false, this.curTempRef);
+        this.emitFrame(this.currentY, this.currentCb, this.currentCr, false, PICTURE_TYPE.B, this.curTempRef);
       }
     }
   }
 
   private emitFrame(
     y: Uint8ClampedArray, cb: Uint8ClampedArray, cr: Uint8ClampedArray, isKeyframe: boolean,
-    temporalReference: number,
+    pictureType: number, temporalReference: number,
   ): void {
     this.onFrame({
       y, cb, cr,
@@ -997,6 +1000,7 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       height: this.height,
       chromaFormat: this.chromaFormat,
       isKeyframe,
+      pictureType,
       temporalReference,
     });
   }
@@ -1061,7 +1065,7 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
     this.dcPredictorCr = dcInit;
     this.dcPredictorCb = dcInit;
     const qsCode = this.bits.read(5);
-    this.quantizerScale = this.qScaleType ? NON_LINEAR_QUANTIZER_SCALE[qsCode] : qsCode;
+    this.quantizerScale = this.qScaleType ? NON_LINEAR_QUANTIZER_SCALE[qsCode] : qsCode << 1;
     while (this.bits.read(1)) this.bits.skip(8); // extra slice data
     let mbCount = 0;
     // A slice never spans more than one MB row, so it can hold at most mbWidth MBs.
@@ -1100,9 +1104,13 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
           this.mvFormatField = false;
           this.macroblockMotFw = true;
           this.macroblockMotBw = false;
+        } else if (this.pictureType === PICTURE_TYPE.B && this.isMPEG2) {
+          // Skipped B macroblock (ISO 13818-2 7.6.6): inherit fwd/bwd motion flags from
+          // the previous MB but force frame prediction using PMV[0][s] in frame units.
+          // Field MC (mvFormatField=true) from a prior coded MB must NOT carry over —
+          // the spec defines skipped-B prediction as frame-based with the r=0 vectors.
+          this.mvFormatField = false;
         }
-        // Skipped B macroblock: repeat the previous MB's motion vectors and prediction
-        // mode (PMV / fieldSelect / mvFormatField / motion flags are preserved as-is).
       }
       while (increment > 1) {
         this.macroblockAddress++;
@@ -1147,7 +1155,7 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
 
     if ((this.macroblockType & 0x10) !== 0) {
       const qsCode = this.bits.read(5);
-      this.quantizerScale = this.qScaleType ? NON_LINEAR_QUANTIZER_SCALE[qsCode] : qsCode;
+      this.quantizerScale = this.qScaleType ? NON_LINEAR_QUANTIZER_SCALE[qsCode] : qsCode << 1;
     }
 
     if (this.macroblockIntra) {
@@ -1312,7 +1320,9 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
   /** motion_vectors(s) — s: 0 = forward, 1 = backward (ISO 13818-2 6.3.17.3). */
   private readMotionVectors(s: 0 | 1): void {
     if (this.mvCount === 1) {
-      if (this.mvFormatField && !this.dmv) this.fieldSelect[0][s] = this.bits.read(1);
+      if (this.mvFormatField && !this.dmv) {
+        this.fieldSelect[0][s] = this.bits.read(1);
+      }
       this.decodeMV(0, s);
       // A single motion vector updates BOTH predictors (ISO 13818-2 7.6.3.5) so that a
       // following field-predicted MB has a valid PMV[1].
@@ -1756,8 +1766,9 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
         predictor = ((block & 1) === 0 ? this.dcPredictorCb : this.dcPredictorCr);
         dctSize = this.readHuffman(DCT_DC_SIZE_CHROMINANCE);
       }
+      let differential = 0;
       if (dctSize > 0) {
-        const differential = this.bits.read(dctSize);
+        differential = this.bits.read(dctSize);
         this.blockData[0] = (differential & (1 << (dctSize - 1))) !== 0
           ? predictor + differential
           : predictor + ((-1 << dctSize) | (differential + 1));
@@ -1767,7 +1778,7 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       if (block < 4) this.dcPredictorY = this.blockData[0];
       else if ((block & 1) === 0) this.dcPredictorCb = this.blockData[0];
       else this.dcPredictorCr = this.blockData[0];
-      this.blockData[0] <<= (3 + 5 - this.intraDcPrecision);
+      this.blockData[0] <<= (3 - this.intraDcPrecision);
       touched[tc++] = 0;
       quantMatrix = block < 4 ? this.intraQuantMatrix : this.chromaIntraQuantMatrix;
       n = 1;
@@ -1832,7 +1843,7 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       // MPEG-2 by 32 (ISO 13818-2 7.4.2.3). Using /16 for MPEG-2 makes every AC
       // coefficient twice the correct amplitude → ~2× ringing/overshoot at edges
       // while flat (DC-only) areas stay correct.
-      level = (level * qs * quantMatrix[dezigZagged]) >> dequantShift;
+      level = (level * qs * quantMatrix[dezigZagged] / (1 << dequantShift)) | 0;
       if (isMPEG2) {
         if (level > 2047) level = 2047; else if (level < -2047) level = -2047;
         mismatchParity ^= (level & 1);
@@ -1840,13 +1851,13 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
         if ((level & 1) === 0) level -= level > 0 ? 1 : -1;
         if (level > 2047) level = 2047; else if (level < -2048) level = -2048;
       }
-      this.blockData[dezigZagged] = level * PREMULTIPLIER_MATRIX[dezigZagged];
+      this.blockData[dezigZagged] = level;
       touched[tc++] = dezigZagged;
     }
 
     if (isMPEG2) {
-      const dcParity = (isIntra && this.intraDcPrecision === 3) ? ((this.blockData[0] >> 5) & 1) : 0;
-      if (((mismatchParity ^ dcParity) & 1) === 0) { this.blockData[63] ^= 2; touched[tc++] = 63; }
+      const dcParity = isIntra ? (this.blockData[0] & 1) : 0;
+      if (((mismatchParity ^ dcParity) & 1) === 0) { this.blockData[63] ^= 1; touched[tc++] = 63; }
     }
 
     let destArray: Uint8ClampedArray;
@@ -1896,12 +1907,15 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
       // over the WASM plane arena — so the kernel reads the coefficients and writes the residual into
       // the plane with no boundary copy. destArray.byteOffset is the plane's base in WASM memory.
       const intra = this.macroblockIntra ? 1 : 0;
-      if (n === 1) k.dcBlock(destArray.byteOffset, destIndex, scan, intra, (this.blockData[0] + 128) >> 8, destArray.length);
+      // DC-only fast path is valid only when the block is *truly* DC-only. MPEG-2 mismatch control
+      // (above) can toggle blockData[63] to ±1 even when only the DC was coded; in that case the
+      // block is no longer DC-only and must go through the full IDCT, or chroma drifts by ±1.
+      if (n === 1 && this.blockData[63] === 0) k.dcBlock(destArray.byteOffset, destIndex, scan, intra, dcOnlyPixel(this.blockData[0]), destArray.length);
       else k.idctAddBlock(destArray.byteOffset, destIndex, scan, intra, destArray.length);
       for (let i = 0; i < tc; i++) this.blockData[touched[i]] = 0;
     } else if (this.macroblockIntra) {
-      if (n === 1) {
-        copyValue((this.blockData[0] + 128) >> 8, destArray, destIndex, scan);
+      if (n === 1 && this.blockData[63] === 0) {
+        copyValue(dcOnlyPixel(this.blockData[0]), destArray, destIndex, scan);
         for (let i = 0; i < tc; i++) this.blockData[touched[i]] = 0;
       } else {
         idct(this.blockData, this.pixelData);
@@ -1909,8 +1923,8 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
         for (let i = 0; i < tc; i++) this.blockData[touched[i]] = 0;
       }
     } else {
-      if (n === 1) {
-        addValue((this.blockData[0] + 128) >> 8, destArray, destIndex, scan);
+      if (n === 1 && this.blockData[63] === 0) {
+        addValue(dcOnlyPixel(this.blockData[0]), destArray, destIndex, scan);
         for (let i = 0; i < tc; i++) this.blockData[touched[i]] = 0;
       } else {
         idct(this.blockData, this.pixelData);
@@ -1918,7 +1932,6 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
         for (let i = 0; i < tc; i++) this.blockData[touched[i]] = 0;
       }
     }
-    // n is reset implicitly — the loop variable; no explicit reset needed
   }
 }
 
@@ -1926,40 +1939,89 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
 // IDCT + block copy helpers
 // ---------------------------------------------------------------------------
 
-// Two-pass row/column IDCT. The row pass reads `src` and writes `dst`; the column pass operates
-// in place on `dst` (reading the row-pass results). Keeping `src` untouched lets the caller clear
-// only the sparse coefficient positions afterward instead of zeroing all 64 entries.
-export function idct(src: Int32Array, dst: Int32Array): void {
-  let b1: number, b3: number, b4: number, b6: number, b7: number, tmp1: number, tmp2: number, m0: number;
-  let x0: number, x1: number, x2: number, x3: number, x4: number, y3: number, y4: number, y5: number, y6: number, y7: number;
+// W constants and shift parameters for ff_simple_idct_int16_8bit (BIT_DEPTH==8).
+// Ported from libavcodec/simple_idct_template.c (LGPL).
+const W1 = 22725, W2 = 21407, W3 = 19266, W4 = 16383, W5 = 12873, W6 = 8867, W7 = 4520;
+const ROW_SHIFT = 11, ROW_ROUND = 1 << (ROW_SHIFT - 1);  // 1024
+// ff_simple_idct folds the column rounding constant into the DC term as W4*(c0 + COL_DC_BIAS),
+// where COL_DC_BIAS = (1<<(COL_SHIFT-1))/W4 = 524288/16383 = 32 (integer). That yields W4*32 =
+// 524256, NOT the exact 524288 — matching this (slightly imprecise) bias is required for bit-exact
+// parity with `-idct simple`. DC_SHIFT=3 is ffmpeg's row DC-only broadcast scale (row[0]<<3).
+const COL_SHIFT = 20, COL_DC_BIAS = 32, DC_SHIFT = 3;
 
-  for (let i = 0; i < 8; i++) {
-    b1 = src[4*8+i]; b3 = src[2*8+i] + src[6*8+i]; b4 = src[5*8+i] - src[3*8+i];
-    tmp1 = src[1*8+i] + src[7*8+i]; tmp2 = src[3*8+i] + src[5*8+i];
-    b6 = src[1*8+i] - src[7*8+i]; b7 = tmp1 + tmp2;
-    m0 = src[0*8+i];
-    x4 = ((b6*473 - b4*196 + 128) >> 8) - b7;
-    x0 = x4 - (((tmp1 - tmp2)*362 + 128) >> 8);
-    x1 = m0 - b1; x2 = (((src[2*8+i] - src[6*8+i])*362 + 128) >> 8) - b3; x3 = m0 + b1;
-    y3 = x1 + x2; y4 = x3 + b3; y5 = x1 - x2; y6 = x3 - b3;
-    y7 = -x0 - ((b4*473 + b6*196 + 128) >> 8);
-    dst[0*8+i] = b7 + y4; dst[1*8+i] = x4 + y3; dst[2*8+i] = y5 - x0; dst[3*8+i] = y6 - y7;
-    dst[4*8+i] = y6 + y7; dst[5*8+i] = x0 + y5; dst[6*8+i] = y3 - x4; dst[7*8+i] = y4 - b7;
+// DC-only pixel value matching ff_simple_idct for a block where only coefficient [0][0] is
+// non-zero. ffmpeg's row pass takes the DC-only shortcut (row[0]<<3, truncated to int16), and the
+// column pass uses the W4*(c0+COL_DC_BIAS) rounding. So the broadcast pixel is colPass(row[0]<<3).
+export function dcOnlyPixel(dc: number): number {
+  const rowVal = ((dc << DC_SHIFT) << 16) >> 16;   // ffmpeg row DC shortcut, int16 wrap
+  return (W4 * (rowVal + COL_DC_BIAS)) >> COL_SHIFT;
+}
+
+// Two-pass 8×8 IDCT matching ff_simple_idct_int16_8bit from libavcodec/simple_idct_template.c.
+// Row pass (horizontal) first, then column pass (vertical) in-place on dst.
+// src contains raw dequantized coefficients; dst receives pixel-range residuals.
+// src is left untouched so the caller can clear only the touched coefficient positions.
+export function idct(src: Int32Array, dst: Int32Array): void {
+  // Row pass: 1D IDCT across each of 8 rows.
+  for (let r = 0; r < 8; r++) {
+    const b = r * 8;
+    const r0 = src[b], r1 = src[b+1], r2 = src[b+2], r3 = src[b+3];
+    const r4 = src[b+4], r5 = src[b+5], r6 = src[b+6], r7 = src[b+7];
+
+    // ff_simple_idct row DC-only shortcut: AC-zero row broadcasts (row[0]<<3) truncated to int16.
+    // This is NOT equal to the full (W4*r0+ROW_ROUND)>>ROW_SHIFT for large r0 (differs by ±1) — and
+    // matching it is required for bit-exact parity with `-idct simple`.
+    if ((r1 | r2 | r3 | r4 | r5 | r6 | r7) === 0) {
+      const dc = ((r0 << DC_SHIFT) << 16) >> 16;
+      dst[b] = dst[b+1] = dst[b+2] = dst[b+3] = dst[b+4] = dst[b+5] = dst[b+6] = dst[b+7] = dc;
+      continue;
+    }
+
+    let a0 = W4 * r0 + ROW_ROUND;
+    let a1 = a0, a2 = a0, a3 = a0;
+    a0 += W2 * r2; a1 += W6 * r2; a2 -= W6 * r2; a3 -= W2 * r2;
+
+    let b0 = W1 * r1 + W3 * r3;
+    let b1 = W3 * r1 - W7 * r3;
+    let b2 = W5 * r1 - W1 * r3;
+    let b3 = W7 * r1 - W5 * r3;
+
+    if (r4 | r5 | r6 | r7) {
+      a0 += W4 * r4 + W6 * r6; a1 -= W4 * r4 + W2 * r6;
+      a2 -= W4 * r4 - W2 * r6; a3 += W4 * r4 - W6 * r6;
+      b0 += W5 * r5 + W7 * r7; b1 -= W1 * r5 + W5 * r7;
+      b2 += W7 * r5 + W3 * r7; b3 += W3 * r5 - W1 * r7;
+    }
+
+    dst[b]   = (a0 + b0) >> ROW_SHIFT; dst[b+7] = (a0 - b0) >> ROW_SHIFT;
+    dst[b+1] = (a1 + b1) >> ROW_SHIFT; dst[b+6] = (a1 - b1) >> ROW_SHIFT;
+    dst[b+2] = (a2 + b2) >> ROW_SHIFT; dst[b+5] = (a2 - b2) >> ROW_SHIFT;
+    dst[b+3] = (a3 + b3) >> ROW_SHIFT; dst[b+4] = (a3 - b3) >> ROW_SHIFT;
   }
-  for (let i = 0; i < 64; i += 8) {
-    b1 = dst[4+i]; b3 = dst[2+i] + dst[6+i]; b4 = dst[5+i] - dst[3+i];
-    tmp1 = dst[1+i] + dst[7+i]; tmp2 = dst[3+i] + dst[5+i];
-    b6 = dst[1+i] - dst[7+i]; b7 = tmp1 + tmp2;
-    m0 = dst[0+i];
-    x4 = ((b6*473 - b4*196 + 128) >> 8) - b7;
-    x0 = x4 - (((tmp1 - tmp2)*362 + 128) >> 8);
-    x1 = m0 - b1; x2 = (((dst[2+i] - dst[6+i])*362 + 128) >> 8) - b3; x3 = m0 + b1;
-    y3 = x1 + x2; y4 = x3 + b3; y5 = x1 - x2; y6 = x3 - b3;
-    y7 = -x0 - ((b4*473 + b6*196 + 128) >> 8);
-    dst[0+i] = (b7 + y4 + 128) >> 8; dst[1+i] = (x4 + y3 + 128) >> 8;
-    dst[2+i] = (y5 - x0 + 128) >> 8; dst[3+i] = (y6 - y7 + 128) >> 8;
-    dst[4+i] = (y6 + y7 + 128) >> 8; dst[5+i] = (x0 + y5 + 128) >> 8;
-    dst[6+i] = (y3 - x4 + 128) >> 8; dst[7+i] = (y4 - b7 + 128) >> 8;
+
+  // Column pass: 1D IDCT down each of 8 columns, in-place on dst.
+  for (let c = 0; c < 8; c++) {
+    const c0 = dst[c], c8 = dst[c+8], c16 = dst[c+16], c24 = dst[c+24];
+    const c32 = dst[c+32], c40 = dst[c+40], c48 = dst[c+48], c56 = dst[c+56];
+
+    let a0 = W4 * (c0 + COL_DC_BIAS);   // ff_simple_idct folds COL rounding into the DC term
+    let a1 = a0, a2 = a0, a3 = a0;
+    a0 += W2 * c16; a1 += W6 * c16; a2 -= W6 * c16; a3 -= W2 * c16;
+
+    let b0 = W1 * c8 + W3 * c24;
+    let b1 = W3 * c8 - W7 * c24;
+    let b2 = W5 * c8 - W1 * c24;
+    let b3 = W7 * c8 - W5 * c24;
+
+    if (c32) { a0 += W4 * c32; a1 -= W4 * c32; a2 -= W4 * c32; a3 += W4 * c32; }
+    if (c40) { b0 += W5 * c40; b1 -= W1 * c40; b2 += W7 * c40; b3 += W3 * c40; }
+    if (c48) { a0 += W6 * c48; a1 -= W2 * c48; a2 += W2 * c48; a3 -= W6 * c48; }
+    if (c56) { b0 += W7 * c56; b1 -= W5 * c56; b2 += W3 * c56; b3 -= W1 * c56; }
+
+    dst[c]    = (a0 + b0) >> COL_SHIFT; dst[c+8]  = (a1 + b1) >> COL_SHIFT;
+    dst[c+16] = (a2 + b2) >> COL_SHIFT; dst[c+24] = (a3 + b3) >> COL_SHIFT;
+    dst[c+32] = (a3 - b3) >> COL_SHIFT; dst[c+40] = (a2 - b2) >> COL_SHIFT;
+    dst[c+48] = (a1 - b1) >> COL_SHIFT; dst[c+56] = (a0 - b0) >> COL_SHIFT;
   }
 }
 

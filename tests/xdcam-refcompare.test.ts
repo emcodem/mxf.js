@@ -80,6 +80,7 @@ describe('xdcam ref compare', () => {
     const coded = await collectFrames(0, N + 6); // extra for tail B reorder
 
     const emitted: YUVFrame[] = [];
+
     const dec = new Mpeg2Decoder((f) => {
       // clone planes — decoder reuses buffers
       emitted.push({ ...f, y: f.y.slice(), cb: f.cb.slice(), cr: f.cr.slice() });
@@ -94,30 +95,81 @@ describe('xdcam ref compare', () => {
     const limit = Math.min(N, emitted.length, refCount);
 
     const rows: string[] = [];
-    let worstFrame = -1, worstMae = 0, worstChromaMae = 0;
+    // Per-frame plane stats; the first keyframe is surfaced separately as a pure-intra (no motion
+    // comp) check, and stats are split by picture type (I/P/B) so a regression localizes quickly.
+    type PStat = { mae: number; max: number; badPx: number };
+    const PT = ['?', 'I', 'P', 'B'];
+    const perFrame: Array<{ i: number; key: boolean; pt: number; yc: PStat; uc: PStat; vc: PStat }> = [];
+    let worstFrame = -1, worstMae = 0, worstChromaMae = 0, worstLumaMae = 0, worstMax = 0;
     for (let i = 0; i < limit; i++) {
       const f = emitted[i];
       const ref = readRefFrame(refFd, i);
       const yc = planeMAE(f.y, f.width, f.height, ref.y, W, H);
       const uc = planeMAE(f.cb, f.width / 2, f.height, ref.u, W / 2, H);
       const vc = planeMAE(f.cr, f.width / 2, f.height, ref.v, W / 2, H);
+      perFrame.push({ i, key: !!f.isKeyframe, pt: f.pictureType, yc, uc, vc });
       const tot = yc.mae + uc.mae + vc.mae;
       if (tot > worstMae) { worstMae = tot; worstFrame = i; }
       worstChromaMae = Math.max(worstChromaMae, uc.mae, vc.mae);
-      const flag = (yc.mae > 1 || uc.mae > 1 || vc.mae > 1) ? '  <== DIFF' : '';
-      if (flag || i === 56 || i === 82 || i === 104) {
-        rows.push(`f${String(i).padStart(3)} key=${f.isKeyframe?1:0} Y(mae=${yc.mae.toFixed(2)} max=${yc.max} bad=${yc.badPx}) U(mae=${uc.mae.toFixed(2)} max=${uc.max} bad=${uc.badPx}) V(mae=${vc.mae.toFixed(2)} max=${vc.max} bad=${vc.badPx})${flag}`);
+      worstLumaMae   = Math.max(worstLumaMae, yc.mae);
+      worstMax       = Math.max(worstMax, yc.max, uc.max, vc.max);
+      const flag = (yc.mae > 0.5 || uc.mae > 0.5 || vc.mae > 0.5) ? '  <== DIFF' : '';
+      if (flag || yc.mae > 0.01 || uc.mae > 0.01 || vc.mae > 0.01) {
+        rows.push(`f${String(i).padStart(3)} key=${f.isKeyframe?1:0} Y(mae=${yc.mae.toFixed(3)} max=${yc.max} bad=${yc.badPx}) U(mae=${uc.mae.toFixed(3)} max=${uc.max} bad=${uc.badPx}) V(mae=${vc.mae.toFixed(3)} max=${vc.max} bad=${vc.badPx})${flag}`);
+      }
+    }
+    // Log pixel positions of bad pixels for frames with bad > 0,
+    // and for those frames also show the I-frame value at same pixel.
+    const frame0 = emitted[0];
+    const ref0   = readRefFrame(refFd, 0);
+    for (let i = 0; i < limit; i++) {
+      const f = emitted[i];
+      const ref = readRefFrame(refFd, i);
+      const cmpW = Math.min(f.width, W);
+      const badPixels: string[] = [];
+      for (let row = 0; row < H && badPixels.length < 20; row++) {
+        for (let x = 0; x < cmpW && badPixels.length < 20; x++) {
+          const d = Math.abs(f.y[row * f.width + x] - ref.y[row * W + x]);
+          if (d > 20) {
+            const iOurs = frame0.y[row * frame0.width + x];
+            const iRef  = ref0.y[row * W + x];
+            badPixels.push(`(${x},${row}) ours=${f.y[row * f.width + x]} ref=${ref.y[row * W + x]} d=${d}  [I-frame: ours=${iOurs} ref=${iRef}]`);
+          }
+        }
+      }
+      if (badPixels.length > 0) {
+        console.log(`\nbad pixels in frame ${i}:`);
+        badPixels.forEach(p => console.log('  ' + p));
       }
     }
     fs.closeSync(refFd);
 
-    console.log('=== frames flagged (mae>1) + error TCs 56/82/104 ===');
+    console.log('=== frames with Y/U/V mae > 0.01 vs ffmpeg reference ===');
+    if (rows.length === 0) console.log('  (none — bit-exact match)');
     rows.forEach(r => console.log(r));
-    console.log(`worst frame=${worstFrame} totMae=${worstMae.toFixed(2)} worstChromaMae=${worstChromaMae.toFixed(2)}`);
 
-    // Before the 4:2:2 field-DCT chroma fix the worst chroma MAE was ~4.3 (frame 86, an I-frame);
-    // a correct decode tracks ffmpeg to within rounding (<0.5). Luma was always near-perfect.
+    // Pure-intra check (first keyframe: no motion comp) + per-picture-type split, so a regression
+    // localizes to intra vs P vs B at a glance.
+    const fmt = (s: PStat) => `mae=${s.mae.toFixed(4)} max=${s.max} bad=${s.badPx}`;
+    const chromaMae = (p: { uc: PStat; vc: PStat }) => Math.max(p.uc.mae, p.vc.mae);
+    const firstKey = perFrame.find(p => p.key);
+    if (firstKey) console.log(`firstI (f${firstKey.i}) Y(${fmt(firstKey.yc)}) U(${fmt(firstKey.uc)}) V(${fmt(firstKey.vc)})`);
+    for (const t of [1, 2, 3]) {
+      const ofType = perFrame.filter(p => p.pt === t);
+      if (!ofType.length) continue;
+      const worstOf = ofType.reduce((a, b) => chromaMae(b) > chromaMae(a) ? b : a);
+      const worstY  = ofType.reduce((a, b) => b.yc.mae > a.yc.mae ? b : a);
+      console.log(`type ${PT[t]}: n=${ofType.length} worstChromaMae=${chromaMae(worstOf).toFixed(4)} (f${worstOf.i}) worstLumaMae=${worstY.yc.mae.toFixed(4)} (f${worstY.i})`);
+    }
+    console.log(`worst frame=${worstFrame} totMae=${worstMae.toFixed(4)} worstLumaMae=${worstLumaMae.toFixed(4)} worstChromaMae=${worstChromaMae.toFixed(4)} worstMax=${worstMax}`);
+    console.log(`bit-exact status: luma=${worstLumaMae === 0 ? 'EXACT' : `off by ${worstLumaMae.toFixed(4)}`}  chroma=${worstChromaMae === 0 ? 'EXACT' : `off by ${worstChromaMae.toFixed(4)}`}`);
+
     expect(emitted.length).toBeGreaterThan(50);
-    expect(worstChromaMae, 'chroma diverges from ffmpeg — 4:2:2 field-DCT/quant-matrix regression').toBeLessThan(0.6);
+    // BIT-EXACT vs the scalar `-cpuflags 0 -flags +bitexact -idct simple` reference. The decoder
+    // replicates ff_simple_idct exactly (row DC-only `<<3` shortcut + W4*(c0+32) column rounding),
+    // MPEG-2 mismatch control, and the 4:2:2 field-DCT/MC paths. Any non-zero here is a regression.
+    expect(worstMax,      'per-pixel max diff must be 0 (bit-exact with ffmpeg)').toBe(0);
+    expect(worstChromaMae, 'chroma must be bit-exact with ffmpeg').toBe(0);
+    expect(worstLumaMae,   'luma must be bit-exact with ffmpeg').toBe(0);
   }, 180_000);
 });

@@ -14,6 +14,7 @@
     "build": "npm run asbuild && vite build && vite build --config vite.worker.config.ts && node scripts/copy-wasm.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:bitexact": "vitest run tests/xdcam-refcompare.test.ts",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:e2e:latency": "vitest run --config vitest.e2e.config.ts test/e2e/latency.test.ts",
     "serve:range": "node scripts/range-server.mjs --dir C:\\temp\\mxf.js --port 8000 --latency 0",

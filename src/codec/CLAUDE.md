@@ -15,7 +15,29 @@ Ported from jsmpeg (MPEG-1), extended for interlaced 4:2:2 Long-GOP. Non-obvious
 5. **Quant matrices**: chroma has its own intra/non-intra slots (`decodeBlock` selects them for blocks ≥4). **Chroma defaults follow luma** wherever luma is loaded — both in the picture-level `quant_matrix_extension` (ext id `0x03`, parsed even when all load-flags are off) AND in the **sequence header**. XDCAM HD422 loads a custom intra matrix in the sequence header with no chroma matrix and no picture extension; if the sequence-header path doesn't copy luma→chroma, chroma keeps the stale default matrix while luma uses the custom one.
 6. **Full-block EOB**: a coefficient at position 63 still emits EOB in MPEG-2. The `if(n>=64) break` stays as corruption guard only.
 7. **Dequant scale**: MPEG-2 divides by 32 (`>>5`), MPEG-1 by 16 (`>>4`).
+8. **Non-intra dequant must truncate toward zero, not floor**: FFmpeg sign-magnitude `(2*|F|+1)*W*qs >> 5` then sign is equivalent to truncation. Using `>> 5` (floor) on signed values gives one more negative for negative coefficients with non-zero remainder. Fix: `(level * qs * W / (1<<dequantShift)) | 0`. Intra blocks do NOT get the `±1` addend — adding it causes catastrophic luma error (MAE=4.521).
 8. **DC predictor chroma block assignment**: even chroma blocks (4, 6) → `dcPredictorCb`; odd (5, 7) → `dcPredictorCr`. Swapping causes wrong chroma DC in every macroblock after the first in each slice.
+
+10. **IDCT must replicate ff_simple_idct's DC shortcuts, not just the math**: the decoder is
+    bit-exact with `ffmpeg -idct simple` only because `idct()` (and the WASM `idctCore`, and
+    `dcOnlyPixel`) match two `ff_simple_idct_int16_8bit` arithmetic quirks, NOT the "pure" full
+    butterfly: (a) **row DC-only shortcut** — an AC-zero row broadcasts `(row[0]<<3)&0xffff`
+    (DC_SHIFT=3, int16-truncated), which differs from `(W4*row[0]+1024)>>11` by ±1 for `row[0]>1024`;
+    (b) **column rounding** folded into the DC term as `W4*(c0+32)` = `W4*c0 + 524256`, NOT the exact
+    `+524288`. Using the "correct" full path instead leaves a ~±1 residual that is tiny in intra but
+    accumulates through MC. `dcOnlyPixel(dc)` must equal `colPass(row[0]<<3)` to stay consistent with
+    `idct()` (guarded by `tests/idct-dc-consistency.test.ts`). Regression: `tests/xdcam-refcompare.test.ts`
+    (asserts exact 0), `tests/wasm-idct.test.ts`, `tests/wasm-plane-parity.test.ts`.
+
+9. **Mismatch control breaks the DC-only fast path**: MPEG-2 mismatch control (§7.4.4) toggles
+   `blockData[63] ^= 1` when the coefficient sum is even, so a block coded with *only* a DC term is
+   no longer DC-only — it carries `F[7][7]=±1`. The `dcOnlyPixel()` fast path must therefore be
+   gated on `n === 1 && blockData[63] === 0`, NOT `n === 1` alone (applies to the JS intra/inter
+   branches AND the WASM `k.dcBlock` branch). Dropping the mismatch coefficient drifts mostly
+   **inter chroma** by −1 (smooth chroma residuals are frequently DC-only): chroma MAE 0.141 vs a
+   bitexact ffmpeg reference. `dcOnlyPixel` itself is correct — `tests/idct-dc-consistency.test.ts`
+   proves it equals `idct()` for a *truly* DC-only block; the bug was selecting it after mismatch.
+   Regression: `tests/xdcam-refcompare.test.ts`.
 
 **`MACROBLOCK_ADDRESS_INCREMENT` VLC** must be built from canonical FFmpeg data (`ff_mpeg12_mbAddrIncrTable`), not hand-authored — the jsmpeg table decoded `00000`→increment 7 (invalid), desyncing every inter slice.
 
