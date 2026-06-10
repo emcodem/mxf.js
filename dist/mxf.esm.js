@@ -29,7 +29,7 @@ class y {
     this.listeners.clear();
   }
 }
-const R = 1, w = 0.5, A = 3, D = 6, E = R + 0.5;
+const R = 1, B = 0.5, w = 3, A = 6, D = R + 0.5;
 class S extends y {
   constructor(e, t = !1) {
     super(), this.mediaSource = null, this.objectURL = null, this.sourceBuffers = /* @__PURE__ */ new Map(), this.queues = /* @__PURE__ */ new Map(), this.processing = /* @__PURE__ */ new Map(), this.video = e, this.debug = t;
@@ -70,7 +70,7 @@ class S extends y {
    * enough to remove.
    */
   trimBackBuffer(e) {
-    const t = e - D;
+    const t = e - A;
     if (!(t <= 0))
       for (const [s, i] of this.sourceBuffers) {
         if (i.buffered.length === 0) continue;
@@ -205,8 +205,8 @@ class S extends y {
     this.video.src = "", this.mediaSource = null, this.sourceBuffers.clear(), this.queues.clear(), this.removeAllListeners();
   }
 }
-const P = 40, N = 0.25, U = 0.08, I = 2, W = 30;
-class q {
+const E = 40, P = 0.25, N = 0.08, U = 2, I = 30;
+class W {
   constructor(e, t) {
     this.video = e, this.onAudioInfo = t, this.cxt = null, this.timer = null, this.anchored = !1, this.anchorCtx = 0, this.anchorMedia = 0, this.runId = 0, this.lastWall = -1, this.lastMedia = 0, this.store = [], this.channelCount = 0, this.active = [0, 1], this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
@@ -215,7 +215,7 @@ class q {
   }
   /** Create the AudioContext (PCM that MSE can't play is routed here). Pinned to the source rate. */
   createContext(e) {
-    this.cxt = new AudioContext({ sampleRate: e }), this.timer || (this.timer = setInterval(() => this.tick(), P));
+    this.cxt = new AudioContext({ sampleRate: e }), this.timer || (this.timer = setInterval(() => this.tick(), E));
   }
   hasContext() {
     return this.cxt !== null;
@@ -282,17 +282,34 @@ class q {
     };
     this.insertChunk(u);
   }
-  /** Insert sorted by mediaStart, deduping a chunk we already hold for the same edit unit (re-fetch
-   *  overlap on seek revisits would otherwise double the audio). */
+  /** Insert sorted by mediaStart, evicting any retained chunk this fresh one OVERLAPS (its media span
+   *  is being re-fetched). A re-fetch on a SHIFTED segment grid — e.g. the cold-start ramp on replay,
+   *  or differing prefetch timing on a seek revisit — produces chunks whose boundaries don't line up
+   *  with the retained ones. Keeping both scheduled the same audio twice (+6 dB); naively rejecting
+   *  the new one instead left a coverage GAP at the old/new grid transition (an audible dropout). The
+   *  fresh fetch is contiguous and current, so it WINS: drop the overlapped chunks (stopping any live
+   *  source — they're ahead of the playhead, so not the one sounding now) and insert this one, letting
+   *  the new grid tile the region seamlessly. Overlap uses a half-edit-unit tolerance so genuine
+   *  tiling (chunk end == next chunk start, which jitters by ~1e-9 in float) is NOT treated as overlap. */
   insertChunk(e) {
     const t = 0.5 * this.editRateDenominator / this.editRateNumerator;
+    for (let r = this.store.length - 1; r >= 0; r--) {
+      const o = this.store[r];
+      if (o.mediaEnd - e.mediaStart > t && e.mediaEnd - o.mediaStart > t) {
+        if (o.source)
+          try {
+            o.source.onended = null, o.source.stop();
+          } catch {
+          }
+        this.store.splice(r, 1);
+      }
+    }
     let s = 0, i = this.store.length;
     for (; s < i; ) {
-      const a = s + i >> 1;
-      this.store[a].mediaStart < e.mediaStart ? s = a + 1 : i = a;
+      const r = s + i >> 1;
+      this.store[r].mediaStart < e.mediaStart ? s = r + 1 : i = r;
     }
-    const r = this.store[s - 1], o = this.store[s];
-    r && Math.abs(r.mediaStart - e.mediaStart) < t || o && Math.abs(o.mediaStart - e.mediaStart) < t || this.store.splice(s, 0, e);
+    this.store.splice(s, 0, e);
   }
   /** Stop and clear all scheduled audio (e.g. on seek, so nothing keeps playing at the old offset). */
   stopSources() {
@@ -330,7 +347,7 @@ class q {
       this.lockTo(s);
     else {
       const r = i - this.anchorCtx + this.anchorMedia;
-      Math.abs(r - s) > U && this.lockTo(s);
+      Math.abs(r - s) > N && this.lockTo(s);
     }
     this.pump(s);
   }
@@ -339,7 +356,7 @@ class q {
   }
   /** Schedule every not-yet-handled chunk whose window reaches into [cur, cur+LOOKAHEAD). */
   pump(e) {
-    const t = this.cxt, s = e + N, i = t.currentTime;
+    const t = this.cxt, s = e + P, i = t.currentTime;
     for (const r of this.store) {
       if (r.mediaStart >= s) break;
       if (r.lastRun === this.runId || (r.lastRun = this.runId, r.mediaEnd <= e - 0.02)) continue;
@@ -355,6 +372,13 @@ class q {
    * Mix a chunk's currently-active channels to a stereo AudioBuffer and wrap it in a source node.
    * Explicit mixing is more reliable than Web Audio's implicit down-mix (undefined for >6/non-standard
    * channel counts). Returns null if there is nothing to play (no active channels in range).
+   *
+   * Channels routed to the same side are SUMMED at unity gain (not averaged): a channel's loudness
+   * must not change with how many other channels are selected. In broadcast files most of the N tracks
+   * are silent or alternate feeds, so averaging by selection count (1/N) buried the program ~Nx when
+   * "all" was selected; a unity sum keeps the program at the same level whether it's played alone or
+   * alongside silent siblings. Genuinely-overlapping loud channels can exceed full scale, but Web Audio
+   * clamps at the destination — acceptable, and the explicit intent here.
    */
   makeSource(e) {
     const t = this.cxt, { samples: s, channelCount: i, sampleRate: r } = e, o = Math.floor(s.length / i), a = this.active.filter((d) => d < i);
@@ -362,14 +386,13 @@ class q {
     const u = [], h = [];
     a.forEach((d, m) => (m % 2 === 0 ? u : h).push(d)), a.length === 1 && (h.length = 0, h.push(a[0]));
     const c = t.createBuffer(2, o, r), l = (d, m) => {
-      if (m.length === 0) return;
-      const x = 1 / m.length;
-      for (let p = 0; p < o; p++) {
-        let v = 0;
-        const T = p * i;
-        for (const B of m) v += s[T + B];
-        d[p] = v * x;
-      }
+      if (m.length !== 0)
+        for (let p = 0; p < o; p++) {
+          let v = 0;
+          const x = p * i;
+          for (const T of m) v += s[x + T];
+          d[p] = v;
+        }
     };
     l(c.getChannelData(0), u), l(c.getChannelData(1), h);
     const f = t.createBufferSource();
@@ -380,7 +403,7 @@ class q {
     if (this.store.length === 0) return;
     const t = [];
     for (const s of this.store) {
-      if (s.mediaEnd < e - I || s.mediaStart > e + W) {
+      if (s.mediaEnd < e - U || s.mediaStart > e + I) {
         if (s.source)
           try {
             s.source.onended = null, s.source.stop();
@@ -399,7 +422,7 @@ class q {
     }), this.cxt = null, this.anchored = !1, this.channelCount = 0;
   }
 }
-class L {
+class q {
   constructor(e, t, s, i) {
     this.video = e, this.requestPreview = t, this.settle = s, this.resume = i, this.active = !1, this.cycle = 0, this.latestFrame = null, this.seq = 0, this.watchdog = null, this.wasPlaying = !1, this.suppressSeeking = !1, this.hasStream = !1, this.duration = 0, this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
@@ -493,7 +516,7 @@ function k(n, e) {
 function F(n) {
   return n === 60 ? 4 : 2;
 }
-function V(n) {
+function O(n) {
   const e = n.base;
   if (e <= 0) return 0;
   let t = ((n.hours * 60 + n.minutes) * 60 + n.seconds) * e + n.frames;
@@ -518,32 +541,32 @@ function C(n) {
   const e = k(n.base, n.dropFrame) ? ";" : ":";
   return `${g(n.hours)}:${g(n.minutes)}:${g(n.seconds)}${e}${g(n.frames)}`;
 }
-function _(n, e = 0) {
+function V(n, e = 0) {
   if (n.length < 4) return null;
   const t = (n[0] & 15) + (n[0] >> 4 & 3) * 10, s = (n[0] & 64) !== 0, i = (n[1] & 15) + (n[1] >> 4 & 7) * 10, r = (n[2] & 15) + (n[2] >> 4 & 7) * 10;
   return { hours: (n[3] & 15) + (n[3] >> 4 & 3) * 10, minutes: r, seconds: i, frames: t, dropFrame: s, base: e };
 }
-const $ = {
+const L = {
   mpeg2video: "mpeg2",
   h264: "h264",
   libx264: "h264"
 };
 function M(n) {
-  const e = n.mxfCodec ?? $[n.ffmpegCodec] ?? n.ffmpegCodec;
+  const e = n.mxfCodec ?? L[n.ffmpegCodec] ?? n.ffmpegCodec;
   return { moduleUrl: n.moduleUrl, ffmpegCodec: n.ffmpegCodec, mxfCodec: e };
 }
-const O = {
+const $ = {
   startBufferSeconds: 10,
   maxBufferSeconds: 30,
   pcmAudioMode: "auto",
   seekMode: "accurate",
-  resumeBufferSeconds: E,
+  resumeBufferSeconds: D,
   debug: !1,
   plugins: {}
 };
-class G extends y {
+class _ extends y {
   constructor(e, t = {}) {
-    super(), this.worker = null, this.mseController = null, this.manifest = null, this.nextFetchFrame = 0, this.framesPerChunk = 50, this.rampChunkFrames = 50, this.fetchPending = !1, this.bufferFull = !1, this.editRateNumerator = 25, this.editRateDenominator = 1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.playIntent = !1, this.isBuffering = !1, this.startupGating = !1, this.manifestTimecodes = [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.rvfcHandle = 0, this.destroyed = !1, this.video = e, this.config = { ...O, ...t }, this.audio = new q(this.video, (s) => this.emit("audio-info", s)), this.scrub = new L(
+    super(), this.worker = null, this.mseController = null, this.manifest = null, this.nextFetchFrame = 0, this.framesPerChunk = 50, this.rampChunkFrames = 50, this.fetchPending = !1, this.bufferFull = !1, this.editRateNumerator = 25, this.editRateDenominator = 1, this.seqBase = 0, this.pendingInitSegment = null, this.pendingSeeks = 0, this.seekTargetFrame = 0, this.activeSeekMode = "accurate", this.previewParked = !1, this.playIntent = !1, this.isBuffering = !1, this.startupGating = !1, this.manifestTimecodes = [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.rvfcHandle = 0, this.destroyed = !1, this.video = e, this.config = { ...$, ...t }, this.audio = new W(this.video, (s) => this.emit("audio-info", s)), this.scrub = new q(
       this.video,
       (s, i) => {
         var r;
@@ -815,7 +838,7 @@ class G extends y {
     const t = e.pictureDescriptor, s = e.soundDescriptor;
     this.editRateNumerator = e.editRateNumerator, this.editRateDenominator = e.editRateDenominator, this.audio.setEditRate(e.editRateNumerator, e.editRateDenominator), this.scrub.setStream(e.duration, e.editRateNumerator, e.editRateDenominator);
     const i = e.editRateNumerator / e.editRateDenominator;
-    this.framesPerChunk = Math.ceil(i * R), this.rampChunkFrames = Math.max(A, Math.ceil(i * w)), this.startupGating = !0, this.manifestTimecodes = e.timecodes ?? [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.manifest = {
+    this.framesPerChunk = Math.ceil(i * R), this.rampChunkFrames = Math.max(w, Math.ceil(i * B)), this.startupGating = !0, this.manifestTimecodes = e.timecodes ?? [], this.systemAnchors = [], this.lastTimecodeEditUnit = -1, this.currentTimecodeBundle = null, this.manifest = {
       duration: e.duration,
       editRateNumerator: e.editRateNumerator,
       editRateDenominator: e.editRateDenominator,
@@ -983,10 +1006,10 @@ class G extends y {
   }
 }
 export {
-  G as MxfPlayer,
-  _ as decodeSmpte12mBcd,
+  _ as MxfPlayer,
+  V as decodeSmpte12mBcd,
   C as formatTimecode,
   b as frameCountToTimecode,
-  V as timecodeToFrameCount
+  O as timecodeToFrameCount
 };
 //# sourceMappingURL=mxf.esm.js.map
