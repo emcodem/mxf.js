@@ -614,7 +614,7 @@
       player.on('timeupdate', ({ currentTime, duration }) => {
         timeCur.textContent = fmt(currentTime);
         timeDur.textContent = fmt(duration);
-        if (!seeking && !kbScrubbing) seekBar.value = currentTime;
+        if (!seeking && !kbSkipping) seekBar.value = currentTime;
         syncPlayBtn();
       });
 
@@ -797,41 +797,39 @@
     // ── Keyboard ±10s skip via the scrub pump ──────────────────────────────────────────────────
     // A discrete seek into unbuffered media forces a full keyframe→target decode + a buffering hold,
     // so MASHING ↑/↓ kept re-seeking before each decode finished → perpetual "Buffering…". Instead we
-    // drive ↑/↓ through the SAME fast keyframe-preview + single-flight pump the slider uses: each
-    // press reports the new target (instant GOP-head preview, rapid presses coalesce to the latest),
-    // and a short idle timer ends the scrub to settle on the exact frame and resume. Feels like
-    // scrubbing instead of a chain of buffering stalls.
-    let kbScrubbing = false;
-    let kbScrubTimer = null;
-    let kbScrubTarget = 0;
-    const KB_SCRUB_SETTLE_MS = 350;   // settle this long after the last skip keypress
+    // ↑/↓ ±10 s do a PLAIN accurate seek, NOT the scrub-preview path the slider uses. The
+    // preview→settle-refetch sequence corrupts the first re-fetched forward segment on the MPEG-2
+    // transcode path (the picture freezes ~0.6–1 s on the next play — see SCRUBISSUE.md); a direct
+    // seek is proven clean. Rapid presses still coalesce: each press accumulates onto the last target
+    // (anchored to the live playhead when idle) and a short idle timer just releases the accumulator.
+    let kbSkipping = false;
+    let kbSkipTimer = null;
+    let kbSkipTarget = 0;
+    const KB_SKIP_COALESCE_MS = 350;   // hold the accumulated target this long after the last keypress
 
     function skipSeconds(delta) {
       if (!player) return;
-      // Indexless files have no keyframe map for previews — fall back to a plain accurate seek.
+      // Indexless files have no keyframe map — same plain accurate seek as everything else here.
       if (player.indexMode === 'none') { resetSpeed(); player.seek(player.currentTime + delta); return; }
       if (seeking) return;       // a slider drag owns the scrub session — ignore keyboard skip
       resetSpeed();              // cancel any J/L fast motion
-      const base = kbScrubbing ? kbScrubTarget : player.currentTime;
+      const base = kbSkipping ? kbSkipTarget : player.currentTime;
       // Clamp to the last real frame, not duration (= end of that frame): a target at duration lands
       // one frame past EOF and paints nothing, leaving the thumb short of the end. See lastFrameTime.
-      kbScrubTarget = Math.max(0, Math.min(base + delta, player.lastFrameTime));
-      if (!kbScrubbing) { kbScrubbing = true; player.beginScrub(); }
-      seekBar.value = kbScrubTarget;          // thumb follows the accumulated target, not the preview
-      timeCur.textContent = fmt(kbScrubTarget);
-      player.scrubTo(kbScrubTarget);          // coalesced fast preview at the latest target
-      if (kbScrubTimer) clearTimeout(kbScrubTimer);
-      kbScrubTimer = setTimeout(endKbScrub, KB_SCRUB_SETTLE_MS);
+      kbSkipTarget = Math.max(0, Math.min(base + delta, player.lastFrameTime));
+      kbSkipping = true;
+      seekBar.value = kbSkipTarget;           // thumb follows the accumulated target
+      timeCur.textContent = fmt(kbSkipTarget);
+      dbgLog('USER', 'skip seek', `${kbSkipTarget.toFixed(2)}s`);
+      player.seek(kbSkipTarget);              // plain seek — clean refetch, preserves play state
+      if (kbSkipTimer) clearTimeout(kbSkipTimer);
+      kbSkipTimer = setTimeout(endKbScrub, KB_SKIP_COALESCE_MS);
     }
-    // Settle the keyboard scrub session now (exact-frame decode + resume to prior play state). Called
-    // by the idle timer and eagerly by any other transport action so a pending settle can't fire late
-    // and override it.
+    // Release the keyboard-skip accumulator so the next press re-anchors to the live playhead. Called
+    // by the idle timer and eagerly by Space/K so a stale accumulator can't fight a fresh action.
     function endKbScrub() {
-      if (kbScrubTimer) { clearTimeout(kbScrubTimer); kbScrubTimer = null; }
-      if (!kbScrubbing) return;
-      kbScrubbing = false;
-      dbgLog('USER', 'skip settle', `${kbScrubTarget.toFixed(2)}s`);
-      player.endScrub(kbScrubTarget);
+      if (kbSkipTimer) { clearTimeout(kbSkipTimer); kbSkipTimer = null; }
+      kbSkipping = false;
     }
 
     document.addEventListener('keydown', (e) => {
