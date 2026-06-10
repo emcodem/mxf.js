@@ -205,17 +205,25 @@ class S extends y {
     this.video.src = "", this.mediaSource = null, this.sourceBuffers.clear(), this.queues.clear(), this.removeAllListeners();
   }
 }
-const E = 40, P = 0.25, N = 0.08, U = 2, I = 30;
+const E = 40, N = 0.25, P = 0.08, U = 2, I = 30;
 class W {
   constructor(e, t) {
-    this.video = e, this.onAudioInfo = t, this.cxt = null, this.timer = null, this.anchored = !1, this.anchorCtx = 0, this.anchorMedia = 0, this.runId = 0, this.lastWall = -1, this.lastMedia = 0, this.store = [], this.channelCount = 0, this.active = [0, 1], this.editRateNumerator = 25, this.editRateDenominator = 1;
+    this.video = e, this.onAudioInfo = t, this.cxt = null, this.timer = null, this.gainNode = null, this.volume = 1, this.anchored = !1, this.anchorCtx = 0, this.anchorMedia = 0, this.runId = 0, this.lastWall = -1, this.lastMedia = 0, this.store = [], this.channelCount = 0, this.active = [0, 1], this.editRateNumerator = 25, this.editRateDenominator = 1;
   }
   setEditRate(e, t) {
     this.editRateNumerator = e, this.editRateDenominator = t;
   }
   /** Create the AudioContext (PCM that MSE can't play is routed here). Pinned to the source rate. */
   createContext(e) {
-    this.cxt = new AudioContext({ sampleRate: e }), this.timer || (this.timer = setInterval(() => this.tick(), E));
+    this.cxt = new AudioContext({ sampleRate: e }), this.gainNode = this.cxt.createGain(), this.gainNode.gain.value = this.volume, this.gainNode.connect(this.cxt.destination), this.timer || (this.timer = setInterval(() => this.tick(), E));
+  }
+  /**
+   * Set the master output volume (0 = silent, 1 = unity; values >1 boost and may clip). Applied with a
+   * short ramp to avoid a click, and retained so it survives a call made before audio (the context)
+   * starts. Affects only the Web Audio PCM path — non-PCM audio plays through the muted <video>/MSE.
+   */
+  setVolume(e) {
+    this.volume = Math.max(0, e), this.gainNode && this.cxt && this.gainNode.gain.setTargetAtTime(this.volume, this.cxt.currentTime, 0.015);
   }
   hasContext() {
     return this.cxt !== null;
@@ -347,7 +355,7 @@ class W {
       this.lockTo(s);
     else {
       const r = i - this.anchorCtx + this.anchorMedia;
-      Math.abs(r - s) > N && this.lockTo(s);
+      Math.abs(r - s) > P && this.lockTo(s);
     }
     this.pump(s);
   }
@@ -356,7 +364,7 @@ class W {
   }
   /** Schedule every not-yet-handled chunk whose window reaches into [cur, cur+LOOKAHEAD). */
   pump(e) {
-    const t = this.cxt, s = e + P, i = t.currentTime;
+    const t = this.cxt, s = e + N, i = t.currentTime;
     for (const r of this.store) {
       if (r.mediaStart >= s) break;
       if (r.lastRun === this.runId || (r.lastRun = this.runId, r.mediaEnd <= e - 0.02)) continue;
@@ -389,14 +397,14 @@ class W {
       if (m.length !== 0)
         for (let p = 0; p < o; p++) {
           let v = 0;
-          const x = p * i;
-          for (const T of m) v += s[x + T];
+          const F = p * i;
+          for (const T of m) v += s[F + T];
           d[p] = v;
         }
     };
     l(c.getChannelData(0), u), l(c.getChannelData(1), h);
     const f = t.createBufferSource();
-    return f.buffer = c, f.connect(t.destination), f;
+    return f.buffer = c, f.connect(this.gainNode ?? t.destination), f;
   }
   /** Drop chunks well behind or far ahead of the playhead to bound memory. */
   evict(e) {
@@ -419,7 +427,7 @@ class W {
   destroy() {
     var e;
     this.stopSources(), this.store = [], this.timer && (clearInterval(this.timer), this.timer = null), (e = this.cxt) == null || e.close().catch(() => {
-    }), this.cxt = null, this.anchored = !1, this.channelCount = 0;
+    }), this.cxt = null, this.gainNode = null, this.anchored = !1, this.channelCount = 0;
   }
 }
 class q {
@@ -513,15 +521,15 @@ function g(n) {
 function k(n, e) {
   return e && (n === 30 || n === 60);
 }
-function F(n) {
+function x(n) {
   return n === 60 ? 4 : 2;
 }
-function O(n) {
+function V(n) {
   const e = n.base;
   if (e <= 0) return 0;
   let t = ((n.hours * 60 + n.minutes) * 60 + n.seconds) * e + n.frames;
   if (k(e, n.dropFrame)) {
-    const s = F(e), i = n.hours * 60 + n.minutes;
+    const s = x(e), i = n.hours * 60 + n.minutes;
     t -= s * (i - Math.floor(i / 10));
   }
   return t;
@@ -531,7 +539,7 @@ function b(n, e, t) {
   let s = n < 0 ? 0 : Math.floor(n);
   const i = k(e, t);
   if (i) {
-    const h = F(e), c = e * 600 - h * 9, l = e * 60 - h, f = Math.floor(s / c), d = s % c;
+    const h = x(e), c = e * 600 - h * 9, l = e * 60 - h, f = Math.floor(s / c), d = s % c;
     s += h * 9 * f + (d > h ? h * Math.floor((d - h) / l) : 0);
   }
   const r = s % e, o = Math.floor(s / e) % 60, a = Math.floor(s / (e * 60)) % 60;
@@ -541,7 +549,7 @@ function C(n) {
   const e = k(n.base, n.dropFrame) ? ";" : ":";
   return `${g(n.hours)}:${g(n.minutes)}:${g(n.seconds)}${e}${g(n.frames)}`;
 }
-function V(n, e = 0) {
+function O(n, e = 0) {
   if (n.length < 4) return null;
   const t = (n[0] & 15) + (n[0] >> 4 & 3) * 10, s = (n[0] & 64) !== 0, i = (n[1] & 15) + (n[1] >> 4 & 7) * 10, r = (n[2] & 15) + (n[2] >> 4 & 7) * 10;
   return { hours: (n[3] & 15) + (n[3] >> 4 & 3) * 10, minutes: r, seconds: i, frames: t, dropFrame: s, base: e };
@@ -742,6 +750,14 @@ class _ extends y {
    */
   setAudioChannels(e) {
     this.audio.setActiveChannels(e);
+  }
+  /**
+   * Set the master audio volume: 0 = silent, 1 = unity (default); values above 1 boost and may clip.
+   * Applies to the Web Audio PCM path (the only audible path — the <video> element is muted). Safe to
+   * call before playback starts; the level is retained and applied once the audio context exists.
+   */
+  setVolume(e) {
+    this.audio.setVolume(e);
   }
   loadUrl(e) {
     var i;
@@ -1007,9 +1023,9 @@ class _ extends y {
 }
 export {
   _ as MxfPlayer,
-  V as decodeSmpte12mBcd,
+  O as decodeSmpte12mBcd,
   C as formatTimecode,
   b as frameCountToTimecode,
-  O as timecodeToFrameCount
+  V as timecodeToFrameCount
 };
 //# sourceMappingURL=mxf.esm.js.map

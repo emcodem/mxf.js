@@ -141,6 +141,12 @@
     <label style="display:inline-flex; align-items:center; gap:4px; margin-right:14px; vertical-align:bottom;">
       <input type="checkbox" id="channelAll"> all</label>
     <span id="channelBoxes"></span>
+    <span id="volumeControl" style="display:inline-flex; align-items:center; gap:6px; margin-left:20px; vertical-align:bottom;">
+      <span style="color:#666">volume</span>
+      <input type="range" id="volume" min="0" max="100" step="1" value="100"
+             style="width:120px; accent-color:#4af; cursor:pointer;">
+      <span id="volumeVal" style="font-family:monospace; color:#aaa; min-width:36px;">100%</span>
+    </span>
   </div>
 
   <div id="log"></div>
@@ -180,6 +186,8 @@
     const audioChannelsEl = document.getElementById('audioChannels');
     const channelBoxesEl  = document.getElementById('channelBoxes');
     const channelAllEl    = document.getElementById('channelAll');
+    const volumeEl        = document.getElementById('volume');
+    const volumeValEl     = document.getElementById('volumeVal');
     const bufferingOverlay = document.getElementById('bufferingOverlay');
     let player = null;
     let seeking = false;
@@ -505,6 +513,16 @@
       syncSelectAll();
     });
 
+    // Master volume lever. Drives the player's Web Audio master gain (the <video> is muted, so this is
+    // the only audible path). 0–100% maps to gain 0–1. The current value is also re-applied whenever a
+    // player is (re)created in initPlayer, so it carries across file loads.
+    function applyVolume() {
+      const pct = parseInt(volumeEl.value, 10) || 0;
+      volumeValEl.textContent = pct + '%';
+      player?.setVolume(pct / 100);
+    }
+    volumeEl.addEventListener('input', applyVolume);
+
     // Build one checkbox per source audio channel. Checked channels are played (mixed to stereo);
     // default is the first pair (1 + 2). Any change pushes the new selection to the player.
     function buildChannelSelector(channelCount, activeChannels) {
@@ -566,6 +584,7 @@
 
       player = new MxfPlayer(video, { debug: true, startBufferSeconds: 3, maxBufferSeconds: 8, seekMode: 'accurate' });
       instrumentPlayer(player);   // wrap API + attach event listeners onto the debug timeline
+      applyVolume();              // carry the current volume-lever level onto the new player
 
       player.on('manifest', (data) => {
         fps = data.editRateNumerator / data.editRateDenominator;

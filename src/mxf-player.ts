@@ -441,6 +441,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.audio.setActiveChannels(channels); // applies to already-buffered audio (near-instant)
   }
 
+  /**
+   * Set the master audio volume: 0 = silent, 1 = unity (default); values above 1 boost and may clip.
+   * Applies to the Web Audio PCM path (the only audible path — the <video> element is muted). Safe to
+   * call before playback starts; the level is retained and applied once the audio context exists.
+   */
+  setVolume(volume: number): void {
+    this.audio.setVolume(volume);
+  }
+
   loadUrl(url: string): void {
     this.setup();
     const plugins = this.config.plugins?.videoDecoder

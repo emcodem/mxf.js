@@ -43,6 +43,9 @@ const FWD_WINDOW = 30;         // evict chunks further ahead than this (orphans 
 export class WebAudioController {
   private cxt: AudioContext | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
+  // Master gain every source routes through, so volume is one control point. Created with the context.
+  private gainNode: GainNode | null = null;
+  private volume = 1; // 0..1+, applied to gainNode (retained so setVolume works before the context exists)
 
   // media→context-time anchor: a chunk at media time m sounds at context time anchorCtx+(m-anchorMedia).
   private anchored = false;
@@ -79,7 +82,21 @@ export class WebAudioController {
   /** Create the AudioContext (PCM that MSE can't play is routed here). Pinned to the source rate. */
   createContext(sampleRate: number): void {
     this.cxt = new AudioContext({ sampleRate });
+    this.gainNode = this.cxt.createGain();
+    this.gainNode.gain.value = this.volume; // honour a volume set before the context existed
+    this.gainNode.connect(this.cxt.destination);
     if (!this.timer) this.timer = setInterval(() => this.tick(), TICK_MS);
+  }
+
+  /**
+   * Set the master output volume (0 = silent, 1 = unity; values >1 boost and may clip). Applied with a
+   * short ramp to avoid a click, and retained so it survives a call made before audio (the context)
+   * starts. Affects only the Web Audio PCM path — non-PCM audio plays through the muted <video>/MSE.
+   */
+  setVolume(volume: number): void {
+    this.volume = Math.max(0, volume);
+    if (this.gainNode && this.cxt)
+      this.gainNode.gain.setTargetAtTime(this.volume, this.cxt.currentTime, 0.015);
   }
 
   hasContext(): boolean {
@@ -311,7 +328,7 @@ export class WebAudioController {
 
     const source = cxt.createBufferSource();
     source.buffer = buffer;
-    source.connect(cxt.destination);
+    source.connect(this.gainNode ?? cxt.destination); // through the master gain (volume)
     return source;
   }
 
@@ -336,6 +353,7 @@ export class WebAudioController {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     this.cxt?.close().catch(() => {});
     this.cxt = null;
+    this.gainNode = null; // recreated with the next context (this.volume carries the level over)
     this.anchored = false;
     this.channelCount = 0; // re-announced on the next file's first chunk
   }
