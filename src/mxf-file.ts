@@ -6,7 +6,6 @@ import { parseHeaderMetadata, MxfMetadata } from './parser/metadata.js';
 import { parseIndexTableSegment, IndexTableSegment, classifyIndexMode } from './parser/index-table.js';
 import {
   isPartitionPack,
-  isPrimerPack,
   isIndexTableSegment,
   isGenericContainerElement,
   ulEquals,
@@ -20,7 +19,6 @@ import {
   FOOTER_INDEX_MAX,
   HEADER_METADATA_MIN_READ,
   HEADER_METADATA_FALLBACK_READ,
-  ESSENCE_SCAN_WINDOW,
   INDEX_SEGMENT_MAX,
 } from './core/constants.js';
 
@@ -190,10 +188,14 @@ export class MxfFile {
       const pkt = iter.next();
       if (!pkt) break;
 
-      // Stop if we accidentally hit another partition pack
-      if (isPrimerPack(pkt.key)) {
-        primer = parsePrimerPack(metaBuf, pkt);
-        metadataStart = iter.offset; // metadata sets begin right after the primer
+      // Detect Primer Pack by invariant tail bytes [8..15] = 0D 01 02 01 01 05 01 00,
+      // regardless of byte 5 (0x53 spec-conformant, 0x05 non-conformant). Context-safe:
+      // Footer Open Pack shares these bytes but cannot precede header metadata sets.
+      const k = pkt.key;
+      if (k[8] === 0x0d && k[9] === 0x01 && k[10] === 0x02 && k[11] === 0x01
+       && k[12] === 0x01 && k[13] === 0x05 && k[14] === 0x01 && k[15] === 0x00) {
+        try { primer = parsePrimerPack(metaBuf, pkt); } catch { /* non-conformant — keep empty primer */ }
+        metadataStart = iter.offset;
         continue;
       }
 
@@ -264,8 +266,14 @@ export class MxfFile {
    * Why walk rather than trust byte counts: some encoders (e.g. XAVC) understate headerByteCount and
    * tuck a CBG index segment into the index region between metadata and essence, so neither
    * "skip headerByteCount+indexByteCount" nor "first non-fill KLV after the partition pack" lands
-   * correctly. Walking whole KLVs and stopping at the first 0D 01 03 01 element is robust to both
-   * essence-in-header-partition (XAVC) and essence-in-body-partition (D-10/OP1a) layouts.
+   * correctly. Walking by KLV self-declared lengths and stopping at the first 0D 01 03 01 element is
+   * robust to both essence-in-header-partition (XAVC) and essence-in-body-partition (D-10/OP1a).
+   *
+   * Uses the same re-probe pattern as collectMultiPartitionIndex: reads only the KLV header
+   * (key + BER length, never the value) to stride, fetching a fresh small window whenever the
+   * next header falls outside the current buffer. This handles arbitrarily large pre-essence
+   * regions (KAG-padded files with 512 KB alignment put the essence at exactly 1 MB, beyond a
+   * fixed 1 MB scan window).
    */
   private async locateEssence(
     rip: RandomIndexPackEntry[],
@@ -277,40 +285,63 @@ export class MxfFile {
     const partOffset = Number(body?.byteOffset ?? BigInt(fallback));
     const indexSegments: IndexTableSegment[] = [];
 
-    // Essence usually begins within a few hundred KB of its partition pack (metadata + index +
-    // fill). A 1 MB window covers every real-world case; if it doesn't, fall back to the partition
-    // offset itself (sequential reading still works, just without the index).
-    const window = Math.min(ESSENCE_SCAN_WINDOW, fileSize - partOffset);
-    if (window <= 0) return { essenceStart: BigInt(partOffset), bodySID: 0, indexSegments };
+    if (partOffset >= fileSize) return { essenceStart: BigInt(partOffset), bodySID: 0, indexSegments };
+
+    const KLV_HEADER_MAX = 25;  // 16-byte key + up to 9-byte BER long-form length
+    const PROBE = 64 * 1024;    // initial / re-probe read covering a KLV header (+ small values)
+    const MAX_KLV_ITERS = 4096; // guard against infinite loops on corrupt files
 
     try {
-      const buf = await this.loader.fetchRange(partOffset, partOffset + window - 1, 'bootstrap: essence partition scan');
+      let buf = await this.loader.fetchRange(
+        partOffset, Math.min(partOffset + PROBE, fileSize) - 1, 'bootstrap: essence partition scan');
+      let bufStart = partOffset;
 
-      // Parse + skip the partition pack at the window start (best-effort: a fallback offset that
-      // isn't a partition pack just means we walk from the window start with bodySID unknown).
+      // Parse + skip the partition pack at the window start (best-effort).
       let bodySID = 0;
-      let walkStart = 0;
+      let abs = partOffset; // absolute file offset of the next KLV to inspect
       try {
         const ppStart = KLVIterator.skipRunIn(buf);
         bodySID = parsePartitionPack(buf, partOffset).bodySID;
-        walkStart = ppStart + readKLV(buf, ppStart).totalLength;
-      } catch { walkStart = 0; }
+        const ppKlv = readKLV(buf, ppStart);
+        abs = partOffset + ppStart + ppKlv.totalLength;
+      } catch { /* walk from start with unknown bodySID */ }
 
-      const iter = new KLVIterator(buf, walkStart);
-      while (iter.hasMore()) {
-        const off = iter.offset;
-        const pkt = iter.next();
-        if (!pkt) break; // incomplete KLV at window end — essence lies beyond it
-        if (isIndexTableSegment(pkt.key)) {
-          try { indexSegments.push(parseIndexTableSegment(buf, pkt)); } catch { /* skip malformed */ }
-          continue;
+      for (let it = 0; it < MAX_KLV_ITERS; it++) {
+        // Re-probe if the KLV header at abs falls outside the current window.
+        if (abs < bufStart || abs + KLV_HEADER_MAX > bufStart + buf.byteLength) {
+          const hEnd = Math.min(abs + PROBE, fileSize) - 1;
+          if (hEnd < abs) break;
+          buf = await this.loader.fetchRange(abs, hEnd, 'bootstrap: essence partition scan');
+          bufStart = abs;
         }
-        // First content-package element (system / picture / sound / data / D-10) → essence start.
-        if (isGenericContainerElement(pkt.key)) {
-          return { essenceStart: BigInt(partOffset + off), bodySID, indexSegments };
+
+        let hdr: ReturnType<typeof readKLVHeader>;
+        try { hdr = readKLVHeader(buf, abs - bufStart); }
+        catch { break; }
+
+        if (isGenericContainerElement(hdr.key)) {
+          return { essenceStart: BigInt(abs), bodySID, indexSegments };
         }
-        // Primer / fill / header metadata / partition packs are skipped by KLV length.
+
+        if (isIndexTableSegment(hdr.key) && hdr.valueLength > 0 && hdr.valueLength <= INDEX_SEGMENT_MAX) {
+          // Parse the index segment — fetch its value if it runs past the probe window.
+          if (abs - bufStart + hdr.totalLength <= buf.byteLength) {
+            try { indexSegments.push(parseIndexTableSegment(buf, hdr)); }
+            catch { /* skip malformed */ }
+          } else {
+            const segEnd = Math.min(abs + hdr.totalLength, fileSize) - 1;
+            if (segEnd >= abs) {
+              try {
+                const segBuf = await this.loader.fetchRange(abs, segEnd, 'bootstrap: oversized index segment');
+                indexSegments.push(parseIndexTableSegment(segBuf, readKLV(segBuf, 0)));
+              } catch { /* skip malformed */ }
+            }
+          }
+        }
+
+        abs += hdr.totalLength; // stride by the KLV's self-declared length
       }
+
       return { essenceStart: BigInt(partOffset), bodySID, indexSegments };
     } catch {
       return { essenceStart: BigInt(partOffset), bodySID: 0, indexSegments };

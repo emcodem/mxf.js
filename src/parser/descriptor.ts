@@ -1,4 +1,4 @@
-import { ulStartsWith } from '../core/ul.js';
+import { ulMatchEssenceCodingPrefix } from '../core/ul.js';
 
 export type VideoCodec = 'h264' | 'mpeg2' | 'unknown';
 export type AudioCodec = 'pcm' | 'aac' | 'unknown';
@@ -35,28 +35,22 @@ export interface SoundDescriptor {
 }
 
 // ── Picture essence coding UL → codec identification (single shared table) ───
-// Bytes 8-15 of the PictureEssenceCoding UL identify the codec; byte 7 (the SMPTE
-// item designator) varies between registrations, so each codec lists its known
-// prefix variants. This is the only codec-identification table in the codebase —
-// metadata.ts imports identifyVideoCodec rather than re-deriving it.
+// Byte 7 of a PictureEssenceCoding UL is the SMPTE item-designator / registry-version
+// and varies across spec revisions (0x01, 0x03, 0x09, 0x0a, 0x0d, …). All entries
+// below use 0x7f as a placeholder at position 7; ulMatchEssenceCodingPrefix skips it.
 const AVC_CODING_PREFIXES: Uint8Array[] = [
-  // AVC / H.264: …01 0a 04 01 02 02 01 32 and the …01 09… designator variant
-  new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x0a,0x04,0x01,0x02,0x02,0x01,0x32]),
-  new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x09,0x04,0x01,0x02,0x02,0x01,0x32]),
-  // AVC byte-13 = 0x31 variant used by Long-GOP XAVC-L (e.g. …01 31 40 01); the trailing two bytes
-  // carry the profile/level, so match only through the …02 01 31 family prefix. Confirmed H.264 by
-  // parsing SPS/PPS/POC + B-slices from the essence of xavc_l_1080p50.mxf.
-  new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x0a,0x04,0x01,0x02,0x02,0x01,0x31]),
-  new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x09,0x04,0x01,0x02,0x02,0x01,0x31]),
+  // byte-13 = 0x32: AVC-Intra
+  new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x7f,0x04,0x01,0x02,0x02,0x01,0x32]),
+  // byte-13 = 0x31: Long-GOP / XAVC-L (trailing bytes carry profile/level, so match through 0x31 only)
+  new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x7f,0x04,0x01,0x02,0x02,0x01,0x31]),
+  // byte-13 = 0x30: H.264/MPEG-4 AVC Video (SMPTE generic AVC label)
+  new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x7f,0x04,0x01,0x02,0x02,0x01,0x30]),
 ];
-const MPEG2_CODING_PREFIXES: Uint8Array[] = [
-  // MPEG-2: …01 03 04 01 02 02 01 and the …01 01… designator variant
-  new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x03,0x04,0x01,0x02,0x02,0x01]),
-  new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x01,0x04,0x01,0x02,0x02,0x01]),
-];
+// MPEG-2: byte-13 = 0x00–0x09.  byte-13 = 0x10 is MPEG-1 (not supported → 'unknown').
+const MPEG2_BASE_PREFIX = new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x7f,0x04,0x01,0x02,0x02,0x01]);
 
 export function identifyVideoCodec(codingUL: Uint8Array): VideoCodec {
-  if (AVC_CODING_PREFIXES.some(p => ulStartsWith(codingUL, p))) return 'h264';
-  if (MPEG2_CODING_PREFIXES.some(p => ulStartsWith(codingUL, p))) return 'mpeg2';
+  if (AVC_CODING_PREFIXES.some(p => ulMatchEssenceCodingPrefix(codingUL, p))) return 'h264';
+  if (ulMatchEssenceCodingPrefix(codingUL, MPEG2_BASE_PREFIX) && codingUL[13] <= 0x09) return 'mpeg2';
   return 'unknown';
 }
