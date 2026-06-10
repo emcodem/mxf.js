@@ -1,5 +1,10 @@
 import { ILoader, logRead } from './loader.js';
 
+/** Total attempts for a single range read before giving up (1 initial try + retries). */
+const FETCH_RETRIES = 3;
+/** Backoff before each retry, in ms; the last value is reused for any further attempts. */
+const BACKOFF_MS = [120, 350];
+
 /**
  * Error message shown when the server returns 200 instead of 206 for a Range request — i.e. it
  * ignored the Range header and would send the WHOLE file for every read. Streaming MXF requires
@@ -79,30 +84,59 @@ export class HttpLoader implements ILoader {
     this.inflight.add(ac);
     const t0 = performance.now();
     try {
-      let res: Response;
-      try {
-        res = await fetch(this.url, { headers: { Range: `bytes=${start}-${end}` }, signal: ac.signal });
-      } catch (e) {
-        if (ac.signal.aborted) throw e; // AbortError — propagate as-is so callers can detect it
-        throw new Error(
-          `fetchRange ${start}-${end} on ${this.url} failed: ${e instanceof Error ? e.message : String(e)}`,
-        );
+      // Transient network errors ("Failed to fetch" TypeError, or a 5xx) get a bounded retry with
+      // backoff before failing. Heavy backward stepping at an evicted file region churns HTTP/1.1
+      // connections (each step supersedes/aborts the prior read), which intermittently yields a
+      // "Failed to fetch" on the next read — and a paused seek that loses its fetch has no timeupdate
+      // to retrigger it, so the picture wedges on the last painted frame. A retry self-heals the blip.
+      // An abort (genuine supersession) is never retried — it propagates immediately. A 200 (server
+      // ignored Range) and a 4xx are not transient either, so they fail without retrying.
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < FETCH_RETRIES; attempt++) {
+        if (ac.signal.aborted) break; // superseded while backing off — stop and let the throw below fire
+        try {
+          const res = await fetch(this.url, { headers: { Range: `bytes=${start}-${end}` }, signal: ac.signal });
+          // A 200 here means the server ignored the Range and is about to stream the WHOLE file — bail
+          // (and cancel the body) rather than download gigabytes for a small read. Not transient.
+          if (res.status === 200) {
+            try { await res.body?.cancel(); } catch { /* ignore */ }
+            throw noRangeError(this.url);
+          }
+          if (res.status !== 206) {
+            const err = new Error(`fetchRange ${start}-${end} failed: ${res.status} ${res.statusText}`);
+            if (res.status < 500) throw err;        // 4xx (incl. 416) is not transient — fail now
+            lastErr = err; if (attempt < FETCH_RETRIES - 1) await this.backoff(attempt, ac.signal); continue; // 5xx
+          }
+          const buf = await res.arrayBuffer(); // can also reject on a mid-body network drop
+          logRead('HTTP', start, end, reason, performance.now() - t0, this.readStats);
+          return buf;
+        } catch (e) {
+          // Retry only genuine network errors — fetch()/arrayBuffer() reject with a TypeError
+          // ("Failed to fetch") on those. Aborts (DOMException), a non-range 200, and 4xx are all
+          // plain non-TypeError throws here, so they propagate immediately without a retry.
+          if (!(e instanceof TypeError) || ac.signal.aborted) throw e;
+          lastErr = e;
+          if (attempt < FETCH_RETRIES - 1) await this.backoff(attempt, ac.signal);
+        }
       }
-      // A 200 here means the server ignored the Range and is about to stream the WHOLE file — bail
-      // (and cancel the body) rather than download gigabytes for a small read.
-      if (res.status === 200) {
-        try { await res.body?.cancel(); } catch { /* ignore */ }
-        throw noRangeError(this.url);
-      }
-      if (res.status !== 206) {
-        throw new Error(`fetchRange ${start}-${end} failed: ${res.status} ${res.statusText}`);
-      }
-      const buf = await res.arrayBuffer();
-      logRead('HTTP', start, end, reason, performance.now() - t0, this.readStats);
-      return buf;
+      throw new Error(
+        `fetchRange ${start}-${end} on ${this.url} failed after ${FETCH_RETRIES} attempts: ` +
+        `${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
+      );
     } finally {
       this.inflight.delete(ac);
     }
+  }
+
+  /** Sleep `BACKOFF_MS[attempt]` (clamped to the last entry), bailing early if the read is aborted. */
+  private backoff(attempt: number, signal: AbortSignal): Promise<void> {
+    const ms = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
+    return new Promise<void>((resolve) => {
+      if (signal.aborted) return resolve();
+      const timer = setTimeout(done, ms);
+      function done() { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); }
+      signal.addEventListener('abort', done, { once: true });
+    });
   }
 
   destroy(): void {
