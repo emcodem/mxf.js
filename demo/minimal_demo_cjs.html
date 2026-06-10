@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<!--
+  mxf.js — minimal drop-in example (no bundler, no modules).
+
+  To integrate, copy THREE files from dist/ and keep them side by side
+  (the player loads the other two by relative URL at runtime):
+
+      mxf.umd.js        ← the player (this is what you <script src> below)
+      demux-worker.js   ← the Web Worker it spawns (must sit next to mxf.umd.js)
+      kernels.wasm      ← MPEG-2 decode kernels (must sit next to demux-worker.js)
+
+  Then it's three lines of JS: load the script, `new MxfJs.MxfPlayer(video)`,
+  and call loadFile()/loadUrl(). That's the whole API surface you need.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>mxf.js — minimal</title>
+</head>
+<body>
+  <input type="file" id="file" accept=".mxf" />
+  <video id="video" controls muted playsinline width="720" style="display:block;margin-top:8px;background:#000"></video>
+
+  <!-- 1. Load the UMD build — exposes the global `MxfJs`. -->
+  <script src="../dist/mxf.umd.js"></script>
+  <script>
+    const video = document.getElementById('video');
+
+    // 2. Create the player on a <video> element.
+    const player = new MxfJs.MxfPlayer(video);
+
+    // 3. Feed it a File (or a URL via player.loadUrl('https://.../clip.mxf')).
+    document.getElementById('file').addEventListener('change', (e) => {
+      const f = e.target.files[0];
+      if (f) player.loadFile(f);
+    });
+
+    // Optional: react to load / errors. Native <video controls> handles play/pause/seek.
+    player.on('manifest', (m) => console.log('loaded', m.duration + 's'));
+    player.on('error', (err) => console.error('mxf.js:', err.message));
+  </script>
+</body>
+</html>
