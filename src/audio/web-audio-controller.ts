@@ -43,6 +43,9 @@ const FWD_WINDOW = 30;         // evict chunks further ahead than this (orphans 
 export class WebAudioController {
   private cxt: AudioContext | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
+  // Master gain every source routes through, so volume is one control point. Created with the context.
+  private gainNode: GainNode | null = null;
+  private volume = 1; // 0..1+, applied to gainNode (retained so setVolume works before the context exists)
 
   // media→context-time anchor: a chunk at media time m sounds at context time anchorCtx+(m-anchorMedia).
   private anchored = false;
@@ -79,7 +82,21 @@ export class WebAudioController {
   /** Create the AudioContext (PCM that MSE can't play is routed here). Pinned to the source rate. */
   createContext(sampleRate: number): void {
     this.cxt = new AudioContext({ sampleRate });
+    this.gainNode = this.cxt.createGain();
+    this.gainNode.gain.value = this.volume; // honour a volume set before the context existed
+    this.gainNode.connect(this.cxt.destination);
     if (!this.timer) this.timer = setInterval(() => this.tick(), TICK_MS);
+  }
+
+  /**
+   * Set the master output volume (0 = silent, 1 = unity; values >1 boost and may clip). Applied with a
+   * short ramp to avoid a click, and retained so it survives a call made before audio (the context)
+   * starts. Affects only the Web Audio PCM path — non-PCM audio plays through the muted <video>/MSE.
+   */
+  setVolume(volume: number): void {
+    this.volume = Math.max(0, volume);
+    if (this.gainNode && this.cxt)
+      this.gainNode.gain.setTargetAtTime(this.volume, this.cxt.currentTime, 0.015);
   }
 
   hasContext(): boolean {
@@ -157,18 +174,29 @@ export class WebAudioController {
     this.insertChunk(chunk);
   }
 
-  /** Insert sorted by mediaStart, deduping a chunk we already hold for the same edit unit (re-fetch
-   *  overlap on seek revisits would otherwise double the audio). */
+  /** Insert sorted by mediaStart, evicting any retained chunk this fresh one OVERLAPS (its media span
+   *  is being re-fetched). A re-fetch on a SHIFTED segment grid — e.g. the cold-start ramp on replay,
+   *  or differing prefetch timing on a seek revisit — produces chunks whose boundaries don't line up
+   *  with the retained ones. Keeping both scheduled the same audio twice (+6 dB); naively rejecting
+   *  the new one instead left a coverage GAP at the old/new grid transition (an audible dropout). The
+   *  fresh fetch is contiguous and current, so it WINS: drop the overlapped chunks (stopping any live
+   *  source — they're ahead of the playhead, so not the one sounding now) and insert this one, letting
+   *  the new grid tile the region seamlessly. Overlap uses a half-edit-unit tolerance so genuine
+   *  tiling (chunk end == next chunk start, which jitters by ~1e-9 in float) is NOT treated as overlap. */
   private insertChunk(chunk: AudioChunk): void {
-    const half = 0.5 * this.editRateDenominator / this.editRateNumerator;
+    const eps = 0.5 * this.editRateDenominator / this.editRateNumerator; // half an edit unit
+    for (let i = this.store.length - 1; i >= 0; i--) {
+      const c = this.store[i];
+      if (c.mediaEnd - chunk.mediaStart > eps && chunk.mediaEnd - c.mediaStart > eps) {
+        if (c.source) { try { c.source.onended = null; c.source.stop(); } catch { /* already stopped */ } }
+        this.store.splice(i, 1);
+      }
+    }
     let lo = 0, hi = this.store.length;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
       if (this.store[mid].mediaStart < chunk.mediaStart) lo = mid + 1; else hi = mid;
     }
-    const prev = this.store[lo - 1], next = this.store[lo];
-    if ((prev && Math.abs(prev.mediaStart - chunk.mediaStart) < half) ||
-        (next && Math.abs(next.mediaStart - chunk.mediaStart) < half)) return; // already have it
     this.store.splice(lo, 0, chunk);
   }
 
@@ -267,6 +295,13 @@ export class WebAudioController {
    * Mix a chunk's currently-active channels to a stereo AudioBuffer and wrap it in a source node.
    * Explicit mixing is more reliable than Web Audio's implicit down-mix (undefined for >6/non-standard
    * channel counts). Returns null if there is nothing to play (no active channels in range).
+   *
+   * Channels routed to the same side are SUMMED at unity gain (not averaged): a channel's loudness
+   * must not change with how many other channels are selected. In broadcast files most of the N tracks
+   * are silent or alternate feeds, so averaging by selection count (1/N) buried the program ~Nx when
+   * "all" was selected; a unity sum keeps the program at the same level whether it's played alone or
+   * alongside silent siblings. Genuinely-overlapping loud channels can exceed full scale, but Web Audio
+   * clamps at the destination — acceptable, and the explicit intent here.
    */
   private makeSource(c: AudioChunk): AudioBufferSourceNode | null {
     const cxt = this.cxt!;
@@ -281,12 +316,11 @@ export class WebAudioController {
     const buffer = cxt.createBuffer(2, samplesPerChannel, sampleRate);
     const mixInto = (out: Float32Array, chans: number[]): void => {
       if (chans.length === 0) return;
-      const gain = 1 / chans.length;
       for (let i = 0; i < samplesPerChannel; i++) {
         let acc = 0;
         const base = i * channelCount;
         for (const ch of chans) acc += samples[base + ch];
-        out[i] = acc * gain;
+        out[i] = acc;
       }
     };
     mixInto(buffer.getChannelData(0), left);
@@ -294,7 +328,7 @@ export class WebAudioController {
 
     const source = cxt.createBufferSource();
     source.buffer = buffer;
-    source.connect(cxt.destination);
+    source.connect(this.gainNode ?? cxt.destination); // through the master gain (volume)
     return source;
   }
 
@@ -319,6 +353,7 @@ export class WebAudioController {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     this.cxt?.close().catch(() => {});
     this.cxt = null;
+    this.gainNode = null; // recreated with the next context (this.volume carries the level over)
     this.anchored = false;
     this.channelCount = 0; // re-announced on the next file's first chunk
   }
