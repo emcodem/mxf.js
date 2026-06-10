@@ -32,6 +32,17 @@ interface AudioChunk {
   sampleRate: number;
   source: AudioBufferSourceNode | null; // live node when scheduled, else null
   lastRun: number;             // scheduler run this chunk was last considered in (dedupes work)
+  scheduledOnce: boolean;      // ever started a source (diag: distinguishes a missed chunk from retained history)
+}
+
+/** One diagnostics record. `t` is AudioContext wall time, `media` the relevant media time. */
+interface DiagEvent {
+  seq: number;                 // monotonic order key (stable sort)
+  t: number;                   // cxt.currentTime when recorded (seconds)
+  media: number;               // relevant media time (seconds)
+  type: string;                // event kind (arrive, sched, drop, relock, stall, underrun, …)
+  anomaly: boolean;            // true if this is a flagged, glitch-prone event
+  detail: Record<string, unknown>;
 }
 
 const TICK_MS = 40;            // scheduler cadence
@@ -68,10 +79,28 @@ export class WebAudioController {
   private editRateNumerator = 25;
   private editRateDenominator = 1;
 
+  // ── Diagnostics (opt-in via `diag`; zero cost when off) ──────────────────────────────────────
+  // The scheduler decides everything silently, so an audible glitch normally leaves no trace. When
+  // diag is on we record each decision into a ring, auto-warn on detectable anomalies, and let the
+  // user dump the preceding ~DIAG_WINDOW seconds the instant they hear something (dumpDiag()).
+  private static readonly DIAG_CAP = 512;          // ring-buffer size (events)
+  private static readonly DIAG_WINDOW = 3;         // seconds of history a manual dump shows
+  private diagBuf: DiagEvent[] = [];               // ring of recent events
+  private diagHead = 0;                            // next write slot
+  private diagSeq = 0;                             // monotonic order key
+  private diagWarnAt: Record<string, number> = {}; // last warn time per type (rate-limit bursts)
+  private schedCtxEnd = -1;                        // ctx-time end of the last started source (gap probe)
+  private arriveDur = -1;                          // previous chunk's duration (sudden-change probe)
+  private arriveCh = 0;                            // previous chunk's channel count (param-change probe)
+  private arriveRate = 0;                          // previous chunk's sample rate (param-change probe)
+  private seenEU = new Set<number>();              // edit units already received (duplicate probe)
+
   constructor(
     private readonly video: HTMLVideoElement,
     /** Fired when the channel count is first known or changes — lets the UI build a selector. */
     private readonly onAudioInfo: (info: { channelCount: number; activeChannels: number[] }) => void,
+    /** Enable audio diagnostics (anomaly warnings + dumpDiag). Off = zero overhead. */
+    private readonly diag = false,
   ) {}
 
   setEditRate(numerator: number, denominator: number): void {
@@ -115,12 +144,35 @@ export class WebAudioController {
    *  the picture jumps or freezes outside the tick's view: seek/scrub start, and pause. The decoded
    *  store is kept (a seek may land in already-buffered audio). */
   onSeek(): void {
-    this.unlock();
+    this.unlock('seek');
   }
 
   /** Total number of PCM channels in the loaded file (0 until audio starts arriving). */
   get channels(): number {
     return this.channelCount;
+  }
+
+  /**
+   * Contiguous decoded-PCM coverage ahead of `cur` (seconds): how far forward from the playhead the
+   * store is tiled without a hole. Used by the player's resume gate so playback doesn't start on a
+   * video-only buffer while the Web Audio path is still empty (the post-seek "video plays, audio
+   * silent" dropout). Returns Infinity when Web Audio isn't the audible route (no context / MSE audio
+   * / no audio track), so for those files it never constrains the gate. 0 means `cur` is uncovered.
+   */
+  bufferedAhead(cur: number): number {
+    if (!this.cxt) return Infinity; // Web Audio not the audible path → not a gating constraint
+    const eps = 0.5 * this.editRateDenominator / this.editRateNumerator;
+    let end = -1;
+    for (const c of this.store) {            // store is sorted by mediaStart
+      if (end < 0) {
+        if (c.mediaStart <= cur + 1e-6 && c.mediaEnd > cur) end = c.mediaEnd; // the chunk covering cur
+      } else if (c.mediaStart - end <= eps) {
+        end = c.mediaEnd;                    // contiguous continuation — extend coverage
+      } else {
+        break;                               // hole — coverage ends here
+      }
+    }
+    return end < 0 ? 0 : Math.max(0, end - cur);
   }
 
   /** Source channels (0-based) currently routed to the stereo output. */
@@ -176,8 +228,20 @@ export class WebAudioController {
     const duration = samplesPerChannel / sampleRate;
     const chunk: AudioChunk = {
       mediaStart, mediaEnd: mediaStart + duration, duration,
-      samples, channelCount, sampleRate, source: null, lastRun: -1,
+      samples, channelCount, sampleRate, source: null, lastRun: -1, scheduledOnce: false,
     };
+    if (this.diag) {
+      this.rec('arrive', false, mediaStart, { eu: editUnit, dur: +duration.toFixed(5), ch: channelCount, rate: sampleRate });
+      if (this.seenEU.has(editUnit)) this.rec('dup-eu', true, mediaStart, { eu: editUnit });
+      else this.seenEU.add(editUnit);
+      if (this.arriveRate && (channelCount !== this.arriveCh || sampleRate !== this.arriveRate))
+        this.rec('param-change', true, mediaStart, { ch: channelCount, wasCh: this.arriveCh, rate: sampleRate, wasRate: this.arriveRate });
+      // A chunk whose duration jumps from its neighbour's = a wrong sample count (a classic periodic
+      // click). Tolerant of NTSC's 1601/1602 cadence (<0.1%); a truncated chunk stands well clear.
+      if (this.arriveDur > 0 && Math.abs(duration - this.arriveDur) > this.arriveDur * 0.05)
+        this.rec('dur-jump', true, mediaStart, { dur: +duration.toFixed(5), was: +this.arriveDur.toFixed(5), samples: samplesPerChannel });
+      this.arriveDur = duration; this.arriveCh = channelCount; this.arriveRate = sampleRate;
+    }
     this.insertChunk(chunk);
   }
 
@@ -192,6 +256,18 @@ export class WebAudioController {
    *  tiling (chunk end == next chunk start, which jitters by ~1e-9 in float) is NOT treated as overlap. */
   private insertChunk(chunk: AudioChunk): void {
     const eps = 0.5 * this.editRateDenominator / this.editRateNumerator; // half an edit unit
+    // Redundant re-fetch guard. Audio media-time is absolute (editUnit→seconds), so a chunk for a span
+    // that is ALREADY contiguously resident carries identical PCM — it adds nothing. After a seek the
+    // fetch frontier can sit behind the resident buffer (a revisited region), so the seek/forward fetch
+    // re-produces 8→10 etc. that we already hold. Replacing resident chunks with these duplicates is
+    // actively harmful: they arrive piecemeal (slow transcode), so removing the resident chunk opens a
+    // hole the playhead falls into before the replacement lands — a mid-playback underrun (the ~500 ms
+    // silence after a seek). Dropping the duplicate keeps the resident audio playing seamlessly. The
+    // replace-on-overlap path below still runs for genuinely NEW/misaligned grids (not fully covered).
+    if (this.isRegionResident(chunk.mediaStart, chunk.mediaEnd, eps)) {
+      if (this.diag) this.rec('refetch-skip', false, chunk.mediaStart, { end: +chunk.mediaEnd.toFixed(3) });
+      return;
+    }
     for (let i = this.store.length - 1; i >= 0; i--) {
       const c = this.store[i];
       if (c.mediaEnd - chunk.mediaStart > eps && chunk.mediaEnd - c.mediaStart > eps) {
@@ -205,17 +281,58 @@ export class WebAudioController {
       if (this.store[mid].mediaStart < chunk.mediaStart) lo = mid + 1; else hi = mid;
     }
     this.store.splice(lo, 0, chunk);
+    if (this.diag && lo > 0) {
+      // Hole between this chunk and its predecessor (a tiling break, not a seek to a new region).
+      const gap = chunk.mediaStart - this.store[lo - 1].mediaEnd;
+      if (gap > eps && gap < 1) this.rec('coverage-gap', true, chunk.mediaStart, { gap: +gap.toFixed(4) });
+    }
+  }
+
+  /** Debug: audio store summary "N:[s0-e0][s1-e1]…" (chunk count + each chunk's media span), so a gap
+   *  or a short/diverged store is visible in the gate log. */
+  debugStore(): string {
+    if (!this.store.length) return '0:[]';
+    let s = `${this.store.length}:`;
+    for (const c of this.store) s += `[${c.mediaStart.toFixed(2)}-${c.mediaEnd.toFixed(2)}]`;
+    return s;
+  }
+
+  /** True when [start, end) is already contiguously covered by chunks in the store, i.e. a fetch for
+   *  this span would be redundant. `store` is sorted by mediaStart; walk from the chunk covering
+   *  `start` and extend while tiles are contiguous (gap ≤ eps), succeeding as soon as reach ≥ end. */
+  private isRegionResident(start: number, end: number, eps: number): boolean {
+    let reach = -1;
+    for (const c of this.store) {
+      if (reach < 0) {
+        if (c.mediaStart <= start + eps && c.mediaEnd > start) reach = c.mediaEnd; // chunk covering start
+      } else if (c.mediaStart - reach <= eps) {
+        reach = Math.max(reach, c.mediaEnd);                                       // contiguous tile
+      } else {
+        break;                                                                     // hole — give up
+      }
+      if (reach >= end - eps) return true;
+    }
+    return false;
   }
 
   /** Stop and clear all scheduled audio (e.g. on seek, so nothing keeps playing at the old offset). */
   private stopSources(): void {
+    this.schedCtxEnd = -1; // the played-source chain is broken: the next start has no gap predecessor
     for (const c of this.store) {
       if (c.source) { try { c.source.onended = null; c.source.stop(); } catch { /* already stopped */ } c.source = null; }
     }
   }
 
   /** Stop audio and drop the anchor; a subsequent tick re-locks to the live playhead. */
-  private unlock(): void {
+  private unlock(reason = ''): void {
+    if (this.diag) {
+      this.rec('unlock', false, this.video.currentTime, { reason });
+      // A seek/scrub/gate breaks the arrive history: the region after the jump is legitimately re-fetched
+      // and may start on a partial chunk. Clear the per-chunk probes so they don't flag that replayed
+      // region as dup-eu / dur-jump — phantom anomalies that would otherwise bury a real glitch.
+      this.seenEU.clear();
+      this.arriveDur = -1; this.arriveCh = 0; this.arriveRate = 0;
+    }
     this.stopSources();
     this.anchored = false;
     this.runId++;
@@ -235,7 +352,7 @@ export class WebAudioController {
     // seeks/scrubs (seeking/paused) and stalls (paused) for free, and mutes during J/L fast-forward/
     // rewind (rate≠1) instead of thrashing on resync.
     if (v.paused || v.seeking || Math.abs(v.playbackRate - 1) > 0.01) {
-      if (this.anchored) this.unlock();
+      if (this.anchored) this.unlock('gate');
       this.lastWall = -1; // re-probe progress when playback resumes
       return;
     }
@@ -248,7 +365,8 @@ export class WebAudioController {
       const wallDelta = wall - this.lastWall;
       const mediaDelta = cur - this.lastMedia;
       if (wallDelta > 0.005 && mediaDelta < 0.25 * wallDelta) {
-        if (this.anchored) this.unlock();
+        this.rec('stall', true, cur, { wallDelta: +wallDelta.toFixed(3), mediaDelta: +mediaDelta.toFixed(3) });
+        if (this.anchored) this.unlock('stall');
         this.lastWall = wall; this.lastMedia = cur;
         return;
       }
@@ -264,10 +382,19 @@ export class WebAudioController {
       const audioMediaNow = (wall - this.anchorCtx) + this.anchorMedia;
       if (Math.abs(audioMediaNow - cur) > MAX_DRIFT) this.lockTo(cur);
     }
+    if (this.diag) {
+      // Playing and anchored but no stored chunk covers the playhead → we've run out of audio (the
+      // decode fell behind, or audio lags the picture after a seek). The decisive dropout signal.
+      const covered = this.store.some(c => c.mediaStart <= cur + 1e-6 && c.mediaEnd > cur);
+      if (!covered) this.rec('underrun', true, cur, { chunks: this.store.length });
+    }
     this.pump(cur);
   }
 
   private lockTo(cur: number): void {
+    // anomaly when already anchored: a mid-run resync (drift) stops & restarts sources → a click.
+    if (this.diag) this.rec('relock', this.anchored, cur,
+      { from: +this.anchorMedia.toFixed(3), drift: this.anchored ? +((this.cxt!.currentTime - this.anchorCtx) + this.anchorMedia - cur).toFixed(4) : 0 });
     this.stopSources();
     this.runId++;
     this.anchorCtx = this.cxt!.currentTime;
@@ -284,17 +411,37 @@ export class WebAudioController {
       if (c.mediaStart >= horizon) break;     // sorted: nothing further is in range
       if (c.lastRun === this.runId) continue; // already handled this run
       c.lastRun = this.runId;
-      if (c.mediaEnd <= cur - 0.02) continue; // fully behind the playhead
+      if (c.mediaEnd <= cur - 0.02) {         // fully behind the playhead
+        // A never-played chunk reaching just behind the playhead = a chunk we missed (a gap). Retained
+        // back-window history (already played, or well behind) is normal — don't flag it.
+        if (this.diag && !c.scheduledOnce && cur - c.mediaEnd < 0.5)
+          this.rec('drop', true, c.mediaStart, { reason: 'behind-unplayed', mediaEnd: +c.mediaEnd.toFixed(3) });
+        continue;
+      }
 
       const ctxStart = this.anchorCtx + (c.mediaStart - this.anchorMedia);
       const into = now - ctxStart;            // seconds already elapsed into this chunk
-      if (into >= c.duration - 0.002) continue; // missed its window (underrun) — drop
+      if (into >= c.duration - 0.002) {        // missed its window (underrun) — drop
+        if (this.diag && !c.scheduledOnce && into - c.duration < 0.5)
+          this.rec('drop', true, c.mediaStart, { reason: 'missed', into: +into.toFixed(4), dur: +c.duration.toFixed(4) });
+        continue;
+      }
       const source = this.makeSource(c);
       if (!source) continue;
       if (into <= 0) source.start(ctxStart);  // future chunk: start at its exact time (gapless tile)
       else source.start(now, into);           // straddles the playhead: start now, offset in
       c.source = source;
+      c.scheduledOnce = true;
       source.onended = () => { c.source = null; };
+      if (this.diag) {
+        // Consecutive sources should tile sample-exactly. A non-zero gap vs the previous source's
+        // context-time end is an audible click (positive = silence, negative = overlap).
+        const ctxEnd = into <= 0 ? ctxStart + c.duration : now + (c.duration - into);
+        const gap = this.schedCtxEnd >= 0 ? ctxStart - this.schedCtxEnd : 0;
+        this.rec('sched', this.schedCtxEnd >= 0 && Math.abs(gap) > 0.001, c.mediaStart,
+          { mode: into <= 0 ? 'future' : 'straddle', gap: +gap.toFixed(5), ctxStart: +ctxStart.toFixed(4), ctxEnd: +ctxEnd.toFixed(4) });
+        this.schedCtxEnd = ctxEnd;
+      }
     }
   }
 
@@ -353,6 +500,83 @@ export class WebAudioController {
     this.store = kept;
   }
 
+  // ── Diagnostics helpers ──────────────────────────────────────────────────────────────────────
+
+  /** Record a diagnostic event into the ring (no-op unless diag is on). Anomalies also console.warn,
+   *  rate-limited per type so one stutter can't produce a wall of logs. */
+  private rec(type: string, anomaly: boolean, media: number, detail: Record<string, unknown>): void {
+    if (!this.diag) return;
+    const t = this.cxt ? this.cxt.currentTime : 0;
+    this.diagBuf[this.diagHead] = { seq: this.diagSeq++, t, media, type, anomaly, detail };
+    this.diagHead = (this.diagHead + 1) % WebAudioController.DIAG_CAP;
+    if (anomaly) {
+      const last = this.diagWarnAt[type] ?? -Infinity;
+      if (t - last >= 0.2) {
+        this.diagWarnAt[type] = t;
+        // eslint-disable-next-line no-console
+        console.warn(`[audio-diag] ${type} media=${media.toFixed(3)}s t=${t.toFixed(3)}s`, detail);
+      }
+    }
+  }
+
+  /**
+   * Dump the recent scheduling history to the console — call the instant a glitch is heard. The ring
+   * holds the preceding ~DIAG_WINDOW seconds, so the dump shows what happened just BEFORE the keypress
+   * (where the glitch was). Includes a state snapshot and a boundary-sample probe: a large jump at a
+   * tile join with no scheduling anomaly means the click is in the decoded data/mix, not the scheduler.
+   */
+  dumpDiag(label = ''): void {
+    /* eslint-disable no-console */
+    if (!this.diag) { console.warn('[audio-diag] diagnostics are off (construct WebAudioController with diag=true)'); return; }
+    const now = this.cxt ? this.cxt.currentTime : 0;
+    const v = this.video;
+    const cur = v.currentTime;
+    const events = this.diagBuf
+      .filter((e): e is DiagEvent => !!e && now - e.t <= WebAudioController.DIAG_WINDOW)
+      .sort((a, b) => a.seq - b.seq);
+    const coverage = this.store.length
+      ? { from: +this.store[0].mediaStart.toFixed(3), to: +this.store[this.store.length - 1].mediaEnd.toFixed(3), chunks: this.store.length }
+      : { from: 0, to: 0, chunks: 0 };
+    console.group(`[audio-diag] mark ${label} @ media=${cur.toFixed(3)}s t=${now.toFixed(3)}s (${events.length} events / ${WebAudioController.DIAG_WINDOW}s)`);
+    console.log('state', {
+      anchored: this.anchored, runId: this.runId, cxtState: this.cxt?.state,
+      paused: v.paused, seeking: v.seeking, rate: v.playbackRate, active: this.active.slice(), coverage,
+    });
+    console.table(events.map(e => ({ dt: +(e.t - now).toFixed(3), type: e.type, media: +e.media.toFixed(3), anomaly: e.anomaly, ...e.detail })));
+    const joins = this.boundaryProbe(cur);
+    if (joins.length) { console.log('tile-join discontinuities (mixed output; large jump = click in data/mix):'); console.table(joins); }
+    console.groupEnd();
+    /* eslint-enable no-console */
+  }
+
+  /** Mixed-output discontinuity at each contiguous tile join near the playhead. A large jump = a click
+   *  baked into the decoded PCM or the channel mix, not a scheduling fault. */
+  private boundaryProbe(cur: number): Array<Record<string, number>> {
+    const eps = 0.5 * this.editRateDenominator / this.editRateNumerator;
+    const out: Array<Record<string, number>> = [];
+    for (let i = 0; i + 1 < this.store.length; i++) {
+      const a = this.store[i], b = this.store[i + 1];
+      if (a.mediaEnd < cur - 1 || b.mediaStart > cur + 1) continue;  // only joins around the playhead
+      if (Math.abs(b.mediaStart - a.mediaEnd) > eps) continue;       // not a contiguous tile join
+      const lastA = this.mixFrame(a, Math.floor(a.samples.length / a.channelCount) - 1);
+      const firstB = this.mixFrame(b, 0);
+      out.push({ join: +a.mediaEnd.toFixed(3), jumpL: +Math.abs(lastA[0] - firstB[0]).toFixed(4), jumpR: +Math.abs(lastA[1] - firstB[1]).toFixed(4) });
+    }
+    return out;
+  }
+
+  /** The stereo [L,R] sample the active-channel mix produces for frame `i` of a chunk (mirrors makeSource). */
+  private mixFrame(c: AudioChunk, i: number): [number, number] {
+    const sel = this.active.filter(ch => ch < c.channelCount);
+    if (sel.length === 0 || i < 0) return [0, 0];
+    const left: number[] = [], right: number[] = [];
+    sel.forEach((ch, k) => (k % 2 === 0 ? left : right).push(ch));
+    if (sel.length === 1) { right.length = 0; right.push(sel[0]); }
+    const base = i * c.channelCount;
+    const sum = (chs: number[]): number => chs.reduce((acc, ch) => acc + c.samples[base + ch], 0);
+    return [sum(left), sum(right)];
+  }
+
   /** Tear down the AudioContext and reset all state for the next file. */
   destroy(): void {
     this.stopSources();
@@ -363,5 +587,9 @@ export class WebAudioController {
     this.gainNode = null; // recreated with the next context (this.volume carries the level over)
     this.anchored = false;
     this.channelCount = 0; // re-announced on the next file's first chunk
+    // Reset diagnostics for the next file.
+    this.diagBuf = []; this.diagHead = 0; this.diagSeq = 0; this.diagWarnAt = {};
+    this.schedCtxEnd = -1; this.arriveDur = -1; this.arriveCh = 0; this.arriveRate = 0;
+    this.seenEU.clear();
   }
 }

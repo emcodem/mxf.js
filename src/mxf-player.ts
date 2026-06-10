@@ -167,7 +167,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     super();
     this.video = video;
     this.config = { ...DEFAULT_CONFIG, ...config };
-    this.audio = new WebAudioController(this.video, (info) => this.emit('audio-info', info));
+    this.audio = new WebAudioController(this.video, (info) => this.emit('audio-info', info), !!this.config.debug);
     this.scrub = new ScrubController(
       this.video,
       (targetFrame, seq) => this.worker?.postMessage({ type: 'scrubPreview', targetFrame, seq } as WorkerCommand),
@@ -451,6 +451,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    */
   setVolume(volume: number): void {
     this.audio.setVolume(volume);
+  }
+
+  /**
+   * Diagnostics: dump the recent audio-scheduling history to the console — call the instant a glitch
+   * is heard. Only does anything when the player was created with `debug: true` (which enables audio
+   * diagnostics). See WebAudioController.dumpDiag for the dump format.
+   */
+  markAudioGlitch(label = ''): void {
+    this.audio.dumpDiag(label);
   }
 
   loadUrl(url: string): void {
@@ -776,14 +785,20 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       this.scrub.scrubTo(targetTime);
       return;
     }
-    // Cheap in-buffer seek (frame-step, rewind, click within the already-buffered region while
-    // paused): the requested frame is already buffered and the element paints it immediately. Doing a
-    // full worker seek here would re-transcode keyframe→target, reset the forward-fetch frontier
-    // backward and abort the in-flight prefetch — which collapses the forward buffer and freezes
-    // playback after a burst of frame-steps. So skip all worker work; the frontier (nextFetchFrame)
-    // is preserved and forward fetching continues seamlessly from the end of the same range. Limited
-    // to the paused element so a seek during playback still flushes/re-locks audio normally.
-    if (this.video.paused && !this.previewParked && this.isSeekServedByBuffer(targetTime)) return;
+    // Cheap in-buffer seek (frame-step, rewind, click within the already-buffered region): the
+    // requested frame is already in BOTH the video MSE buffer and the resident PCM store, so the
+    // element paints it immediately and audio can re-tile from chunks already decoded. A full worker
+    // seek here would re-transcode keyframe→target, reset the forward-fetch frontier backward and
+    // abort the in-flight prefetch — and, for audio, refetch chunks we already hold, which insertChunk
+    // then evicts and replaces with not-yet-transcoded ones (the post-seek dropout). So skip all
+    // worker work; the frontier (nextFetchFrame) is preserved and forward fetching continues from the
+    // same range. Works whether paused or playing: when playing we drop the audio anchor so the
+    // scheduler re-locks to the new playhead from the RESIDENT store (no refetch — ~one tick of
+    // silence instead of a multi-second underrun). A paused element re-locks on the next play().
+    if (!this.previewParked && this.isSeekServedByBuffer(targetTime)) {
+      this.audio.onSeek();
+      return;
+    }
     this.initiateSeek(targetTime, this.config.seekMode);
   }
 
@@ -796,13 +811,20 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    */
   private isSeekServedByBuffer(targetTime: number): boolean {
     if (!this.mseController || !this.manifest) return false;
-    const ahead = this.mseController.getBufferedAhead('video', targetTime);
-    if (ahead <= 0) return false;                     // target isn't inside any buffered range
+    const videoAhead = this.mseController.getBufferedAhead('video', targetTime);
+    if (videoAhead <= 0) return false;                // target isn't inside any buffered video range
+    // The Web Audio PCM path must ALSO have the target resident, else skipping the worker seek strands
+    // audio with no decoded chunk at the new playhead. bufferedAhead returns Infinity for non-Web-Audio
+    // files (MSE audio / no audio), so this never blocks them; 0 means the target PCM is uncovered.
+    const audioAhead = this.audio.bufferedAhead(targetTime);
+    if (audioAhead <= 0) return false;
     const fps = this.editRateNumerator / this.editRateDenominator;
-    const totalFrames = Math.round(this.manifest.duration * fps);
-    if (this.nextFetchFrame >= totalFrames) return true;   // everything to EOF already requested
-    const rangeEnd = targetTime + ahead;              // end of the buffered range containing target
-    return rangeEnd >= this.nextFetchFrame / fps - 0.5;
+    // Both buffers must tile contiguously up to where forward fetch will resume (capped at the stream
+    // end for a fully-fetched file). Required of BOTH tracks — NOT a blanket "served" when video is all
+    // fetched: a backward seek can land where video is fully resident but audio was evicted/diverged;
+    // skipping the re-seek there would strand the audio gate forever (no forward fetch left to fill it).
+    const frontierTime = Math.min(this.nextFetchFrame / fps, this.manifest.duration) - 0.5;
+    return targetTime + videoAhead >= frontierTime && targetTime + audioAhead >= frontierTime;
   }
 
   private onVideoSeeked(): void {
@@ -816,6 +838,14 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // Re-arm the one-shot buffer gate: the target region is (likely) unbuffered, so the resume after
     // this seek should hold for the buffer + show "buffering" rather than stall silently.
     this.startupGating = true;
+    // Hold the element NOW if it's playing — don't wait for a native 'waiting' event, which only fires
+    // when VIDEO is missing. A forward seek can land where video is still buffered (a prior pass) but
+    // audio has diverged/been evicted: the element keeps PLAYING with no audio (no 'waiting', no gate),
+    // and this seek's refetch resets the fetch frontier back to the keyframe, starving video too —
+    // "audio drops + video hangs, no buffering". Pausing routes the resume through maybeResumePlayback,
+    // which holds (buffering) until the post-seek fetch refills BOTH tracks in sync, then plays once.
+    // The paused element still paints the seeked frame from the buffer, so the picture jumps instantly.
+    if (!this.video.paused) { this.video.pause(); this.setBuffering(true); }
     this.activeSeekMode = mode;
     // A new seek supersedes any parked preview; this seek will define the next decode start.
     this.previewParked = false;
@@ -900,6 +930,16 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private maybeResumePlayback(): void {
     if (!this.playIntent || !this.manifest) return;
     if (this.scrub.isActive) return;          // the scrub controller owns the element while scrubbing
+    // A seek is in flight: its refetch is about to REPLACE the chunks around the target (insertChunk
+    // stops the live audio source and the slow re-transcode leaves a gap), and the fetch frontier still
+    // reflects the OLD position (a stale-EOF bypass). Resuming now plays onto a buffer that's about to
+    // be clobbered — the post-seek dropout, even when the resident buffer looks full (v/a ≥ target from
+    // a prior playthrough). So hold and show buffering until 'seeked' lands and the post-seek fetch
+    // refills BOTH buffers in sync; we then resume ONCE from a healthy buffer and the clobber happened
+    // silently while paused. Released as soon as 'seeked' decrements pendingSeeks — a live worker always
+    // replies 1:1, so this can't wedge; only a dead worker leaves it pending (which can't play anyway,
+    // and surfaces via the worker 'error' path).
+    if (this.pendingSeeks > 0) { this.setBuffering(true); return; }
     if (!this.video.paused) { this.setBuffering(false); return; }
 
     const fps = this.editRateNumerator / this.editRateDenominator;
@@ -907,7 +947,28 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     const fetchedToEof = this.nextFetchFrame >= totalFrames;
     const target = this.resumeTargetSeconds();
 
-    if (this.bufferedAhead() >= target || fetchedToEof) {
+    // Gate on BOTH video and the Web Audio PCM path. The audio (decoded to Web Audio, not MSE) is
+    // decoupled from the video buffer, so resuming on video alone after a seek would start the picture
+    // while the audio store is still empty/short — the playhead then outruns the late-arriving chunks
+    // and they drop 'behind-unplayed' (a second-plus of silence). audioAhead is Infinity for non-Web-
+    // Audio files, so this is a no-op there. fetchedToEof still forces a start (can't fetch more).
+    const audioAhead = this.audio.bufferedAhead(this.video.currentTime);
+    const videoAhead = this.bufferedAhead();
+    // Deadlock breaker: forward fetch is bounded by requested-ahead, so once video is buffered a full
+    // maxBuffer past the playhead, NO further fetch runs — a short/diverged audio buffer will never be
+    // backfilled. Waiting for audio in that state hangs on "buffering" forever (video full, audio
+    // short). When the fetch is capped (or we're at EOF), don't gate on audio — resume on video; audio
+    // catches up as the playhead advances and re-opens the fetch window.
+    const requestedAhead = this.nextFetchFrame / fps - this.video.currentTime;
+    const audioStuck = fetchedToEof || requestedAhead >= this.config.maxBufferSeconds;
+    const willPlay = (videoAhead >= target && (audioAhead >= target || audioStuck)) || fetchedToEof;
+    if (this.config.debug) {
+      this.log(`gate cur=${this.video.currentTime.toFixed(2)} v=${videoAhead.toFixed(2)} ` +
+        `a=${audioAhead === Infinity ? 'inf' : audioAhead.toFixed(2)} target=${target.toFixed(2)} ` +
+        `eof=${fetchedToEof} pending=${this.pendingSeeks} reqAhead=${requestedAhead.toFixed(2)} ` +
+        `stuck=${audioStuck} → ${willPlay ? 'PLAY' : 'hold'} vbuf=${this.videoRanges()} abuf=${this.audio.debugStore()}`);
+    }
+    if (willPlay) {
       // Disarm the one-shot gate on the play ATTEMPT, not on the 'playing' event: if the element
       // can't immediately sustain (a decode-bound source stalls right after the buffered range),
       // 'playing' may never fire, and a still-armed gate would force-pause→replay in a tight loop.
@@ -929,6 +990,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    */
   private onVideoWaiting(): void {
     if (!this.playIntent || this.scrub.isActive || this.previewParked) return;
+    if (this.config.debug) this.log(`waiting cur=${this.video.currentTime.toFixed(2)} gating=${this.startupGating} pending=${this.pendingSeeks} vbuf=${this.videoRanges()}`);
     this.setBuffering(true);
     // Only the one-shot startup gate forcibly holds the element (cold start / post-seek): re-buffer
     // to RESUME_BUFFER_SECONDS, then resume once. A mid-playback underrun (gate already cleared) just
@@ -942,6 +1004,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
   private log(msg: string): void {
     if (this.config.debug) console.log('[mxf.js]', msg);
+  }
+
+  /** Debug: the <video> element's buffered ranges as "[s1-e1][s2-e2]…" (a gap between ranges is the
+   *  hang-then-skip symptom). */
+  private videoRanges(): string {
+    const b = this.video.buffered;
+    let s = '';
+    for (let i = 0; i < b.length; i++) s += `[${b.start(i).toFixed(2)}-${b.end(i).toFixed(2)}]`;
+    return s || '[]';
   }
 
   private destroyInternal(): void {

@@ -583,6 +583,7 @@
       tcEl.title = '';
 
       player = new MxfPlayer(video, { debug: true, startBufferSeconds: 3, maxBufferSeconds: 8, seekMode: 'accurate' });
+      window.player = player;     // expose for console: player.markAudioGlitch() to dump audio diag
       instrumentPlayer(player);   // wrap API + attach event listeners onto the debug timeline
       applyVolume();              // carry the current volume-lever level onto the new player
 
@@ -842,7 +843,7 @@
       if (!player || playBtn.disabled) return;
       if (e.ctrlKey || e.metaKey || e.altKey) return;
 
-      const KEY_NAMES = { ' ': 'Space', j: 'J', J: 'J', l: 'L', L: 'L', k: 'K', K: 'K',
+      const KEY_NAMES = { ' ': 'Space', j: 'J', J: 'J', l: 'L', L: 'L', k: 'K', K: 'K', g: 'G mark-glitch', G: 'G mark-glitch',
         ArrowLeft: '← step-back', ArrowRight: '→ step-fwd', ArrowUp: '↑ +10s', ArrowDown: '↓ −10s' };
       if (KEY_NAMES[e.key]) dbgLog('USER', `key: ${KEY_NAMES[e.key]}`);
 
@@ -867,6 +868,8 @@
         case 'ArrowRight': e.preventDefault(); stepFrame(1);  break;
         case 'ArrowUp':    e.preventDefault(); skipSeconds(10);  break;
         case 'ArrowDown':  e.preventDefault(); skipSeconds(-10); break;
+        // Press the instant a glitch is heard: dumps the preceding ~3 s of audio-scheduling history.
+        case 'g': case 'G': e.preventDefault(); player.markAudioGlitch('keypress'); break;
       }
     });
 
