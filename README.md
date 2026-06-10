@@ -29,7 +29,7 @@ HTTP Range / File API ──► Web Worker ──► demux ──► remux / tra
 | Codec | Path | Notes |
 |-------|------|-------|
 | **H.264 / AVC-Intra (XAVC)** | Remux to fMP4 | Played natively by Chrome (High 4:2:2 / profile 122 via its software decoder). SPS-derived `avc1` dimensions for interlaced 1080i MBAFF. - Firefox support missing yet (that requires WASM)|
-| **MPEG-2** (D-10 / IMX, XDCAM Long-GOP) | Decode in JS → re-encode to H.264 via WebCodecs `VideoEncoder` → fMP4 | Full javascript MPEG-2 decoder (derived and extended from https://github.com/phoboslab/jsmpeg) and extended for interlaced 1080i 4:2:2 Long-GOP. I/P/B frames, open-GOP scrub handling, field-DCT, 4:2:0 and 4:2:2. |
+| **MPEG-2** (D-10 / IMX, XDCAM Long-GOP) | Decode in JS → re-encode to H.264 via WebCodecs `VideoEncoder` → fMP4 | Full javascript MPEG-2 decoder (derived and extended from https://github.com/phoboslab/jsmpeg) and extended for interlaced 1080i 4:2:2 Long-GOP. I/P/B frames, open-GOP scrub handling, field-DCT, 4:2:0 and 4:2:2. **Bit-exact** with ffmpeg's `-idct simple` decoder — see [Decoder accuracy](#decoder-accuracy). |
 
 All video flows through the single `<video>` element, so seeking and scrubbing work identically for every source.
 
@@ -321,6 +321,16 @@ src/
 ```
 
 The worker owns all parsing, decoding, and remuxing; the main thread owns the `<video>` element, MSE buffers, and the Web Audio graph. They communicate over typed messages (`src/worker/worker-messages.ts`).
+
+---
+
+## Decoder accuracy
+
+The JavaScript MPEG-2 decoder is **bit-exact with ffmpeg's scalar `-idct simple` decoder**: for the same essence it produces byte-for-byte identical YUV output (per-pixel max diff `0` across all 120 I/P/B test frames, on both the pure-JS and WASM-kernel paths). The IDCT is a direct port of `ff_simple_idct_int16_8bit` (row/column W-constant passes, including ffmpeg's row DC-only `<<3` shortcut and the `W4*(c0+32)` folded column rounding), and dequantization, mismatch control, and skipped-B macroblock prediction all follow the same rounding ffmpeg uses. This matters because the decoded frames are re-encoded to H.264 for playback — starting from the exact same pixels ffmpeg would produce keeps the transcode faithful to a reference decode.
+
+Verified by `tests/xdcam-refcompare.test.ts` (run `npm run test:bitexact`), which compares every decoded plane against an ffmpeg reference dump and asserts an exact `0` difference (self-skips when the reference is absent, e.g. in CI). See [`BITEXACT.md`](BITEXACT.md) for the parity notes and the ffmpeg-internals details (DC bias, int16 wrap, mismatch toggle) the decode must match.
+
+> Reference dump: `ffmpeg -cpuflags 0 -flags +bitexact -idct simple -i input.mxf -pix_fmt yuv422p -f rawvideo ref.yuv`
 
 ---
 
