@@ -19,7 +19,7 @@ export interface SpsppsPair {
  * VideoEncoder is available in dedicated workers (Chrome 94+).
  */
 export class Mpeg2Transcoder {
-  private encoder: VideoEncoder;
+  private encoder!: VideoEncoder;
   private pendingChunks: TranscodedChunk[] = [];
   private _spspps: SpsppsPair | null = null;
   private _codecStr: string | null = null;
@@ -29,6 +29,12 @@ export class Mpeg2Transcoder {
   private displayWidth: number;
   private displayHeight: number;
   private encoderError: Error | null = null;
+  // The exact config the encoder was configured with — stashed so a reclaimed encoder can be rebuilt
+  // identically (same SPS/PPS ⇒ chunks stay compatible with the already-published init segment).
+  private encoderConfig!: VideoEncoderConfig;
+  // Set after recreating a reclaimed encoder: the next encoded frame MUST be a keyframe (IDR) so the
+  // fresh encoder's first output is a random-access point the decoder can latch onto.
+  private forceKeyNext = false;
 
   // Persistent per-frame scratch, reused across encodeFrame() calls to avoid ~3.5 MB of allocation
   // per frame (the dominant GC pressure during a decode/scrub burst). Sized lazily on first use;
@@ -65,7 +71,40 @@ export class Mpeg2Transcoder {
 
     const targetBitrate = Math.min(50_000_000, Math.round(codedWidth * codedHeight * frameRate * 0.15));
 
-    this.encoder = new VideoEncoder({
+    this.encoderConfig = {
+      codec: `avc1.4d00${levelHex}`,  // Main Profile
+      width: codedWidth,
+      height: codedHeight,
+      displayWidth,
+      displayHeight,
+      bitrate: targetBitrate,
+      framerate: frameRate,
+      bitrateMode: 'variable',
+      // 'realtime' tells the encoder not to reorder frames, i.e. emit no B-frames.
+      // Output then arrives in display order, so decode order == presentation order
+      // and each chunk's timestamp is monotonic. This lets the worker derive a sample's
+      // edit unit directly from its timestamp and use compositionTimeOffset 0, instead
+      // of having to reconstruct a PTS/DTS reorder map (which the previous positional
+      // editUnit assignment got wrong, scrambling playback after the first GOP).
+      latencyMode: 'realtime',
+      // Prefer the GPU H.264 encoder — typically several times faster than the software
+      // (openh264) encoder Chrome falls back to under 'no-preference'. It's a hint: if no
+      // hardware encoder is available Chrome silently uses software. We sanitize SPS[2]
+      // regardless, so either encoder's parameter sets are accepted by MSE.
+      hardwareAcceleration: 'prefer-hardware',
+      avc: { format: 'avc' },           // AVCC output; SPS/PPS via decoderConfig.description
+    };
+    this.createEncoder();
+  }
+
+  /**
+   * Stand up `this.encoder` from `this.encoderConfig` and wire its output/error callbacks. Called once
+   * at construction, and again by {@link recreateEncoder} after the browser reclaims an idle encoder.
+   */
+  private createEncoder(): void {
+    // Bind the error handler to THIS encoder instance (not `this.encoder`): a reclaim's error task can
+    // run after we've already rebuilt and repointed `this.encoder`, and must not poison the new one.
+    const enc = new VideoEncoder({
       output: (chunk, metadata) => {
         // Encoder output is already in AVCC format (no inline SPS/PPS).
         const avccBuf = new ArrayBuffer(chunk.byteLength);
@@ -111,38 +150,42 @@ export class Mpeg2Transcoder {
         });
       },
       error: (e) => {
+        // The browser reclaims an idle VideoEncoder (closing it) when memory is tight or after a
+        // period of inactivity — common in playlist mode, where there are gaps between clips and
+        // after a seek settles. That surfaces here as an error on a now-`closed` encoder. Don't latch
+        // it as fatal in that case: `ensureEncoderAlive()` rebuilds the encoder on the next encode.
+        // A genuine error on a still-live encoder IS latched and re-thrown.
+        if (enc.state === 'closed') return;
         console.error('[Mpeg2Transcoder] VideoEncoder error:', e);
         this.encoderError = e;
       },
     });
+    enc.configure(this.encoderConfig);
+    this.encoder = enc;
+  }
 
-    this.encoder.configure({
-      codec: `avc1.4d00${levelHex}`,  // Main Profile
-      width: codedWidth,
-      height: codedHeight,
-      displayWidth,
-      displayHeight,
-      bitrate: targetBitrate,
-      framerate: frameRate,
-      bitrateMode: 'variable',
-      // 'realtime' tells the encoder not to reorder frames, i.e. emit no B-frames.
-      // Output then arrives in display order, so decode order == presentation order
-      // and each chunk's timestamp is monotonic. This lets the worker derive a sample's
-      // edit unit directly from its timestamp and use compositionTimeOffset 0, instead
-      // of having to reconstruct a PTS/DTS reorder map (which the previous positional
-      // editUnit assignment got wrong, scrambling playback after the first GOP).
-      latencyMode: 'realtime',
-      // Prefer the GPU H.264 encoder — typically several times faster than the software
-      // (openh264) encoder Chrome falls back to under 'no-preference'. It's a hint: if no
-      // hardware encoder is available Chrome silently uses software. We sanitize SPS[2]
-      // regardless, so either encoder's parameter sets are accepted by MSE.
-      hardwareAcceleration: 'prefer-hardware',
-      avc: { format: 'avc' },           // AVCC output; SPS/PPS via decoderConfig.description
-    });
+  /**
+   * Rebuild the encoder after the browser reclaimed it (state went `closed` during an idle gap). The
+   * config is byte-identical, so the new encoder emits the same SPS/PPS and its chunks stay compatible
+   * with the init segment already sent to MSE — no re-init needed. The next frame is forced to a
+   * keyframe so the fresh encoder opens on a random-access point.
+   */
+  private recreateEncoder(): void {
+    try { this.encoder.close(); } catch { /* already closed by the reclaim */ }
+    this.encoderError = null;
+    this.pendingChunks = [];   // anything queued in the reclaimed encoder is gone
+    this.createEncoder();
+    this.forceKeyNext = true;
+  }
+
+  /** Recover a reclaimed (browser-`closed`) encoder before use; re-throw a genuine latched error. */
+  private ensureEncoderAlive(): void {
+    if (this.encoder.state === 'closed') { this.recreateEncoder(); return; }
+    if (this.encoderError) throw this.encoderError;
   }
 
   encodeFrame(frame: YUVFrame, timestampUs: number, forceKeyframe: boolean): void {
-    if (this.encoderError) throw this.encoderError;
+    this.ensureEncoderAlive();
 
     // Only 4:2:0 (1, pass-through) and 4:2:2 (2, downsampled below) are handled. The decoder already
     // rejects other chroma formats, but guard here too: the `else` branch assumes 4:2:0 layout, so an
@@ -197,7 +240,9 @@ export class Mpeg2Transcoder {
       duration:      this.frameDurUs,
     });
 
-    this.encoder.encode(videoFrame, { keyFrame: forceKeyframe });
+    // A just-recreated encoder must open on a keyframe regardless of the caller's request.
+    this.encoder.encode(videoFrame, { keyFrame: forceKeyframe || this.forceKeyNext });
+    this.forceKeyNext = false;
     videoFrame.close();
   }
 
@@ -214,7 +259,7 @@ export class Mpeg2Transcoder {
    * full-MB frame; the display crop in the avc1 box hides the padded rows from the viewer.
    */
   encodeRgbaFrame(rgba: Uint8ClampedArray, srcWidth: number, srcHeight: number, timestampUs: number, forceKeyframe: boolean): void {
-    if (this.encoderError) throw this.encoderError;
+    this.ensureEncoderAlive();
 
     const cw     = this.codedWidth;
     const ch     = this.codedHeight;
@@ -267,12 +312,22 @@ export class Mpeg2Transcoder {
       timestamp:     timestampUs,
       duration:      this.frameDurUs,
     });
-    this.encoder.encode(videoFrame, { keyFrame: forceKeyframe });
+    // A just-recreated encoder must open on a keyframe regardless of the caller's request.
+    this.encoder.encode(videoFrame, { keyFrame: forceKeyframe || this.forceKeyNext });
+    this.forceKeyNext = false;
     videoFrame.close();
   }
 
   /** Flush the encoder and return all accumulated encoded chunks. */
   async flush(): Promise<TranscodedChunk[]> {
+    // If the browser reclaimed the encoder during an idle gap, flush() would throw on a closed
+    // encoder. Rebuild it for the next segment and return whatever (if anything) was already queued;
+    // the next forward fetch re-decodes from a keyframe, so a reclaim becomes a no-op, not an error.
+    if (this.encoder.state === 'closed') {
+      const queued = this.pendingChunks.splice(0);
+      this.recreateEncoder();
+      return queued;
+    }
     if (this.encoderError) throw this.encoderError;
     await this.encoder.flush();
     if (this.encoderError) throw this.encoderError;

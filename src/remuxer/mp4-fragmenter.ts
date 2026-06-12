@@ -160,7 +160,9 @@ export class Mp4Fragmenter {
     return concat(ftyp(), moovBox);
   }
 
-  buildVideoSegment(frames: EssenceFrame[]): Uint8Array | null {
+  /** `frameOffset` (edit units, default 0) shifts every timestamp onto the GLOBAL playlist timeline:
+   *  baseMediaDecodeTime = (dts + frameOffset) × frameDurationTicks. 0 in single-file mode. */
+  buildVideoSegment(frames: EssenceFrame[], frameOffset = 0): Uint8Array | null {
     if (!this.config || frames.length === 0) return null;
 
     const videoFrames = frames.filter(f => f.trackType === 'video');
@@ -168,13 +170,13 @@ export class Mp4Fragmenter {
 
     if (this.videoCodec === 'mpeg2') {
       // MPEG-2 is not directly supported in browser MSE; still package it but caller should warn
-      return this.buildRawVideoSegment(videoFrames, 'mpeg2');
+      return this.buildRawVideoSegment(videoFrames, 'mpeg2', frameOffset);
     }
 
-    return this.buildRawVideoSegment(videoFrames, 'h264');
+    return this.buildRawVideoSegment(videoFrames, 'h264', frameOffset);
   }
 
-  private buildRawVideoSegment(frames: EssenceFrame[], _codec: string): Uint8Array {
+  private buildRawVideoSegment(frames: EssenceFrame[], _codec: string, frameOffset = 0): Uint8Array {
     const config = this.config!;
     const samples: TrunSample[] = [];
     const dataParts: Uint8Array[] = [];
@@ -208,7 +210,7 @@ export class Mp4Fragmenter {
     }
 
     const allData = concatU8(dataParts);
-    const baseTime = frames[0].dts * BigInt(config.frameDurationTicks);
+    const baseTime = (frames[0].dts + BigInt(frameOffset)) * BigInt(config.frameDurationTicks);
 
     // moof = 8 + mfhd(16) + traf(8 + tfhd(16) + tfdt_v1(20) + trun_v1(20 + N*16))
     //      = 88 + N*16
@@ -221,7 +223,9 @@ export class Mp4Fragmenter {
     return concat(moofBox, mdatBox);
   }
 
-  buildAudioSegment(frames: EssenceFrame[]): Uint8Array | null {
+  /** `frameOffset` (video edit units, default 0) shifts audio onto the GLOBAL playlist timeline,
+   *  converted to audio samples via audioSamplesPerFrame. 0 in single-file mode. */
+  buildAudioSegment(frames: EssenceFrame[], frameOffset = 0): Uint8Array | null {
     if (!this.config || frames.length === 0) return null;
 
     const audioFrames = frames.filter(f => f.trackType === 'audio');
@@ -247,7 +251,7 @@ export class Mp4Fragmenter {
     }
 
     const allData = concatU8(dataParts);
-    const baseTime = frames[0].dts * BigInt(config.audioSamplesPerFrame);
+    const baseTime = (frames[0].dts + BigInt(frameOffset)) * BigInt(config.audioSamplesPerFrame);
 
     const moofSize = 88 + samples.length * 16;
     const dataOffset = moofSize + 8;
@@ -288,6 +292,9 @@ export class Mp4Fragmenter {
        *  whole GOP). Ignored if it would not lengthen the last sample. */
       totalDurationFrames?: number;
     },
+    /** Edit-unit shift onto the GLOBAL playlist timeline (default 0 = single-file). Added to the
+     *  first chunk's editUnit so the segment's baseMediaDecodeTime lands at its global position. */
+    frameOffset = 0,
   ): Uint8Array | null {
     if (!this.config || chunks.length === 0) return null;
     const config = this.config;
@@ -312,7 +319,7 @@ export class Mp4Fragmenter {
       samples[samples.length - 1].duration += extraFrames * config.frameDurationTicks;
     }
 
-    const baseTime = chunks[0].editUnit * BigInt(config.frameDurationTicks);
+    const baseTime = (chunks[0].editUnit + BigInt(frameOffset)) * BigInt(config.frameDurationTicks);
     const moofSize = 88 + samples.length * 16;
     const dataOffset = moofSize + 8;
     const trafBox = traf(VIDEO_TRACK_ID, baseTime, samples, dataOffset);

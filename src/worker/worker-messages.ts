@@ -41,12 +41,43 @@ export interface WorkerPluginConfig {
   mxfCodec: string;
 }
 
+/**
+ * Playlist-mode addressing carried on fetch/seek/scrub commands. `clipIndex` selects the registered
+ * clip context (loader + reused bootstrap); `frameOffset` is that clip's start on the GLOBAL edit-unit
+ * timeline. The command's frame numbers (startFrame / targetFrame) are LOCAL to the clip; the worker
+ * reads local essence and labels output at `frameOffset + local` so segments tile across clips on one
+ * continuous MSE timeline. Both default to 0 → single-file mode (one clip at the timeline origin), so
+ * the existing loadUrl/loadFile paths need not set them.
+ */
+interface ClipAddress {
+  clipIndex?: number;
+  frameOffset?: number;
+}
+
 // Commands sent from main thread to worker
 export type WorkerCommand =
   | { type: 'initUrl';  url: string;  debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig } }
   | { type: 'initFile'; file: File; debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig } }
   | {
+      /** Playlist mode: load the FIRST clip (full header parse → shared init segment + pipeline) and
+       *  register it as clip 0. Subsequent clips arrive via registerClip and reuse this clip's
+       *  bootstrap. Otherwise identical to initUrl. */
+      type: 'initPlaylist';
+      url: string;
+      debug?: boolean;
+      plugins?: { videoDecoder?: WorkerPluginConfig };
+    }
+  | {
+      /** Playlist mode: register a clip's URL under `clipIndex`. The worker creates a loader and a
+       *  LIGHT bootstrap (reusing clip 0's parsed metadata/essence location — no header re-parse,
+       *  just this clip's length / VBE index) and replies `clipReady{clipIndex, frameCount}`. */
+      type: 'registerClip';
+      clipIndex: number;
+      url: string;
+    }
+  | ({
       type: 'fetchSegment';
+      /** LOCAL start edit unit within the addressed clip (global in single-file mode). */
       startFrame: number;
       frameCount: number;
       seqBase: number;
@@ -58,21 +89,21 @@ export type WorkerCommand =
        * the timeline thumb. Omitted/0 = normal playback fetch (one frame period per sample).
        */
       stretchToFrames?: number;
-    }
-  | { type: 'seek'; targetFrame: number }
+    } & ClipAddress)
+  | ({ type: 'seek'; targetFrame: number } & ClipAddress)
   | {
       /** Abandon any in-flight/queued forward prefetch immediately (e.g. when a scrub starts), so the
        *  worker is free for previews. Bumps the seek generation so the in-flight transcode bails. */
       type: 'cancelPrefetch';
     }
-  | {
+  | ({
       /** Fast-drag scrub: resolve the GOP-head keyframe for targetFrame, decode just that I-frame
        *  stretched across its GOP, and reply with previewDone{seq}. One round-trip (vs seek→seeked
        *  →fetch). `seq` lets the player's single-flight pump match the reply to its request. */
       type: 'scrubPreview';
       targetFrame: number;
       seq: number;
-    };
+    } & ClipAddress);
 
 // Events sent from worker to main thread
 export type WorkerEvent =
@@ -146,6 +177,19 @@ export type WorkerEvent =
        *  all-intra / CBE files). The player uses this to stretch an I-frame-only preview so it
        *  covers its whole GOP on the timeline. */
       gopFrameCount: number;
+    }
+  | {
+      /** Playlist: a clip's light bootstrap finished. `frameCount` is this clip's length in edit
+       *  units — the player uses it to place the NEXT clip on the global timeline. */
+      type: 'clipReady';
+      clipIndex: number;
+      frameCount: number;
+    }
+  | {
+      /** Playlist: a clip failed to register/open. Non-fatal — the player skips it (live) or surfaces
+       *  an error. */
+      type: 'clipFailed';
+      clipIndex: number;
     }
   | { type: 'codecUnsupported'; codec: string; reason: string }
   | { type: 'error'; message: string; fatal: boolean };

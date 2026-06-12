@@ -132,38 +132,7 @@ export class MxfFile {
     // needed even when the footer index already covers frame 0 (the offsets are still container-
     // relative). Skipped for CBG (offset is pure math) and when there's no usable RIP (growing/live
     // files fall through to indexMode 'none' + percentage seeking).
-    const hasCbg = indexSegments.some(s => s.editUnitByteCount > 0);
-    const hasVbeEntries = indexSegments.some(s => s.entries.length > 0);
-    if (!hasCbg && hasVbeEntries && ripEntries.some(e => e.bodySID > 0)) {
-      const { partitions, segments } = await this.collectMultiPartitionIndex(ripEntries, fileSize);
-      if (partitions.length > 0) {
-        this.mergeIndexSegments(indexSegments, segments);
-        const es = Number(essenceStart);
-        // The essence-bearing partition whose bodyOffset is 0 is the identity base: a stream offset
-        // there maps to `essenceStart + so`. When the FIRST essence lives in the header partition
-        // (file offset 0, e.g. this Omneon file), collectMultiPartitionIndex skips it (its offset-0
-        // RIP entry is excluded), so seed the base here from the already-resolved essenceStart.
-        // Without it, partition-1 offsets would remap against the next partition's base (wrong).
-        if (!partitions.some(p => p.bodyOffset === 0)) {
-          partitions.unshift({ bodyOffset: 0, essenceFileStart: es });
-        }
-        // For a stream offset SO, find the body partition whose essence it falls in (largest
-        // bodyOffset ≤ SO) and map: fileOffset = partition.essenceFileStart + (SO − bodyOffset).
-        // Expressed relative to essenceStart so the resolver's `essenceStart + streamOffset` is
-        // unchanged. Single-partition files yield an identity remap (bodyOffset 0, essenceFileStart
-        // === essenceStart), so this is safe to always apply to multi-segment VBE files.
-        const mapStreamOffset = (so: number): number => {
-          let p = partitions[0];
-          for (const q of partitions) { if (q.bodyOffset <= so) p = q; else break; }
-          return p.essenceFileStart + (so - p.bodyOffset) - es;
-        };
-        for (const seg of indexSegments) {
-          if (seg.editUnitByteCount > 0) continue; // CBG has no entry array
-          for (const e of seg.entries) e.streamOffset = BigInt(mapStreamOffset(Number(e.streamOffset)));
-        }
-        if (this.debug) console.log(`[mxf.js] multi-partition VBE index: ${partitions.length} partitions, ${indexSegments.length} segs (remapped)`);
-      }
-    }
+    await this.remapMultiPartitionVbe(indexSegments, ripEntries, essenceStart, fileSize);
 
     // ── Step 6: Determine the seeking strategy ────────────────────────────────
     const indexMode: IndexMode = classifyIndexMode(indexSegments, essenceBodySID);
@@ -518,6 +487,138 @@ export class MxfFile {
 
     // No usable indexByteCount: scan whatever we read after the partition pack (legacy behaviour).
     return this.parseFooterIndexSegments(headBuf);
+  }
+
+  /**
+   * Multi-partition VBE remap (XDCAM-style OP1a). Index entry `streamOffset`s are essence-CONTAINER-
+   * relative — they exclude the partition packs / index / fill interleaved between body partitions —
+   * so `essenceStart + streamOffset` only lands correctly within the first body partition. Whenever
+   * essence spans body partitions, walk them (via the RIP) to build a {bodyOffset → essenceFileStart}
+   * table and remap every VBE entry's streamOffset to a file offset, in place. No-op for CBG, for
+   * single-partition VBE (identity remap), and when there's no usable RIP. Shared by `open()` (full
+   * parse) and `openLight()` (per-clip re-read).
+   */
+  private async remapMultiPartitionVbe(
+    indexSegments: IndexTableSegment[],
+    ripEntries: RandomIndexPackEntry[],
+    essenceStart: bigint,
+    fileSize: number,
+  ): Promise<void> {
+    const hasCbg = indexSegments.some(s => s.editUnitByteCount > 0);
+    const hasVbeEntries = indexSegments.some(s => s.entries.length > 0);
+    if (hasCbg || !hasVbeEntries || !ripEntries.some(e => e.bodySID > 0)) return;
+
+    const { partitions, segments } = await this.collectMultiPartitionIndex(ripEntries, fileSize);
+    if (partitions.length === 0) return;
+    this.mergeIndexSegments(indexSegments, segments);
+    const es = Number(essenceStart);
+    // The essence-bearing partition whose bodyOffset is 0 is the identity base: a stream offset there
+    // maps to `essenceStart + so`. When the FIRST essence lives in the header partition (file offset 0),
+    // collectMultiPartitionIndex skips it (its offset-0 RIP entry is excluded), so seed the base here
+    // from the already-resolved essenceStart. Without it, partition-1 offsets would remap against the
+    // next partition's base (wrong).
+    if (!partitions.some(p => p.bodyOffset === 0)) {
+      partitions.unshift({ bodyOffset: 0, essenceFileStart: es });
+    }
+    // For a stream offset SO, find the body partition whose essence it falls in (largest bodyOffset ≤
+    // SO) and map: fileOffset = partition.essenceFileStart + (SO − bodyOffset). Expressed relative to
+    // essenceStart so the resolver's `essenceStart + streamOffset` is unchanged. Single-partition files
+    // yield an identity remap (bodyOffset 0, essenceFileStart === essenceStart).
+    const mapStreamOffset = (so: number): number => {
+      let p = partitions[0];
+      for (const q of partitions) { if (q.bodyOffset <= so) p = q; else break; }
+      return p.essenceFileStart + (so - p.bodyOffset) - es;
+    };
+    for (const seg of indexSegments) {
+      if (seg.editUnitByteCount > 0) continue; // CBG has no entry array
+      for (const e of seg.entries) e.streamOffset = BigInt(mapStreamOffset(Number(e.streamOffset)));
+    }
+    if (this.debug) console.log(`[mxf.js] multi-partition VBE index: ${partitions.length} partitions, ${indexSegments.length} segs (remapped)`);
+  }
+
+  /**
+   * Cheap per-clip bootstrap for playlist mode: the clip is structurally identical to `template`
+   * (same header layout, descriptors, codec, edit rate, essence start) — only its LENGTH and (for VBE)
+   * its per-frame byte offsets differ. So we reuse the template's parsed metadata, essence location
+   * and index mode, and re-derive only what varies: this clip's frame count and, for VBE, its index.
+   *
+   * Skips the expensive header-metadata parse and the essence-container walk entirely. Falls back to a
+   * full {@link open} when the template is 'none'-indexed or when a sane frame count can't be derived
+   * (a structural mismatch — requirement: re-parse on mismatch).
+   */
+  async openLight(template: MxfBootstrap): Promise<MxfBootstrap> {
+    if (this.bootstrap) return this.bootstrap;
+    if (template.indexMode === 'none') return this.open();
+
+    const fileSize = await this.loader.fileSize;
+    const essenceStart = template.essenceStart;
+    const essenceBodySID = template.essenceBodySID;
+
+    // Header partition pack (cheap) — needed only for the footer-offset fallback.
+    const ppBuf = await this.loader.fetchRange(
+      0, Math.min(PARTITION_PACK_READ_SIZE, fileSize) - 1, 'light: header partition pack');
+    const headerPartition = parsePartitionPack(ppBuf, 0);
+
+    // Tail / Random Index Pack.
+    const tailStart = Math.max(0, fileSize - TAIL_READ_SIZE);
+    const tailBuf = await this.loader.fetchRange(tailStart, fileSize - 1, 'light: tail / random index pack');
+    const ripEntries = this.parseRandomIndexPack(tailBuf);
+
+    let indexSegments: IndexTableSegment[];
+    let frameCount: number;
+
+    if (template.indexMode === 'cbg') {
+      // CBG: byte math is identical across same-structure clips (offset = essenceStart +
+      // frame*editUnitByteCount), so reuse the template's index verbatim. The only per-clip unknown is
+      // how many frames exist — derive it from the essence-container byte length (essenceStart → footer
+      // partition, else EOF). floor() absorbs any KAG fill at the container tail.
+      indexSegments = template.indexSegments;
+      const eubc = template.indexSegments.find(s => s.editUnitByteCount > 0)?.editUnitByteCount ?? 0;
+      const footerOffset = Number(this.findFooterOffset(ripEntries, headerPartition));
+      const containerEnd = footerOffset > Number(essenceStart) ? footerOffset : fileSize;
+      frameCount = eubc > 0 ? Math.max(0, Math.floor((containerEnd - Number(essenceStart)) / eubc)) : 0;
+    } else {
+      // VBE: per-frame offsets are this clip's own — re-read its index (footer + any multi-partition
+      // remap), exactly as open() does, but without re-parsing metadata. Frame count = covered units.
+      indexSegments = [];
+      const footerOffset = this.findFooterOffset(ripEntries, headerPartition);
+      const footerStart = Number(footerOffset);
+      const footerIdx = (footerStart > 0 && footerStart >= tailStart)
+        ? this.parseFooterIndexSegments(tailBuf.slice(footerStart - tailStart))
+        : await this.fetchIndexSegments(footerOffset, fileSize);
+      this.mergeIndexSegments(indexSegments, footerIdx);
+      await this.remapMultiPartitionVbe(indexSegments, ripEntries, essenceStart, fileSize);
+      frameCount = this.indexFrameCount(indexSegments, essenceBodySID);
+    }
+
+    if (!(frameCount > 0)) {
+      // Couldn't derive a sane length — the clip likely isn't the structure we assumed. Re-parse fully.
+      if (this.debug) console.warn('[mxf.js] openLight: frame count derivation failed → full parse');
+      this.bootstrap = null;
+      return this.open();
+    }
+
+    // Reuse the template's metadata (descriptors / SPS / edit rate) but stamp this clip's own duration.
+    const metadata = { ...template.metadata, duration: BigInt(frameCount) };
+    this.bootstrap = {
+      headerPartition, metadata, indexSegments, ripEntries,
+      essenceStart, essenceBodySID, indexMode: template.indexMode,
+    };
+    if (this.debug) console.log(`[mxf.js] openLight: ${template.indexMode}, frames=${frameCount}, segs=${indexSegments.length}`);
+    return this.bootstrap;
+  }
+
+  /** Total edit units covered by the index for `bodySID` (0 matches any): the max segment end
+   *  (indexStartPosition + duration|entries). Used by openLight to size a VBE clip. */
+  private indexFrameCount(segments: IndexTableSegment[], bodySID: number): number {
+    let end = 0n;
+    for (const seg of segments) {
+      if (bodySID > 0 && seg.bodySID > 0 && seg.bodySID !== bodySID) continue;
+      const len = seg.indexDuration > 0n ? seg.indexDuration : BigInt(seg.entries.length);
+      const segEnd = seg.indexStartPosition + len;
+      if (segEnd > end) end = segEnd;
+    }
+    return Number(end);
   }
 
   getBootstrap(): MxfBootstrap | null {

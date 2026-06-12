@@ -2,6 +2,7 @@ import { EventEmitter, MxfPlayerEvents, ManifestData, TimecodeBundle, TimecodeSo
 import { MseController } from './mse/mse-controller.js';
 import { WebAudioController } from './audio/web-audio-controller.js';
 import { ScrubController } from './scrub-controller.js';
+import { PlaylistController, PlaylistClip } from './playlist/playlist-controller.js';
 import { WorkerCommand, WorkerEvent, WorkerPluginConfig, ManifestTimecode, TimecodeAnchor } from './worker/worker-messages.js';
 import { frameCountToTimecode, formatTimecode } from './parser/timecode.js';
 import { CHUNK_DURATION_SECONDS, FIRST_CHUNK_DURATION_SECONDS, MIN_CHUNK_FRAMES, RESUME_BUFFER_SECONDS } from './core/constants.js';
@@ -85,6 +86,16 @@ const DEFAULT_CONFIG: Required<MxfConfig> = {
   plugins: {},
 };
 
+/** Per-clip state on the global timeline (playlist mode). `frameOffset` is the clip's start edit unit
+ *  (null until the previous clip's count is known); `frameCount` is its length (null until the worker
+ *  reports it via clipReady / the manifest for clip 0). */
+interface PlaylistClipState {
+  url: string;
+  frameOffset: number | null;
+  frameCount: number | null;
+  state: 'pending' | 'registering' | 'ready' | 'failed';
+}
+
 
 /**
  * MxfPlayer renders all video through the native <video> element via MSE.
@@ -163,6 +174,20 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private rvfcHandle = 0;
   private destroyed = false;
 
+  // ── Playlist mode ─────────────────────────────────────────────────────────
+  // Seamless multi-clip playback over one continuous GLOBAL edit-unit timeline. The player owns the
+  // offset math: each clip occupies [frameOffset, frameOffset+frameCount) and its worker output is
+  // labelled at that offset, so segments tile natively on the single MSE timeline. Clip 0 is parsed
+  // fully (shared init segment + pipeline); later clips reuse that bootstrap (MxfFile.openLight) and
+  // are registered sequentially as their frame counts arrive (each clip's offset needs the previous
+  // clip's count). `loadUrl`/`loadFile` leave playlistMode false (a single clip 0 spanning the file).
+  private playlistMode = false;
+  private playlist: PlaylistController | null = null;
+  private staticPlaylist = false;       // m3u8 had/grew an ENDLIST → full spanning timeline + EOF
+  private clips: PlaylistClipState[] = [];
+  // Index of the next clip awaiting worker registration (offsets are computed as counts arrive).
+  private nextRegisterIndex = 0;
+
   constructor(video: HTMLVideoElement, config: MxfConfig = {}) {
     super();
     this.video = video;
@@ -170,7 +195,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.audio = new WebAudioController(this.video, (info) => this.emit('audio-info', info), !!this.config.debug);
     this.scrub = new ScrubController(
       this.video,
-      (targetFrame, seq) => this.worker?.postMessage({ type: 'scrubPreview', targetFrame, seq } as WorkerCommand),
+      (targetFrame, seq) => this.postScrubPreview(targetFrame, seq),
       (timeSeconds) => this.initiateSeek(timeSeconds, 'accurate'),
       () => this.play(),
     );
@@ -320,7 +345,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   get lastFrameTime(): number {
     if (!this.manifest) return 0;
     const fps = this.editRateNumerator / this.editRateDenominator;
-    const totalFrames = Math.round(this.manifest.duration * fps);
+    const totalFrames = this.totalFramesGlobal();
     return Math.max(0, (totalFrames - 1) / fps);
   }
 
@@ -490,6 +515,122 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.worker!.postMessage(cmd);
   }
 
+  /**
+   * Load an HLS (m3u8) playlist of structurally-identical MXF clips and play them back-to-back
+   * seamlessly on one continuous timeline. The first clip's header is parsed once and reused for every
+   * other clip (no per-clip header re-parse); the shared init segment / transcode pipeline means MSE
+   * sees one continuous stream across clip boundaries.
+   *
+   * Works for both a STATIC playlist (`#EXT-X-ENDLIST` — a full spanning timeline you can scrub across)
+   * and a LIVE playlist (no ENDLIST — polled for new clips, HLS-live style). The mode is detected from
+   * the manifest. The first clip's bytes start downloading immediately; later clips are fetched ahead
+   * of the playhead so a clip boundary never stalls.
+   */
+  loadPlaylist(url: string): void {
+    this.setup();
+    this.playlistMode = true;
+    this.staticPlaylist = false;
+    this.clips = [];
+    this.nextRegisterIndex = 0;
+    this.playlist = new PlaylistController(url);
+    this.playlist.on('clips-added', ({ clips }) => this.onClipsAdded(clips));
+    this.playlist.on('static-known', () => { this.staticPlaylist = true; this.updatePlaylistDuration(); });
+    this.playlist.on('error', ({ message, fatal }) => this.emit('error', { message, fatal }));
+    void this.playlist.start();
+  }
+
+  /** New clips surfaced by the playlist controller — append them and drive sequential registration. */
+  private onClipsAdded(clips: PlaylistClip[]): void {
+    const firstNew = this.clips.length === 0;
+    for (const c of clips) {
+      this.clips.push({ url: c.url, frameOffset: null, frameCount: null, state: 'pending' });
+    }
+    if (firstNew && this.clips.length > 0) {
+      // Clip 0: full parse → shared init segment + pipeline. Its offset is the timeline origin.
+      this.clips[0].frameOffset = 0;
+      this.clips[0].state = 'registering';
+      const plugins = this.config.plugins?.videoDecoder
+        ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
+      this.worker!.postMessage({ type: 'initPlaylist', url: this.clips[0].url, debug: this.config.debug, plugins } as WorkerCommand);
+      this.nextRegisterIndex = 1;
+    } else {
+      // More clips appeared (live poll) — keep the registration pump going if it had drained.
+      this.pumpClipRegistration();
+    }
+  }
+
+  /** Register the next pending clip with the worker, once the previous clip's offset is known. One at a
+   *  time: each clip's frameOffset = previous clip's frameOffset + frameCount, known only on clipReady. */
+  private pumpClipRegistration(): void {
+    const i = this.nextRegisterIndex;
+    if (i <= 0 || i >= this.clips.length) return;       // clip 0 handled separately; nothing pending
+    const prev = this.clips[i - 1];
+    if (prev.frameOffset === null || prev.frameCount === null) return; // wait for the previous count
+    const clip = this.clips[i];
+    if (clip.state !== 'pending') return;                // already registering/ready
+    clip.frameOffset = prev.frameOffset + prev.frameCount;
+    clip.state = 'registering';
+    this.worker!.postMessage({ type: 'registerClip', clipIndex: i, url: clip.url } as WorkerCommand);
+  }
+
+  /** A clip's worker bootstrap finished: record its length, advance the registration pump, refresh the
+   *  timeline duration, and (in case the playhead was waiting at the frontier) kick a forward fetch. */
+  private onClipReady(clipIndex: number, frameCount: number): void {
+    const clip = this.clips[clipIndex];
+    if (!clip) return;
+    clip.frameCount = frameCount;
+    clip.state = 'ready';
+    this.nextRegisterIndex = Math.max(this.nextRegisterIndex, clipIndex + 1);
+    this.pumpClipRegistration();
+    this.updatePlaylistDuration();
+    this.fetchNextChunk();
+  }
+
+  private onClipFailed(clipIndex: number): void {
+    const clip = this.clips[clipIndex];
+    if (clip) clip.state = 'failed';
+    // Skip a failed clip in live mode by treating it as zero-length so the next clip's offset follows
+    // the previous one; in static mode this leaves a gap the player simply doesn't fetch past.
+    if (clip && clip.frameOffset !== null) clip.frameCount = 0;
+    this.nextRegisterIndex = Math.max(this.nextRegisterIndex, clipIndex + 1);
+    this.pumpClipRegistration();
+  }
+
+  /** Recompute and publish the MSE timeline duration from the registered clips' total frame count. */
+  private updatePlaylistDuration(): void {
+    if (!this.playlistMode || !this.manifest) return;
+    const fps = this.editRateNumerator / this.editRateDenominator;
+    const seconds = this.totalFramesGlobal() / fps;
+    this.manifest.duration = seconds;
+    this.mseController?.setDuration(seconds);
+  }
+
+  /** Resolve the clip owning a GLOBAL edit unit: the last ready clip whose frameOffset ≤ frame and
+   *  that contains it. Returns null when the frame is past every registered clip (await more). */
+  private clipForGlobalFrame(globalFrame: number): { clipIndex: number; frameOffset: number; frameCount: number } | null {
+    for (let i = 0; i < this.clips.length; i++) {
+      const c = this.clips[i];
+      if (c.state !== 'ready' || c.frameOffset === null || c.frameCount === null) break; // not yet known
+      if (globalFrame >= c.frameOffset && globalFrame < c.frameOffset + c.frameCount) {
+        return { clipIndex: i, frameOffset: c.frameOffset, frameCount: c.frameCount };
+      }
+    }
+    return null;
+  }
+
+  /** Total frames on the global timeline: playlist → sum of ready clips; single-file → clip 0 length. */
+  private totalFramesGlobal(): number {
+    if (this.playlistMode) {
+      let sum = 0;
+      for (const c of this.clips) {
+        if (c.state === 'ready' && c.frameCount !== null) sum += c.frameCount; else break;
+      }
+      return sum;
+    }
+    if (!this.manifest) return 0;
+    return Math.round(this.manifest.duration * this.editRateNumerator / this.editRateDenominator);
+  }
+
   private setup(): void {
     this.destroyInternal();
     this.worker = this.createWorker();
@@ -616,6 +757,14 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
         this.scrub.onPreviewDone(event.editUnit);
         break;
 
+      case 'clipReady':
+        this.onClipReady(event.clipIndex, event.frameCount);
+        break;
+
+      case 'clipFailed':
+        this.onClipFailed(event.clipIndex);
+        break;
+
       case 'codecUnsupported':
         this.emit('codec-unsupported', { codec: event.codec, reason: event.reason });
         break;
@@ -663,6 +812,17 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       longGop: event.longGop,
       timecodes: event.timecodes ?? [],
     };
+
+    // Playlist: clip 0's length comes from this manifest (the worker already registered it internally).
+    // Record it so the global timeline + the next clip's offset can be computed, then start registering
+    // the following clips ahead of the playhead.
+    if (this.playlistMode && this.clips.length > 0) {
+      this.clips[0].frameOffset = 0;
+      this.clips[0].frameCount = Math.round(event.duration * fps);
+      this.clips[0].state = 'ready';
+      this.nextRegisterIndex = 1;
+      this.pumpClipRegistration();
+    }
 
     // Use the resolved output codec for the MIME type (e.g. 'h264' for transcoded MPEG-2).
     const effectiveVideoCodec = event.resolvedVideoCodec ?? pd?.codec ?? 'unknown';
@@ -716,16 +876,42 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private fetchKeyframePreview(keyframe: number, stretchFrames: number): void {
     if (!this.manifest) return;
     this.previewParked = true;      // forward playback must re-seek accurately before resuming
-    this.nextFetchFrame = keyframe; // park here; endScrub() resumes forward playback from the keyframe
+    this.nextFetchFrame = keyframe; // park here (GLOBAL); endScrub() resumes forward playback here
+    let startFrame = keyframe;
+    let clipFields: { clipIndex: number; frameOffset: number } | undefined;
+    if (this.playlistMode) {
+      const loc = this.clipForGlobalFrame(keyframe);
+      if (!loc) return;             // keyframe in an unregistered region — can't preview
+      startFrame = keyframe - loc.frameOffset;
+      clipFields = { clipIndex: loc.clipIndex, frameOffset: loc.frameOffset };
+    }
     const cmd: WorkerCommand = {
       type: 'fetchSegment',
-      startFrame: keyframe,
+      startFrame,
       frameCount: 1,
       seqBase: this.seqBase,
       stretchToFrames: stretchFrames,
+      ...(clipFields ?? {}),
     };
     this.seqBase += 2;
     this.worker!.postMessage(cmd);
+  }
+
+  /** Post a scrub-preview request, mapping the GLOBAL drag frame to (clip, local) in playlist mode. */
+  private postScrubPreview(globalFrame: number, seq: number): void {
+    if (!this.worker) return;
+    if (this.playlistMode) {
+      const loc = this.clipForGlobalFrame(globalFrame)
+        ?? this.clipForGlobalFrame(Math.max(0, this.totalFramesGlobal() - 1));
+      if (loc) {
+        this.worker.postMessage({
+          type: 'scrubPreview', targetFrame: globalFrame - loc.frameOffset, seq,
+          clipIndex: loc.clipIndex, frameOffset: loc.frameOffset,
+        } as WorkerCommand);
+        return;
+      }
+    }
+    this.worker.postMessage({ type: 'scrubPreview', targetFrame: globalFrame, seq } as WorkerCommand);
   }
 
   private fetchNextChunk(explicitFrames?: number): void {
@@ -750,10 +936,12 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     const requestedAheadSeconds = this.nextFetchFrame / fps - currentTime;
     if (requestedAheadSeconds >= this.config.maxBufferSeconds) return;
 
-    const totalFrames = Math.round(
-      this.manifest.duration * this.editRateNumerator / this.editRateDenominator
-    );
+    const totalFrames = this.totalFramesGlobal();
     if (this.nextFetchFrame >= totalFrames) {
+      // Playlist live: the frontier reached the end of what's registered so far — don't end the
+      // stream, just wait for more clips (or the next clip to finish registering). Static playlist /
+      // single-file: this is the real end.
+      if (this.playlistMode && !this.staticPlaylist) return;
       this.mseController?.endOfStream();
       return;
     }
@@ -761,14 +949,31 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // Resolve the chunk size only now that we're committed to posting — an explicit size (the seek
     // path) bypasses the ramp; a default forward fetch consumes and grows it. Computing it here (not
     // as a default arg) means the early-return guards above don't burn ramp steps.
-    const frameCount = explicitFrames ?? this.nextRampChunk();
+    let frameCount = explicitFrames ?? this.nextRampChunk();
+
+    // Playlist: translate the GLOBAL frontier to (clip, local) and never let one fetch straddle a clip
+    // boundary — clip boundaries are GOP boundaries, and the worker resets its decoder there.
+    let clipIndex = 0;
+    let frameOffset = 0;
+    let startFrame = this.nextFetchFrame;
+    if (this.playlistMode) {
+      const loc = this.clipForGlobalFrame(this.nextFetchFrame);
+      if (!loc) return;                                   // next clip not registered yet — wait
+      clipIndex = loc.clipIndex;
+      frameOffset = loc.frameOffset;
+      startFrame = this.nextFetchFrame - loc.frameOffset; // local start within the clip
+      const framesLeftInClip = loc.frameOffset + loc.frameCount - this.nextFetchFrame;
+      frameCount = Math.min(frameCount, framesLeftInClip);
+      if (frameCount <= 0) return;
+    }
 
     this.fetchPending = true;
     const cmd: WorkerCommand = {
       type: 'fetchSegment',
-      startFrame: this.nextFetchFrame,
+      startFrame,
       frameCount,
       seqBase: this.seqBase,
+      ...(this.playlistMode ? { clipIndex, frameOffset } : {}),
     };
     this.seqBase += 2;
     this.nextFetchFrame += frameCount;
@@ -867,10 +1072,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
     // Clamp to a real frame: a target at/after `duration` rounds to `totalFrames` (one past the last
     // frame), which the worker can't decode — the seek then resolves to nothing and the element shows
-    // no picture. totalFrames-1 is the last displayable frame.
-    const totalFrames = Math.round(
-      this.manifest.duration * this.editRateNumerator / this.editRateDenominator
-    );
+    // no picture. totalFrames-1 is the last displayable frame. `seekTargetFrame` is GLOBAL (the
+    // 'seeked' reply returns a global keyframe), so all the post-seek math stays in one coordinate.
+    const totalFrames = this.totalFramesGlobal();
     this.seekTargetFrame = Math.max(0, Math.min(
       Math.round(targetTime * this.editRateNumerator / this.editRateDenominator),
       totalFrames - 1,
@@ -881,7 +1085,21 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // new playhead — otherwise audio keeps playing at the pre-seek offset.
     this.audio.onSeek();
 
-    const cmd: WorkerCommand = { type: 'seek', targetFrame: this.seekTargetFrame };
+    // Playlist: map the global target to (clip, local); the worker reads/resolves locally and replies
+    // with a global keyframe. Single-file sends the target as-is (clip 0 at offset 0).
+    let cmd: WorkerCommand = { type: 'seek', targetFrame: this.seekTargetFrame };
+    if (this.playlistMode) {
+      const loc = this.clipForGlobalFrame(this.seekTargetFrame)
+        ?? this.clipForGlobalFrame(Math.max(0, this.totalFramesGlobal() - 1));
+      if (loc) {
+        cmd = {
+          type: 'seek',
+          targetFrame: this.seekTargetFrame - loc.frameOffset,
+          clipIndex: loc.clipIndex,
+          frameOffset: loc.frameOffset,
+        };
+      }
+    }
     this.worker!.postMessage(cmd);
   }
 
@@ -962,8 +1180,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     if (!this.video.paused) { this.setBuffering(false); return; }
 
     const fps = this.editRateNumerator / this.editRateDenominator;
-    const totalFrames = Math.round(this.manifest.duration * fps);
-    const fetchedToEof = this.nextFetchFrame >= totalFrames;
+    const totalFrames = this.totalFramesGlobal();
+    // Live playlist: reaching the registered frontier is "await next clip", not EOF — so don't let the
+    // deadlock-breaker treat it as end-of-stream (which would force a start on a possibly-thin buffer).
+    const fetchedToEof = this.nextFetchFrame >= totalFrames && (!this.playlistMode || this.staticPlaylist);
     const target = this.resumeTargetSeconds();
 
     // Gate on BOTH video and the Web Audio PCM path. The audio (decoded to Web Audio, not MSE) is
@@ -1035,6 +1255,12 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   }
 
   private destroyInternal(): void {
+    this.playlist?.destroy();
+    this.playlist = null;
+    this.playlistMode = false;
+    this.staticPlaylist = false;
+    this.clips = [];
+    this.nextRegisterIndex = 0;
     this.worker?.terminate();
     this.worker = null;
     this.mseController?.destroy();

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<!--
+  mxf.js — seamless HLS clip-playlist demo.
+
+  Point it at an .m3u8 whose segments are whole, structurally-identical MXF clips. A STATIC playlist
+  (with #EXT-X-ENDLIST) plays as one continuous spanning timeline you can scrub across; a LIVE
+  playlist (no ENDLIST) is polled and new clips are appended seamlessly as they appear.
+
+  Serve over a range-capable static server (e.g. `npx http-server --cors`) so the MXF clips support
+  HTTP Range, then open this page from the same origin (or enable CORS).
+
+  Uses the UMD build — copy dist/mxf.umd.js + dist/demux-worker.js + dist/kernels.wasm side by side.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>mxf.js — playlist</title>
+  <style>body { font-family: system-ui, sans-serif; margin: 16px; } input { width: 32rem; }</style>
+</head>
+<body>
+  <label>m3u8 URL: <input id="url" type="text" placeholder="https://host/playlist.m3u8" /></label>
+  <button id="load">Load playlist</button>
+  <video id="video" controls muted playsinline width="960" style="display:block;margin-top:8px;background:#000"></video>
+  <pre id="log" style="white-space:pre-wrap;color:#444"></pre>
+
+  <script src="../dist/mxf.umd.js"></script>
+  <script>
+    const video = document.getElementById('video');
+    const logEl = document.getElementById('log');
+    const log = (m) => { logEl.textContent += m + '\n'; };
+
+    let player = null;
+    document.getElementById('load').addEventListener('click', () => {
+      const url = document.getElementById('url').value.trim();
+      if (!url) return;
+      logEl.textContent = '';
+      if (player) player.destroy();
+      // debug:true makes the worker log clip 0's full parse vs later clips' light open.
+      player = new MxfJs.MxfPlayer(video, { debug: true });
+      player.on('manifest', (m) => log(`manifest: clip0 ${m.duration.toFixed(2)}s, video=${m.pictureDescriptor?.codec}, index=${m.indexMode}`));
+      player.on('timeupdate', (t) => { /* duration grows as clips register / live polls */ });
+      player.on('error', (e) => log(`error${e.fatal ? ' (fatal)' : ''}: ${e.message}`));
+      player.loadPlaylist(url);
+    });
+  </script>
+</body>
+</html>

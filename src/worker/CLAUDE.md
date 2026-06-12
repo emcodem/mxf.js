@@ -1,5 +1,22 @@
 # src/worker/ — pipeline, index, scrub, buffering
 
+## Playlist mode (seamless multi-clip, `demux-worker.ts`)
+
+`initPlaylist` parses clip 0 fully (shared init segment + transcode pipeline) and stashes its bootstrap
+as `templateBootstrap`. `registerClip{clipIndex,url}` builds a LIGHT bootstrap (`MxfFile.openLight` —
+reuses the template's metadata/essence location; only re-derives length and, for VBE, the per-clip
+index) and replies `clipReady{clipIndex,frameCount}`. `clips[]` holds `{loader, bootstrap}` per clip;
+the fragmenter + pipeline are shared.
+
+`fetchSegment`/`seek`/`scrubPreview` carry `clipIndex` + `frameOffset` (the clip's start on the GLOBAL
+edit-unit timeline; both default 0 = single-file). Frame numbers in/out are LOCAL for essence reads +
+index, GLOBAL (`local + frameOffset`, via `globalOf`) for every posted edit unit + the fragmenter
+`baseMediaDecodeTime` (the `frameOffset` param on the build methods) + `pcmSamples.editUnit` + cache
+keys — so clips tile on one MSE timeline. A forward fetch whose `clipIndex` changes resets the
+persistent decoder (`lastFetchClipIndex`); the last segment of a clip flushes the held anchor
+(`atEndOfClip`). The player clamps each fetch to one clip (boundaries are GOP boundaries). `'none'`
+index clips fall back to a full `open()` (shared `sparseKf` is not clip-keyed — known limit).
+
 ## MPEG-2 transcode pipeline (`demux-worker.ts`)
 
 **Init** (`handleInit`): detect `pd.codec === 'mpeg2'` → fetch 2 frames (probe) → one-shot decode for `codedWidth/Height/chromaFormat/frameRate` → create `Mpeg2Transcoder` → encode probe frame → read `spspps` → `fragmenter.enableTranscodeMode` → `buildInitSegment(false)` (no audio — Chrome MSE rejects `sowt` in a video-only buffer) → post `manifest` + `initSegment`.

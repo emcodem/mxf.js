@@ -25,6 +25,11 @@ export interface FetchJob {
   /** If true, this is a background speculative cache-fill: decode + cache but post nothing to the
    *  player (no videoSegment, no previewDone, no segmentDone). Superseded cleanly by any real drag. */
   cacheOnly?: boolean;
+  /** Playlist mode: which registered clip this job reads from (default 0 = single-file). */
+  clipIndex?: number;
+  /** Playlist mode: the clip's start on the GLOBAL edit-unit timeline; output is labelled
+   *  `frameOffset + local` (default 0 = single-file). */
+  frameOffset?: number;
 }
 
 export class FetchQueue {
