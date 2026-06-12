@@ -38,6 +38,12 @@ All video flows through the single `<video>` element, so seeking and scrubbing w
   - Played through **MSE** where supported, otherwise scheduled through **Web Audio** alongside the silent `<video>`.
 - **Channel selection**: pick which source channels are routed to stereo output; near-instant switching on already-buffered audio.
 
+### Playlist / multi-clip
+- **Seamless HLS playback**: load an m3u8 of whole MXF clips with `loadPlaylist()` — they play back-to-back as one continuous, seekable timeline with no gaps or re-inits at boundaries.
+- **Single header parse**: clip 0's header is parsed once; every subsequent clip is bootstrapped cheaply (frame-count + VBE index only, no metadata re-parse).
+- **Static (VOD) playlists** (`#EXT-X-ENDLIST`): full spanning timeline, total duration known up front, fully scrubbable.
+- **Live playlists** (no `#EXT-X-ENDLIST`): polled for new clips; the timeline grows as clips register and the player buffers ahead of the playhead so clip boundaries never stall.
+
 ### Seeking & scrubbing
 - **Accurate seek**: decode preceding keyframe → exact target frame.
 - **Keyframe seek**: decode only the GOP-head I-frame (near-instant, random-access granularity).
@@ -153,6 +159,7 @@ A runnable demo is in [`demo/index.html`](demo/index.html) (`npm run dev`, then 
 |--------|-------------|
 | `loadFile(file: File)` | Load a local MXF file. |
 | `loadUrl(url: string)` | Load a remote MXF over HTTP byte ranges. |
+| `loadPlaylist(url: string)` | Load an HLS m3u8 of MXF clips for seamless multi-clip playback (see [Playlist mode](#playlist-mode)). |
 | `play()` | Start playback (resumes Web Audio context on the user gesture). |
 | `pause()` | Pause playback. |
 | `seek(seconds: number)` | Seek to a time (clamped to duration). |
@@ -276,6 +283,45 @@ For local development, the Vite dev server (`npm run dev`) also serves the asset
 
 ---
 
+## Playlist mode
+
+`loadPlaylist(url)` takes a URL pointing to an HLS media playlist (`.m3u8`) where each segment is a **whole, structurally-identical MXF clip**. The clips are played back-to-back on one continuous MSE timeline — seek, scrub, and timecode work across clip boundaries exactly as they do in a single-file load.
+
+```ts
+player.loadPlaylist('https://example.com/recording/playlist.m3u8');
+// Everything else is the same: play/pause/seek/scrub/events work normally.
+// 'manifest' fires for clip 0; 'timeupdate' carries the growing duration in live mode.
+```
+
+A range-capable HTTP server is required (same as `loadUrl` — see [URL playback](#url-playback)). The demo in `demo/playlist.html` (served by `demo/hls-server.py`) shows this in action; `demo/make-hls.ps1` can split an existing MXF into clip segments via ffmpeg.
+
+### Supported m3u8 tags
+
+| Tag | Handled |
+|-----|---------|
+| `#EXTM3U` | Parsed (missing header tolerated) |
+| `#EXTINF:<duration>,` | ✅ Duration extracted |
+| `#EXT-X-ENDLIST` | ✅ Static/VOD mode — full timeline, no more polling |
+| `#EXT-X-MEDIA-SEQUENCE:<n>` | ✅ Used for live dedup across re-polls |
+| `#EXT-X-TARGETDURATION:<n>` | ✅ Used as the live poll interval |
+| `#EXT-X-VERSION` | Ignored (parsed tags work on all versions) |
+| `#EXT-X-STREAM-INF` (master playlists) | ❌ Not supported — pass a media playlist directly |
+| `#EXT-X-KEY` (encryption) | ❌ Ignored — clips must be unencrypted |
+| `#EXT-X-BYTERANGE` | ❌ Ignored — each segment must be a complete MXF file |
+| `#EXT-X-DISCONTINUITY` | ❌ Ignored — clips must be structurally identical |
+| All other tags | Silently skipped |
+
+### Static vs live playlists
+
+- **Static** (`#EXT-X-ENDLIST` present): all clips are known at load time. The total duration is computed immediately and the full timeline is scrubbable from the start.
+- **Live** (no `#EXT-X-ENDLIST`): the playlist is re-fetched every `#EXT-X-TARGETDURATION` seconds (minimum 1 s). New clips are appended to the timeline as they appear; the duration grows in real time. When the server eventually adds `#EXT-X-ENDLIST`, polling stops and the timeline is sealed.
+
+### Clip requirements
+
+All clips in a playlist must be **structurally identical** to clip 0 — same codec, edit rate, frame dimensions, and index mode (`cbg` or `vbe`). The per-clip bootstrap reuses clip 0's parsed metadata and only re-reads the index; a structural mismatch causes a full re-parse (slower but still correct). `none`-indexed clips always fall back to a full parse.
+
+---
+
 ## Development
 
 ```powershell
@@ -306,6 +352,9 @@ src/
   scrub-controller.ts      Fast-drag scrub render cycle (gated on paint)
   mse/mse-controller.ts    SourceBuffer append/remove queue, back-buffer eviction, quota back-pressure
   audio/                   PCM decode + Web Audio scheduling + channel routing
+  playlist/
+    hls-parser.ts          Minimal m3u8 parser (EXTINF, ENDLIST, MEDIA-SEQUENCE, TARGETDURATION)
+    playlist-controller.ts m3u8 lifecycle: initial fetch, static/live detection, live polling + dedup
   worker/
     demux-worker.ts        Worker entry: init, fetch-segment, seek, scrub-preview commands
     mpeg2-pipeline.ts      MPEG-2 decode → encode → fragment pipeline
