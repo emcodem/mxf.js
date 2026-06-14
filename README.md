@@ -44,6 +44,42 @@ All video flows through the single `<video>` element, so seeking and scrubbing w
 - **Fast-drag scrub**: single-flight, latest-wins preview pump with a per-keyframe scrub-preview cache (LRU). The playhead is gated on actual paint, so the picture keeps updating during a continuous drag instead of stalling.
 - **Bounded buffering**: prefetch is capped by requested-ahead time, back buffer is evicted behind the playhead, and `QuotaExceededError` back-pressure is handled — so high-bitrate AVC-Intra (~280 Mbps) doesn't overflow the SourceBuffer or saturate the worker.
 
+### Live edge — growing recordings
+
+Play an MXF file that is **still being written** (a running recording) and follow its end forward, with gapless hand-off when the recorder rotates to a new file:
+
+```ts
+// 1. Anchor to the current (growing) file at the live edge
+player.loadLive('/archive/ch01_2025-01-01T10:00:00.mxf');
+
+// 2. Pre-load the next file in the background as soon as it appears
+player.preloadNextUrl('/archive/ch01_2025-01-01T10:30:00.mxf');
+
+// 3. The player drains the old file and continues on the new one gaplessly
+player.on('live-end', () => player.switchLive(nextUrl));
+player.on('live-switched', ({ url }) => console.log('now playing', url));
+
+// 4. Catch-up events (speed strategy, default)
+player.on('catchup', ({ active, rate, lagSeconds }) => {
+  if (active) showBadge(`catching up ×${rate}…`);
+  else hideBadge();
+});
+
+// 5. Hard re-anchor fallback (player fell too far behind)
+player.on('catchup-jump', ({ lagSeconds }) => {
+  player.reanchorLive(getNewestFileFromPlaylist());
+});
+
+// 6. Feed the player an updated lag estimate whenever your playlist refreshes
+player.setLiveLag(lagSeconds);
+```
+
+Key points:
+- `loadLive` ignores the index and streams forward; `duration` is not meaningful in live mode.
+- `switchLive` / `preloadNextUrl` are **gapless** — the same MSE track and Web Audio context continue; there is no black frame, no decoder re-init, no A/V seam.
+- `preloadNextUrl` starts background loading the next file while the current one is still playing; `live-end` just completes the switch. Use `switchLive` if you didn't preload.
+- `reanchorLive` is for hard re-anchors only (lag too large to close smoothly). It does a clean cut to a new file — not gapless.
+
 ### Timecode
 - **Per-frame System Item timecode** (the authoritative source TC, which can jump) and **computed package start timecodes** (Material / File / Source), surfaced through one `timecode` event and the `currentTimecode` getter.
 - Locked to the frame **on screen** via `requestVideoFrameCallback`, so the displayed TC never lags the picture.
@@ -146,6 +182,12 @@ A runnable demo is in [`demo/index.html`](demo/index.html) (`npm run dev`, then 
 | `seekMode` | `'accurate' \| 'keyframe'` | `'accurate'` | Default `seek()` behaviour. `accurate` decodes keyframe→target; `keyframe` shows just the GOP-head I-frame. Scrubbing always uses keyframe internally and settles accurately on release. |
 | `resumeBufferSeconds` | `number` | `0.75` | Seconds buffered ahead before (re)starting playback after a cold start, seek, or stall. The first decoded picture shows immediately (with `buffering: true`) while this fills. Smaller = snappier resume but more re-buffering on a thin/decode-bound source. |
 | `debug` | `boolean` | `false` | Verbose `[mxf.js]` console logging. |
+| `live` | `boolean` | `false` | Open the file as a growing live recording (`loadLive`). No seeking; playback follows the end forward and fires `live-end` when complete. |
+| `liveCatchupStrategy` | `'speed' \| 'jump' \| 'off'` | `'speed'` | How to recover when the playhead falls behind the live edge. `'speed'`: nudge playback to `catchupRate` until within `catchupStopSeconds` of the edge (audio pitches up slightly). `'jump'`: hard re-anchor via `catchup-jump` event. `'off'`: never catch up. |
+| `catchupRate` | `number` | `1.1` | Playback rate used by the `'speed'` strategy while catching up. Keep in `1.05–1.15` — audio is pitched up while active. |
+| `catchupStartSeconds` | `number` | `5` | Engage `'speed'` catch-up when this many seconds behind the edge. Set above steady-state latency so normal play never triggers it. |
+| `catchupStopSeconds` | `number` | `2` | Disengage `'speed'` catch-up once within this many seconds of the edge (the target latency — not zero, to avoid pressing the bleeding edge). |
+| `catchupJumpSeconds` | `number` | `15` | Lag threshold for a hard jump — the `'jump'` strategy's only trigger, and the `'speed'` strategy's large-lag fallback. |
 
 ### Methods
 
@@ -160,6 +202,12 @@ A runnable demo is in [`demo/index.html`](demo/index.html) (`npm run dev`, then 
 | `scrubTo(seconds: number)` | Report a live drag position during scrubbing. |
 | `endScrub(seconds?: number)` | Leave scrub mode, settle accurately, resume playback. Defaults to current playhead. |
 | `setAudioChannels(channels: number[])` | Choose 0-based source channels to mix to stereo (`[]` mutes). |
+| `loadLive(url: string)` | Open a growing live recording. Player streams forward and fires `live-end` when the file completes. No seeking or scrubbing. |
+| `preloadNextUrl(url: string)` | Start background-loading the next file while the current one is still playing; the gapless switch completes automatically on `live-end`. |
+| `switchLive(url: string)` | Hand off to the next file gaplessly (same MSE + audio, no teardown). Call on `live-end` if you didn't call `preloadNextUrl`. |
+| `reanchorLive(url: string)` | Hard re-anchor to a new file (clean cut, not gapless). Intended as the `catchup-jump` response. |
+| `setLiveLag(seconds: number)` | Report the current estimated lag to the player so it can evaluate catch-up. Call whenever your playlist refreshes. |
+| `audioDiag()` | Return a diagnostic snapshot: A/V offset, anomaly counts, audio coverage, scheduler gap. Useful for tuning and debugging. |
 | `destroy()` | Tear down the worker, MSE, audio, and listeners. |
 
 ### Properties (getters)
@@ -195,6 +243,10 @@ Subscribe with `player.on(event, handler)` / `.once(...)` / `.off(...)`.
 | `codec-unsupported` | `{ codec, reason }` | A track's codec can't be played. |
 | `error` | `{ message, fatal }` | An error occurred; `fatal` means playback can't continue. |
 | `destroyed` | `void` | `destroy()` completed. |
+| `live-end` | `void` | Live mode: the current file is complete. Call `switchLive(nextUrl)` (or rely on a prior `preloadNextUrl`) to continue gaplessly. |
+| `live-switched` | `{ url: string }` | Live mode: gapless hand-off to the next file completed. Advance your current-file bookkeeping here. |
+| `catchup` | `{ active: boolean, rate: number, lagSeconds: number }` | `'speed'` strategy: catch-up engaged (`active: true`, playback nudged to `rate`) or disengaged (`active: false`, restored to 1×). |
+| `catchup-jump` | `{ lagSeconds: number }` | Player fell too far behind to close smoothly. Respond by calling `reanchorLive(newestUrl)` with the newest file from your playlist. |
 
 ### Types
 
@@ -228,6 +280,7 @@ interface ManifestData {
   displayHeight: number;           //   0 when unknown
   aspectRatio: { num: number; den: number } | null;  // display aspect ratio (DAR), null = square
   indexMode: IndexMode;
+  live: boolean;                   // true when opened via loadLive()
   longGop: boolean;                // true for H.264 Long-GOP (XAVC-L); B-frame reorder applied on fetch
   timecodes: ManifestTimecode[];   // computed start TCs from material/file/source packages
 }
