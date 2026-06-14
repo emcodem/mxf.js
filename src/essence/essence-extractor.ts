@@ -40,8 +40,10 @@ export class EssenceExtractor {
    * edit-unit counter, so two video tracks double-count edit units and misalign every index offset.
    * Audio is deliberately NOT locked this way: separate-mono PCM carries each channel as its own
    * sound element per edit unit, and the PCM decoder relies on seeing all of them.
+   *
+   * A holder (not a bare field) so the shared {@link emitEssenceFrames} walk can lock it across calls.
    */
-  private videoTrackKey: Uint8Array | null = null;
+  private readonly videoTrackKey: VideoTrackKeyHolder = { key: null };
   /** Optional cancellation signal; aborting it cancels in-flight reads (seek/scrub supersession). */
   private readonly signal?: AbortSignal;
   /** Rounded timecode base (frames/sec) for decoding System Item SMPTE 12M timecodes. */
@@ -148,7 +150,7 @@ export class EssenceExtractor {
     fromByteOffset?: bigint
   ): AsyncGenerator<EssenceFrame> {
     const fileSize = await this.loader.fileSize;
-    const state = { editUnit: startFrame, videoFramesSeen: 0, pendingSystemTc: null as Timecode | null };
+    const state: WalkState = { editUnit: startFrame, videoFramesSeen: 0, started: false, pendingSystemTc: null };
 
     let window = SEQ_WINDOW;
     let carry: Uint8Array | null = null;
@@ -179,7 +181,7 @@ export class EssenceExtractor {
 
       // combined is always backed by a real (non-shared) ArrayBuffer at offset 0 (it's either the
       // fresh fetched buffer or a freshly-allocated concat), so this cast is safe.
-      const stopOffset = yield* this.emitFromBuffer(combined.buffer as ArrayBuffer, 0, state, frameCount, combinedAbs);
+      const stopOffset = yield* emitEssenceFrames(combined.buffer as ArrayBuffer, 0, state, frameCount, combinedAbs, this.walkCtx);
       if (state.videoFramesSeen >= frameCount) break;
       if (reachedEOF) break; // nothing more to read; whatever's left is a trailing fragment
 
@@ -216,90 +218,234 @@ export class EssenceExtractor {
     frameCount: number,
     bufferAbs: number
   ): AsyncGenerator<EssenceFrame> {
-    const state = { editUnit: startFrame, videoFramesSeen: 0, pendingSystemTc: null as Timecode | null };
-    yield* this.emitFromBuffer(buffer, 0, state, frameCount, bufferAbs);
+    const state: WalkState = { editUnit: startFrame, videoFramesSeen: 0, started: false, pendingSystemTc: null };
+    yield* emitEssenceFrames(buffer, 0, state, frameCount, bufferAbs, this.walkCtx);
   }
 
-  /**
-   * Walk KLVs in `buffer` from `startOffset`, emitting video/audio EssenceFrames and updating
-   * `state` (editUnit + videoFramesSeen) in place so the caller can resume across buffers. Returns
-   * the byte offset where iteration stopped — the start of an incomplete trailing KLV, the start of
-   * the first video frame past `frameCount`, or the end of the buffer. Skips partition packs and
-   * KLV Fill (including the inter-frame fill used to pad CBG constant-size edit units).
-   */
-  private *emitFromBuffer(
-    buffer: ArrayBuffer,
-    startOffset: number,
-    state: { editUnit: bigint; videoFramesSeen: number; pendingSystemTc: Timecode | null },
-    frameCount: number,
-    bufferAbs: number
-  ): Generator<EssenceFrame, number> {
-    const iter = new KLVIterator(buffer, startOffset);
+  /** Context the shared KLV walk needs: the cross-call video-track lock and the timecode base. */
+  private get walkCtx(): WalkCtx {
+    return { videoTrackKey: this.videoTrackKey, tcBase: this.tcBase };
+  }
+}
 
-    while (iter.hasMore()) {
-      const pktStart = iter.offset;
-      const pkt = iter.next();
-      if (!pkt) return pktStart; // incomplete trailing KLV begins here
+/** Mutable holder for the locked video track number, shared by the walk across calls. */
+interface VideoTrackKeyHolder { key: Uint8Array | null }
 
-      if (isPartitionPack(pkt.key) || isFill(pkt.key)) continue;
+/** Per-walk context: the (cross-call) video-track lock and the rounded timecode base. */
+interface WalkCtx { videoTrackKey: VideoTrackKeyHolder; tcBase: number }
 
-      // System Item: carries this content package's per-frame timecode. It precedes the picture
-      // element in the package, so stash the TC and attach it to the next emitted picture frame. A
-      // package can have MORE than one system KLV (e.g. XAVC writes a System Metadata Pack that
-      // carries the timecode PLUS a second pack that doesn't) — keep the first valid TC of the
-      // package and don't let a later TC-less pack clobber it (pendingSystemTc is reset to null when
-      // the picture frame consumes it, so the guard is per-package).
-      if (isSystemItem(pkt.key)) {
-        if (state.pendingSystemTc === null) {
-          const sysVal = new Uint8Array(buffer, pkt.valueOffset, pkt.valueLength);
-          state.pendingSystemTc = parseSystemItemTimecode(sysVal, this.tcBase);
-        }
-        continue;
+/**
+ * Persistent state for {@link emitEssenceFrames}, threaded across buffers (windowed reads) and, in
+ * live mode, across many separate forward reads. `started` is true once any video frame has been
+ * emitted, so the edit-unit counter advances on every subsequent picture element (not the first) —
+ * which keeps numbering continuous across reads without re-emitting the last frame's edit unit.
+ */
+export interface WalkState {
+  editUnit: bigint;
+  videoFramesSeen: number;
+  started: boolean;
+  pendingSystemTc: Timecode | null;
+}
+
+/**
+ * Walk KLVs in `buffer` from `startOffset`, emitting video/audio EssenceFrames and updating `state`
+ * in place so a caller can resume across buffers. Returns the byte offset where iteration stopped —
+ * the start of an incomplete trailing KLV, the start of the first video frame past `frameCount`, or
+ * the end of the buffer. Skips partition packs and KLV Fill (incl. the inter-frame fill that pads
+ * CBG constant-size edit units). Shared by the sequential reader, the index chunk parser, and the
+ * live forward reader.
+ */
+export function* emitEssenceFrames(
+  buffer: ArrayBuffer,
+  startOffset: number,
+  state: WalkState,
+  frameCount: number,
+  bufferAbs: number,
+  ctx: WalkCtx,
+): Generator<EssenceFrame, number> {
+  const iter = new KLVIterator(buffer, startOffset);
+
+  while (iter.hasMore()) {
+    const pktStart = iter.offset;
+    const pkt = iter.next();
+    if (!pkt) return pktStart; // incomplete trailing KLV begins here
+    // Stop at the first byte that isn't a valid MXF key (06 0e 2b 34). In a growing/preallocated
+    // recording this is the unwritten zero frontier: returning its offset lets the live reader treat
+    // it as the edge and wait, instead of walking zero-padding as bogus KLVs and desyncing.
+    if (pkt.key[0] !== 0x06 || pkt.key[1] !== 0x0e || pkt.key[2] !== 0x2b || pkt.key[3] !== 0x34) return pktStart;
+
+    if (isPartitionPack(pkt.key) || isFill(pkt.key)) continue;
+
+    // System Item: carries this content package's per-frame timecode. It precedes the picture
+    // element in the package, so stash the TC and attach it to the next emitted picture frame. A
+    // package can have MORE than one system KLV (e.g. XAVC writes a System Metadata Pack that
+    // carries the timecode PLUS a second pack that doesn't) — keep the first valid TC of the
+    // package and don't let a later TC-less pack clobber it (pendingSystemTc is reset to null when
+    // the picture frame consumes it, so the guard is per-package).
+    if (isSystemItem(pkt.key)) {
+      if (state.pendingSystemTc === null) {
+        const sysVal = new Uint8Array(buffer, pkt.valueOffset, pkt.valueLength);
+        state.pendingSystemTc = parseSystemItemTimecode(sysVal, ctx.tcBase);
       }
-
-      const isVideo = isPictureEssence(pkt.key);
-      const isAudio = isSoundEssence(pkt.key);
-      if (!isVideo && !isAudio) continue;
-
-      if (isVideo) {
-        // Lock onto the first picture track number; skip picture elements from any other video track
-        // so they neither emit nor advance the edit-unit counter (see videoTrackKey).
-        if (this.videoTrackKey === null) {
-          this.videoTrackKey = pkt.key.slice(12, 16);
-        } else if (!trackKeyEquals(pkt.key, this.videoTrackKey)) {
-          continue;
-        }
-        if (state.videoFramesSeen >= frameCount) return pktStart; // beyond the requested range
-        if (state.videoFramesSeen > 0) state.editUnit++;
-        state.videoFramesSeen++;
-      }
-
-      const data = buffer.slice(pkt.valueOffset, pkt.valueOffset + pkt.valueLength);
-
-      // Hand the stashed system-item TC to this picture frame, then clear it so it can't leak onto
-      // a later package's video element (audio elements don't consume it).
-      const systemTimecode = isVideo ? (state.pendingSystemTc ?? undefined) : undefined;
-      if (isVideo) state.pendingSystemTc = null;
-
-      yield {
-        trackType: isVideo ? 'video' : 'audio',
-        editUnit: state.editUnit,
-        pts: state.editUnit,
-        dts: state.editUnit,
-        isKeyframe: isVideo, // refined via index flags at seek time
-        data,
-        systemTimecode,
-        aes3: !isVideo && isAes3Sound(pkt.key),
-        byteOffset: BigInt(bufferAbs + pktStart),
-      };
+      continue;
     }
 
-    return iter.offset;
+    const isVideo = isPictureEssence(pkt.key);
+    const isAudio = isSoundEssence(pkt.key);
+    if (!isVideo && !isAudio) continue;
+
+    if (isVideo) {
+      // Lock onto the first picture track number; skip picture elements from any other video track
+      // so they neither emit nor advance the edit-unit counter (see videoTrackKey).
+      if (ctx.videoTrackKey.key === null) {
+        ctx.videoTrackKey.key = pkt.key.slice(12, 16);
+      } else if (!trackKeyEquals(pkt.key, ctx.videoTrackKey.key)) {
+        continue;
+      }
+      if (state.videoFramesSeen >= frameCount) return pktStart; // beyond the requested range
+      // Advance on every picture element except the very first one emitted (across all reads), so
+      // audio in the same package shares the package's edit unit and numbering stays continuous.
+      if (state.started) state.editUnit++;
+      state.started = true;
+      state.videoFramesSeen++;
+    }
+
+    const data = buffer.slice(pkt.valueOffset, pkt.valueOffset + pkt.valueLength);
+
+    // Hand the stashed system-item TC to this picture frame, then clear it so it can't leak onto
+    // a later package's video element (audio elements don't consume it).
+    const systemTimecode = isVideo ? (state.pendingSystemTc ?? undefined) : undefined;
+    if (isVideo) state.pendingSystemTc = null;
+
+    yield {
+      trackType: isVideo ? 'video' : 'audio',
+      editUnit: state.editUnit,
+      pts: state.editUnit,
+      dts: state.editUnit,
+      isKeyframe: isVideo, // refined via index flags at seek time
+      data,
+      systemTimecode,
+      aes3: !isVideo && isAes3Sound(pkt.key),
+      byteOffset: BigInt(bufferAbs + pktStart),
+    };
   }
+
+  return iter.offset;
 }
 
 /** Compare an essence element key's track-number bytes (key[12..15]) against a 4-byte lock. */
 function trackKeyEquals(key: Uint8Array, track4: Uint8Array): boolean {
   return key[12] === track4[0] && key[13] === track4[1] &&
          key[14] === track4[2] && key[15] === track4[3];
+}
+
+/**
+ * Live-mode forward reader for a growing recording. Holds a persistent byte cursor, carry (the
+ * incomplete trailing KLV at the file's edge), and a CONTINUOUS edit-unit counter, so successive
+ * {@link readForward} calls stream frames straight forward — and the edit unit keeps climbing across
+ * the whole session (including across rotated files when seeded via `startEditUnit`), which is what
+ * makes the fragmenter's timestamps continuous for seamless stitching. Reuses {@link emitEssenceFrames}
+ * for KLV classification; the only extra logic is the persistent windowed read with carry, bounded by
+ * the CURRENT (polled) file size rather than the one-shot `loader.fileSize`.
+ */
+export class LiveSequentialReader {
+  private readonly loader: ILoader;
+  private readonly tcBase: number;
+  private readonly videoTrackKey: VideoTrackKeyHolder = { key: null };
+  private readonly state: WalkState;
+  private carry: Uint8Array | null = null;
+  private carryAbs: number;
+  private fetchAbs: number;
+  /** True when the last readForward stopped because it reached the current file size (live edge). */
+  private _atEdge = false;
+
+  constructor(loader: ILoader, startByteOffset: bigint, startEditUnit: bigint, tcBase: number) {
+    this.loader = loader;
+    this.tcBase = tcBase;
+    this.fetchAbs = Number(startByteOffset);
+    this.carryAbs = this.fetchAbs;
+    this.state = { editUnit: startEditUnit, videoFramesSeen: 0, started: false, pendingSystemTc: null };
+  }
+
+  /** Caught up to EOF as of the last read (no more complete frames available right now). */
+  get atEdge(): boolean { return this._atEdge; }
+  /** Absolute byte offset of the next unread byte (the live edge cursor). */
+  get cursor(): number { return this.fetchAbs; }
+  /** Edit unit that the NEXT emitted video frame will carry (continuous across reads). */
+  get nextEditUnit(): bigint { return this.state.started ? this.state.editUnit + 1n : this.state.editUnit; }
+
+  /**
+   * Read forward up to `frameCount` video frames, bounded by `currentFileSize` (the latest polled
+   * size). Persists cursor/carry/edit-unit so the next call resumes exactly where this stopped.
+   * Stops early (retaining carry) when it reaches the current edge — the caller then polls and calls
+   * again once the file has grown.
+   */
+  async *readForward(frameCount: number, currentFileSize: number, signal?: AbortSignal): AsyncGenerator<EssenceFrame> {
+    const ctx: WalkCtx = { videoTrackKey: this.videoTrackKey, tcBase: this.tcBase };
+    this.state.videoFramesSeen = 0; // per-call budget; editUnit/started persist
+    this._atEdge = false;
+    let window = SEQ_WINDOW;
+
+    while (this.state.videoFramesSeen < frameCount) {
+      const end = Math.min(currentFileSize - 1, this.fetchAbs + window - 1);
+      if (this.fetchAbs > end) { this._atEdge = true; break; } // at the live edge — nothing new yet
+
+      const fetched = new Uint8Array(
+        await this.loader.fetchRange(this.fetchAbs, end, `live forward @${this.fetchAbs}`, signal)
+      );
+      const reachedEdge = end >= currentFileSize - 1;
+
+      let combined: Uint8Array;
+      let combinedAbs: number;
+      if (this.carry && this.carry.length > 0) {
+        combined = new Uint8Array(this.carry.length + fetched.length);
+        combined.set(this.carry, 0);
+        combined.set(fetched, this.carry.length);
+        combinedAbs = this.carryAbs;
+      } else {
+        combined = fetched;
+        combinedAbs = this.fetchAbs;
+      }
+
+      const stopOffset = yield* emitEssenceFrames(combined.buffer as ArrayBuffer, 0, this.state, frameCount, combinedAbs, ctx);
+
+      // Unwritten frontier: the walk stopped on bytes that aren't a valid MXF key. The recorder
+      // preallocates the file ahead of the data it has written, so the reported size covers
+      // zero-padding past the live write-frontier — this is the edge, NOT corruption. Drop the zero
+      // carry and reset the cursor to the frontier so the next read re-fetches it fresh once the real
+      // bytes land. Without this the walk would parse zero-padding as bogus KLVs and desync.
+      if (stopOffset < combined.length &&
+          !(combined[stopOffset] === 0x06 && combined[stopOffset + 1] === 0x0e &&
+            combined[stopOffset + 2] === 0x2b && combined[stopOffset + 3] === 0x34)) {
+        this.carry = null;
+        this.carryAbs = combinedAbs + stopOffset;
+        this.fetchAbs = combinedAbs + stopOffset;
+        this._atEdge = true;
+        break;
+      }
+
+      // Oversized single KLV (a frame larger than the window) — read its declared length exactly and
+      // retry, unless implausibly large.
+      if (stopOffset === 0 && this.state.videoFramesSeen < frameCount && !reachedEdge) {
+        const dv = new DataView(combined.buffer);
+        let fullKlvSize: number;
+        try { const { length: vlen, bytesRead } = decodeBerLength(dv, 16); fullKlvSize = 16 + bytesRead + vlen; }
+        catch { this._atEdge = true; break; }
+        if (fullKlvSize > SEQ_HARD_CAP) { this._atEdge = true; break; }
+        this.carry = combined;
+        this.carryAbs = combinedAbs;
+        this.fetchAbs = combinedAbs + combined.length;
+        window = Math.min(Math.max(window, fullKlvSize - combined.length + 16), SEQ_HARD_CAP);
+        continue;
+      }
+
+      // Carry the incomplete trailing KLV (or the over-budget frame's bytes) into the next call.
+      this.carry = stopOffset < combined.length ? combined.slice(stopOffset) : null;
+      this.carryAbs = combinedAbs + stopOffset;
+      this.fetchAbs = combinedAbs + combined.length;
+      window = SEQ_WINDOW;
+
+      if (reachedEdge && this.state.videoFramesSeen < frameCount) { this._atEdge = true; break; }
+    }
+  }
 }

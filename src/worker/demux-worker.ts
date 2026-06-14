@@ -3,7 +3,7 @@ import { FileLoader } from '../loader/file-loader.js';
 import { ILoader } from '../loader/loader.js';
 import { MxfFile } from '../mxf-file.js';
 import type { MxfBootstrap } from '../mxf-file.js';
-import { EssenceExtractor } from '../essence/essence-extractor.js';
+import { EssenceExtractor, LiveSequentialReader } from '../essence/essence-extractor.js';
 import { Mp4Fragmenter } from '../remuxer/mp4-fragmenter.js';
 import {
   resolveFrameOffset, gopLengthFromKeyframe,
@@ -52,6 +52,33 @@ let workerDebug = false;
 // Active transcode pipeline: the native JS MPEG-2 pipeline OR a wasm-backed plugin pipeline.
 // Only one is set at a time; null for the H.264 remux path (no transcode needed).
 let transcodePipeline: ITranscodePipeline | null = null;
+
+// ── Live mode (growing recording, index-free forward streaming) ──────────────
+// Set when the file was opened via initUrl/initFile with live:true. The index is ignored; a
+// persistent LiveSequentialReader streams frames forward from near EOF and follows the growing file.
+// There is no seeking/scrubbing in live mode. See handleLiveFetch / handlePollLive and MxfFile.openLive.
+let liveMode = false;
+let liveReader: LiveSequentialReader | null = null;
+// Continuous edit-unit counter base for THIS file's first emitted frame — 0 for the first file, and
+// the previous file's final edit unit for a rotated next file, so timestamps stay continuous across
+// the seam (seamless stitch). Set from the init command and refined via setStartEditUnit at handoff.
+let liveStartEditUnit = 0;
+// Latest known file size (from refreshFileSize polling); bounds each forward read at the live edge.
+let liveLastSize = 0;
+// Start reading from the essence start (true, rotated next file) vs near EOF (false, first file).
+let liveFromStart = false;
+// Continuous OUTPUT frontier: edit unit after the last video frame actually emitted to MSE. Trails the
+// reader's byte cursor by the transcode reorder depth (held frames). Reported to the player so the
+// forward frontier and the next-file switch base align to emitted video — keeping the seam gap-free.
+let liveOutputFrontier = 0;
+// Audio frontier: edit unit AFTER the last audio frame emitted. Audio is never reorder-held, so this
+// leads the video output frontier at the boundary. flushLiveTail reports it as the switch base so the
+// next file's audio abuts the old audio EXACTLY (no coverage gap / no overlap) — the audible seam.
+let liveAudioFrontier = 0;
+// DIAG (remove after debug): last reported video-vs-audio frontier divergence, so handleLiveFetch
+// logs only TRANSITIONS (a growing |divergence| = accumulating A/V desync) instead of every fetch.
+let _diagLastDiv = NaN;
+let _diagFetchN = 0; // DIAG (remove after debug): fetch counter for the "still alive" heartbeat
 // Config for the wasm plugin, carried from the init command so handleInit can use it.
 let activePluginConfig: WorkerPluginConfig | null = null;
 
@@ -170,7 +197,7 @@ async function loadKernelsOnce(): Promise<void> {
   }
 }
 
-async function handleInit(loader_: ILoader, debug = false): Promise<void> {
+async function handleInit(loader_: ILoader, debug = false, live = false, startEditUnit = 0, fromStart = false): Promise<void> {
   loader = loader_;
   workerDebug = debug;
   mxfFile = new MxfFile(loader, debug);
@@ -180,9 +207,16 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
   sparseKf = null;
   abortSpeculation();
   scrubSegmentCache.clear();
+  liveMode = live;
+  liveReader = null;
+  liveStartEditUnit = startEditUnit;
+  liveLastSize = 0;
+  liveFromStart = fromStart;
+  liveOutputFrontier = startEditUnit;
+  liveAudioFrontier = startEditUnit;
 
   try {
-    const bootstrap = await mxfFile.open();
+    const bootstrap = live ? await mxfFile.openLive() : await mxfFile.open();
     const { metadata } = bootstrap;
     fragmenter = new Mp4Fragmenter(metadata);
     const pd = metadata.pictureDescriptor;
@@ -279,6 +313,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
         indexMode: bootstrap.indexMode,
         longGop: false,
         audioChannelCount,
+        live: liveMode,
       });
 
       const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
@@ -369,6 +404,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
         indexMode: bootstrap.indexMode,
         longGop: false, // MPEG-2 transcode path handles reorder inside the decoder, not here
         audioChannelCount,
+        live: liveMode,
       });
 
       const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
@@ -475,6 +511,7 @@ async function handleInit(loader_: ILoader, debug = false): Promise<void> {
       indexMode: bootstrap.indexMode,
       longGop: longGop !== null,
       audioChannelCount,
+      live: liveMode,
     });
 
     if (resolvedMode === 'webcodecs' && pendingVideoInit) {
@@ -951,6 +988,198 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
   }
 }
 
+/**
+ * Keyframe detector for the live-edge start snap, by codec. MPEG-2: a GOP/sequence header
+ * (00 00 01 B3 / B8) near the start of the picture bytes marks a GOP head — the only place the
+ * decoder can begin cleanly. Returns undefined for codecs where any frame is a valid start (e.g.
+ * AVC-Intra all-intra), so the start snaps to the latest complete frame.
+ */
+function liveKeyframeDetector(): ((value: Uint8Array) => boolean) | undefined {
+  const codec = mxfFile?.getBootstrap()?.metadata.pictureDescriptor?.codec;
+  if (codec === 'mpeg2') {
+    return (v: Uint8Array) => {
+      // Scan a bounded prefix for an MPEG-2 sequence (B3) or GOP (B8) start code.
+      const lim = Math.min(v.length - 4, 4096);
+      for (let i = 0; i <= lim; i++) {
+        if (v[i] === 0x00 && v[i + 1] === 0x00 && v[i + 2] === 0x01 && (v[i + 3] === 0xB3 || v[i + 3] === 0xB8)) return true;
+      }
+      return false;
+    };
+  }
+  return undefined; // any frame is a fine start (all-intra), or codec without a cheap marker
+}
+
+/**
+ * Live-mode forward fetch: pull the next `frameCount` frames from the persistent LiveSequentialReader
+ * (created lazily, positioned near EOF on first call) and post a video segment + audio, then
+ * segmentDone. No index, no seeking, no scrub/speculation — just stream forward. The continuous
+ * edit-unit counter (seeded from `liveStartEditUnit`) keeps timestamps continuous across rotated
+ * files. The MPEG-2 pipeline's held anchor is deliberately NOT flushed at the edge (flushing
+ * mid-stream would drop the decoder's references and corrupt the next frames); the latest frame
+ * lands one fetch later, which is imperceptible for live.
+ */
+async function handleLiveFetch(frameCount: number, seqBase: number): Promise<void> {
+  if (!loader || !mxfFile || !fragmenter) { postError('Not initialized'); return; }
+  const bootstrap = mxfFile.getBootstrap();
+  if (!bootstrap) { postError('Bootstrap not complete'); return; }
+
+  try {
+    // Lazily create the reader on first fetch: locate the start byte near the current EOF, seed the
+    // continuous counter, and (for MPEG-2) number the transcode pipeline's output from that base.
+    if (!liveReader) {
+      const fileSize = await loader.fileSize;
+      // First file → jump to its live edge; rotated next file → start at its beginning (contiguous).
+      // For the edge jump, snap to a KEYFRAME so the decoder syncs immediately and A/V stay aligned
+      // (starting mid-GOP would discard video until the next sequence header while audio played).
+      const startByte = liveFromStart
+        ? bootstrap.essenceStart
+        : await mxfFile.findLiveStartByte(fileSize, liveKeyframeDetector());
+      const tcBase = storedEditRateDenominator > 0 ? Math.round(storedEditRateNumerator / storedEditRateDenominator) : 0;
+      liveReader = new LiveSequentialReader(loader, startByte, BigInt(liveStartEditUnit), tcBase);
+      liveLastSize = fileSize;
+      liveOutputFrontier = liveStartEditUnit;
+      liveAudioFrontier = liveStartEditUnit;
+      _diagLastDiv = NaN; // DIAG: fresh reader → re-log the first divergence
+      transcodePipeline?.reset(liveStartEditUnit, false);
+      if (workerDebug) console.log(`[live] reader @byte ${startByte}, startEditUnit ${liveStartEditUnit}, size ${fileSize}`);
+    }
+
+    const currentSize = liveLastSize > 0 ? liveLastSize : await loader.fileSize;
+    const frames: EssenceFrame[] = [];
+    for await (const f of liveReader.readForward(frameCount, currentSize)) frames.push(f);
+    const videoFrames = frames.filter(f => f.trackType === 'video');
+    const audioFrames = frames.filter(f => f.trackType === 'audio');
+
+    // ── Video ────────────────────────────────────────────────────────────────
+    if (videoFrames.length > 0) {
+      const segEditUnit = Number(videoFrames[0].editUnit);
+      const tcAnchors = buildTcAnchors(videoFrames.map(f => ({ editUnit: Number(f.editUnit), tc: f.systemTimecode })));
+      const anchors = tcAnchors.length ? tcAnchors : undefined;
+
+      if (transcodePipeline) {
+        // flushHeldAnchor=false: never flush mid-stream — flushing emits the held reorder anchor early,
+        // which breaks long-GOP display order (the held P would precede the B's that display before it).
+        // shouldAbort=false: live fetches are serial (player waits for the reply) and never superseded.
+        const { chunks, framesEmitted } = await transcodePipeline.decodeSegment(videoFrames, false, () => false);
+        const seg = fragmenter.buildTranscodedVideoSegment(chunks);
+        if (chunks.length > 0) liveOutputFrontier = Number(chunks[chunks.length - 1].editUnit) + 1;
+        if (workerDebug) console.log(`[live] fetch: read ${videoFrames.length}v/${audioFrames.length}a, emitted ${framesEmitted}, chunks ${chunks.length} eu[${chunks[0] ? Number(chunks[0].editUnit) : '-'}..${chunks.length ? Number(chunks[chunks.length - 1].editUnit) : '-'}] frontier=${liveOutputFrontier} atEdge=${liveReader.atEdge}`);
+        if (seg) post({ type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: segEditUnit, systemTcAnchors: anchors }, [seg.buffer]);
+      } else {
+        const seg = fragmenter.buildVideoSegment(videoFrames);
+        // Remux path: no reorder hold, so the output frontier is simply past the last frame read.
+        liveOutputFrontier = Number(videoFrames[videoFrames.length - 1].editUnit) + 1;
+        if (seg) post({ type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: segEditUnit, systemTcAnchors: anchors }, [seg.buffer]);
+      }
+    }
+
+    // ── Audio (same handling as the normal forward path) ───────────────────────
+    if (audioFrames.length > 0) {
+      const sd = bootstrap.metadata.soundDescriptor;
+      const audioEditUnit = Number(audioFrames[0].editUnit);
+      // Advance the audio frontier past the last audio frame read (audio is never reorder-held).
+      liveAudioFrontier = Number(audioFrames[audioFrames.length - 1].editUnit) + 1;
+      if (sd?.codec === 'pcm') {
+        const { samples: float32, channelCount } = decodePcmElements(
+          audioFrames.map(f => ({ editUnit: f.editUnit, data: f.data, aes3: f.aes3 })),
+          { bitDepth: sd.bitDepth, blockAlign: sd.blockAlign, channelCount: sd.channelCount },
+        );
+        post({ type: 'pcmSamples', samples: float32, editUnit: audioEditUnit, sampleRate: sd.sampleRate, channelCount }, [float32.buffer]);
+      } else {
+        const seg = fragmenter.buildAudioSegment(audioFrames);
+        if (seg) post({ type: 'audioSegment', data: seg.buffer as ArrayBuffer, seq: seqBase + 1, editUnit: audioEditUnit }, [seg.buffer]);
+      }
+    }
+
+    // DIAG (remove after debug): log A/V frontier divergence TRANSITIONS. Steady state is constant
+    // (-1 held anchor); a growing magnitude means video is falling behind audio (the accumulating
+    // desync). vEU0/aEU0 are this fetch's first video/audio edit units.
+    {
+      const div = liveOutputFrontier - liveAudioFrontier;
+      _diagFetchN++;
+      // Log every divergence TRANSITION, plus a heartbeat every 20 fetches so a STALL (fetching stops)
+      // is visible as the absence of heartbeats — not just constant divergence.
+      if (div !== _diagLastDiv || _diagFetchN % 20 === 0) {
+        // eslint-disable-next-line no-console
+        console.log(`[mxfdiag] wkr div ${_diagLastDiv}->${div} f#${_diagFetchN} vfront=${liveOutputFrontier} afront=${liveAudioFrontier} vEU0=${videoFrames[0] ? Number(videoFrames[0].editUnit) : '-'} aEU0=${audioFrames[0] ? Number(audioFrames[0].editUnit) : '-'} atEdge=${liveReader.atEdge}`);
+        _diagLastDiv = div;
+      }
+    }
+
+    // Live uses liveUpdate (not segmentDone): it carries the OUTPUT frontier (emitted video) and the
+    // edge state. Reporting the output frontier (not the reader's byte cursor) keeps the player's
+    // forward math and the file-switch base aligned to what's actually in MSE — so the seam has no gap.
+    post({
+      type: 'liveUpdate',
+      grew: videoFrames.length > 0 || audioFrames.length > 0,
+      atEdge: liveReader.atEdge,
+      nextEditUnit: liveOutputFrontier,
+    });
+  } catch (e) {
+    postError(`Live fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+    // Never wedge the player's fetch loop on a transient read error — report at-edge so it polls.
+    post({ type: 'liveUpdate', grew: false, atEdge: true, nextEditUnit: liveOutputFrontier });
+  }
+}
+
+/**
+ * Live-mode boundary flush: drain the transcode decoder's held reorder frames at a file rotation.
+ * Mid-stream we deliberately never flush (flushing emits the held anchor early and breaks display
+ * order); but at the boundary the held frames are the old file's final, fully-decodable pictures, and
+ * emitting them advances the video OUTPUT frontier up to the AUDIO frontier (audio is never held). The
+ * player calls this just before activating the standby so the next file's base phase-locks both tracks
+ * — no A/V seam. The remux path holds nothing, so this only reports the (already-aligned) frontier.
+ */
+async function handleFlushLiveTail(seqBase: number): Promise<void> {
+  try {
+    if (transcodePipeline && fragmenter && liveReader) {
+      // flushDecoder=true: nudge the parser + drain the reorder buffer, emitting every remaining
+      // display-order frame the old file's decoder still holds.
+      const { chunks, framesEmitted } = await transcodePipeline.decodeSegment([], true, () => false);
+      if (chunks.length > 0) {
+        const seg = fragmenter.buildTranscodedVideoSegment(chunks);
+        liveOutputFrontier = Number(chunks[chunks.length - 1].editUnit) + 1;
+        if (seg) post({ type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: Number(chunks[0].editUnit) }, [seg.buffer]);
+      }
+      if (workerDebug) console.log(`[live] flushTail: emitted ${framesEmitted}, chunks ${chunks.length}, videoFrontier=${liveOutputFrontier} audioFrontier=${liveAudioFrontier}`);
+    }
+  } catch (e) {
+    postError(`Live tail flush failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  // Lock the switch base to the EARLIER of the two track frontiers so NEITHER track gaps at the seam.
+  // The flush is meant to bring the video frontier up to the audio frontier, but a file is often cut
+  // mid-GOP with audio written a couple edit units ahead of the last decodable video frame — those
+  // video frames simply aren't in the file, so the flush can't emit them and the video frontier stays
+  // behind. Basing at the audio frontier then leaves a multi-edit-unit VIDEO GAP that wedges the
+  // playhead (the seam stall). Basing at min() makes the lagging track abut exactly and the leading
+  // track OVERLAP by those few units — benign: MSE replaces the overlapping video sample, and the Web
+  // Audio store replaces the overlapped chunk (a sub-frame audio re-tile, not a stall).
+  const v = liveOutputFrontier, a = liveAudioFrontier;
+  const base = v > 0 && a > 0 ? Math.min(v, a) : (v > 0 ? v : a);
+  if (workerDebug) console.log(`[live] flushTail base=${base} (videoFrontier=${v} audioFrontier=${a})`);
+  post({ type: 'liveTailFlushed', nextEditUnit: base });
+}
+
+/**
+ * Live-mode poll: re-query the source size and tell the player whether it grew and whether the reader
+ * has caught up to the current edge. Drives the follow-the-edge cadence on the player side.
+ */
+async function handlePollLive(): Promise<void> {
+  if (!liveMode || !loader?.refreshFileSize) return;
+  let newSize: number;
+  try {
+    newSize = await loader.refreshFileSize();
+  } catch {
+    post({ type: 'liveUpdate', grew: false, atEdge: liveReader?.atEdge ?? true, nextEditUnit: liveOutputFrontier });
+    return;
+  }
+  const grew = newSize > liveLastSize;
+  if (grew) liveLastSize = newSize;
+  const atEdge = !grew && (liveReader ? liveReader.cursor >= newSize : true);
+  if (workerDebug) console.log(`[live] poll: size ${newSize} grew=${grew} cursor=${liveReader?.cursor ?? '-'} atEdge=${atEdge} frontier=${liveOutputFrontier}`);
+  post({ type: 'liveUpdate', grew, atEdge, nextEditUnit: liveOutputFrontier });
+}
+
 // Command dispatch: one handler per command type. Each handler's parameter is narrowed to the
 // matching member of the WorkerCommand union, so adding a command is a single entry here (plus the
 // union itself) rather than a new switch case. The dispatch cast is the standard discriminated-union
@@ -961,14 +1190,20 @@ const commandHandlers: CommandHandlers = {
   initUrl: (cmd) => {
     videoMode = cmd.videoMode ?? 'mse';
     activePluginConfig = cmd.plugins?.videoDecoder ?? null;
-    handleInit(new HttpLoader(cmd.url), cmd.debug).catch(e => postError(String(e), true));
+    handleInit(new HttpLoader(cmd.url), cmd.debug, cmd.live, cmd.startEditUnit, cmd.liveFromStart).catch(e => postError(String(e), true));
   },
   initFile: (cmd) => {
     videoMode = cmd.videoMode ?? 'mse';
     activePluginConfig = cmd.plugins?.videoDecoder ?? null;
-    handleInit(new FileLoader(cmd.file), cmd.debug).catch(e => postError(String(e), true));
+    handleInit(new FileLoader(cmd.file), cmd.debug, cmd.live, cmd.startEditUnit, cmd.liveFromStart).catch(e => postError(String(e), true));
   },
   fetchSegment: (cmd) => {
+    // Live mode streams forward via the persistent LiveSequentialReader (no index / seek). Fetches
+    // are serial (the player waits for segmentDone), so the reader's cursor is never raced.
+    if (liveMode) {
+      handleLiveFetch(cmd.frameCount, cmd.seqBase).catch(e => postError(String(e)));
+      return;
+    }
     fetchQ.enqueue({
       startFrame: cmd.startFrame,
       frameCount: cmd.frameCount,
@@ -981,6 +1216,9 @@ const commandHandlers: CommandHandlers = {
   // Scrub started: drop in-flight/queued forward prefetch so the worker is free for previews. The
   // in-flight transcode checks the generation after each frame and bails; queued jobs are cleared.
   cancelPrefetch: () => { fetchQ.supersede(); },
+  pollLive: () => { handlePollLive().catch(e => postError(String(e))); },
+  setStartEditUnit: (cmd) => { liveStartEditUnit = cmd.startEditUnit; },
+  flushLiveTail: (cmd) => { handleFlushLiveTail(cmd.seqBase).catch(e => postError(String(e))); },
 };
 
 self.addEventListener('message', (event: MessageEvent<WorkerCommand>) => {

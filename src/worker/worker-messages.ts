@@ -43,8 +43,19 @@ export interface WorkerPluginConfig {
 
 // Commands sent from main thread to worker
 export type WorkerCommand =
-  | { type: 'initUrl';  url: string;  debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig } }
-  | { type: 'initFile'; file: File; debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig } }
+  | { type: 'initUrl';  url: string;  debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig };
+      /** Live mode: open as a growing recording — ignore the index, start at the file's end, stream
+       *  forward. See MxfFile.openLive. */
+      live?: boolean;
+      /** Live mode: the continuous edit-unit counter to label this file's first emitted frame with,
+       *  so a rotated next file's timestamps continue the previous file's timeline (seamless stitch). */
+      startEditUnit?: number;
+      /** Live mode: start reading from the essence container START rather than near EOF. False (the
+       *  default) for the FIRST file (jump to its live edge); true for a rotated NEXT file, which just
+       *  began recording so its beginning IS the live point and is contiguous with the previous file. */
+      liveFromStart?: boolean }
+  | { type: 'initFile'; file: File; debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig };
+      live?: boolean; startEditUnit?: number; liveFromStart?: boolean }
   | {
       type: 'fetchSegment';
       startFrame: number;
@@ -72,6 +83,28 @@ export type WorkerCommand =
       type: 'scrubPreview';
       targetFrame: number;
       seq: number;
+    }
+  | {
+      /** Live mode: re-query the source size (refreshFileSize) and report whether it grew and whether
+       *  the live reader has caught up to EOF. Drives the player's follow-the-edge poll loop. */
+      type: 'pollLive';
+    }
+  | {
+      /** Live mode: set the continuous edit-unit counter for the NEXT emitted frame, used at standby
+       *  activation to lock a rotated file's timeline base to where the previous file ended. */
+      type: 'setStartEditUnit';
+      startEditUnit: number;
+    }
+  | {
+      /** Live mode: drain the transcode decoder's held reorder frames at the file boundary. Mid-stream
+       *  the pipeline holds its last reorder anchor (so video output trails the bytes the reader has
+       *  consumed), which makes the video OUTPUT frontier lag the AUDIO frontier (audio isn't held). At
+       *  a rotation those held frames would otherwise be lost and the next file's base (the video
+       *  frontier) would sit BEHIND the audio already emitted → an A/V seam. flushLiveTail emits the
+       *  held frames so the video frontier catches up to the audio frontier; the player then activates
+       *  the standby from that aligned base. `seqBase` numbers the flushed video segment. */
+      type: 'flushLiveTail';
+      seqBase: number;
     };
 
 // Events sent from worker to main thread
@@ -106,6 +139,8 @@ export type WorkerEvent =
        *  for AES3 / separate-mono layouts). 0 if no audio. Lets the UI build a channel selector
        *  at load time rather than waiting for audio to start. */
       audioChannelCount: number;
+      /** Live mode: this file was opened as a growing recording (index ignored, follow-the-edge). */
+      live?: boolean;
     }
   | { type: 'initSegment'; data: ArrayBuffer }
   | { type: 'videoInit'; codec: string; description: ArrayBuffer; width: number; height: number }
@@ -148,4 +183,28 @@ export type WorkerEvent =
       gopFrameCount: number;
     }
   | { type: 'codecUnsupported'; codec: string; reason: string }
+  | {
+      /** Live mode: posted after every live fetch AND in answer to pollLive (replacing segmentDone for
+       *  live). `grew` = new frames were produced / the source got larger; `atEdge` = the reader has
+       *  caught up to the current EOF (no more complete frames right now); `nextEditUnit` = the
+       *  continuous edit-unit counter the reader will next emit — the player adopts it as the
+       *  authoritative forward-fetch frontier so it never over- or under-counts at the edge. */
+      type: 'liveUpdate';
+      grew: boolean;
+      atEdge: boolean;
+      /** The continuous OUTPUT frontier — the edit unit AFTER the last video frame actually emitted to
+       *  MSE (display order, so it trails the bytes the reader has consumed by the transcode reorder
+       *  depth). The player adopts it as the forward-fetch frontier and, at a file switch, as the next
+       *  file's continuous base — so the seam is gap-free (the few un-emitted reorder frames at the end
+       *  of the old file are dropped, which is imperceptible at a rotation boundary). */
+      nextEditUnit: number;
+    }
+  | {
+      /** Live mode: reply to flushLiveTail. The held reorder frames have been emitted (as a videoSegment
+       *  posted just before this), and `nextEditUnit` is the now-aligned OUTPUT frontier (== the audio
+       *  frontier). The player adopts it as `nextFetchFrame` and then activates the standby from it, so
+       *  the next file's audio AND video both continue from the same edit unit (no A/V seam). */
+      type: 'liveTailFlushed';
+      nextEditUnit: number;
+    }
   | { type: 'error'; message: string; fatal: boolean };

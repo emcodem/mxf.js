@@ -67,6 +67,22 @@ export class HttpLoader implements ILoader {
     throw new Error(`Server did not report a size for ${this.url} (no Content-Range or Content-Length)`);
   }
 
+  /**
+   * Live mode: re-read the current Content-Length via HEAD so the live reader sees bytes appended to
+   * a still-growing recording. No range probe here — by the time live polling runs, open() has
+   * already verified the server honours ranges. Throws if HEAD gives no Content-Length.
+   */
+  async refreshFileSize(): Promise<number> {
+    // `cache: 'no-store'` is essential: a growing recording's size changes constantly, but a cached
+    // HEAD response would report a stale Content-Length, so the live reader would never see new bytes
+    // and playback would stall after the initial buffer drained.
+    const head = await fetch(this.url, { method: 'HEAD', cache: 'no-store' });
+    if (!head.ok) throw new Error(`refreshFileSize: HEAD ${this.url} failed: ${head.status} ${head.statusText}`);
+    const len = head.headers.get('content-length');
+    if (!len) throw new Error(`refreshFileSize: HEAD ${this.url} returned no Content-Length`);
+    return parseInt(len, 10);
+  }
+
   async fetchRange(start: number, end: number, reason = '', signal?: AbortSignal): Promise<ArrayBuffer> {
     // Each read owns a controller (so destroy() can abort it); the caller's signal, when given, is
     // linked to it so a seek/scrub supersession cancels the underlying fetch instead of letting it

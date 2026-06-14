@@ -78,6 +78,11 @@ export class WebAudioController {
   private active: number[] = [0, 1];
   private editRateNumerator = 25;
   private editRateDenominator = 1;
+  // Playback rate the audio is allowed to follow. 1 normally. Raised (e.g. 1.1) by the player's
+  // live catch-up so the scheduler keeps audio audible — pitched up — while the picture runs fast to
+  // close the gap to the live edge. Any OTHER non-1 rate (J/L scrub) still mutes (see tick gate),
+  // because only the rate we were told to honour matches video.playbackRate here.
+  private catchupRate = 1;
 
   // ── Diagnostics (opt-in via `diag`; zero cost when off) ──────────────────────────────────────
   // The scheduler decides everything silently, so an audible glitch normally leaves no trace. When
@@ -89,6 +94,11 @@ export class WebAudioController {
   private diagHead = 0;                            // next write slot
   private diagSeq = 0;                             // monotonic order key
   private diagWarnAt: Record<string, number> = {}; // last warn time per type (rate-limit bursts)
+  // DIAG (remove after debug): cumulative count per anomaly type. Console warns are rate-limited per
+  // type (0.2 s), which UNDERCOUNTS bursts of "many small glitches" — these totals are not, so a
+  // sampler can read true frequency. diagSnapshot() also returns the live A/V offset (audio-vs-picture).
+  private diagCounts: Record<string, number> = {};
+  private _diagMaxSchedGap = 0; // DIAG: worst (signed) audio tiling gap since the last diagSnapshot() read
   private schedCtxEnd = -1;                        // ctx-time end of the last started source (gap probe)
   private arriveDur = -1;                          // previous chunk's duration (sudden-change probe)
   private arriveCh = 0;                            // previous chunk's channel count (param-change probe)
@@ -106,6 +116,20 @@ export class WebAudioController {
   setEditRate(numerator: number, denominator: number): void {
     this.editRateNumerator = numerator;
     this.editRateDenominator = denominator;
+  }
+
+  /**
+   * Set the playback rate the scheduler should follow (1 = normal). The player calls this in lock-step
+   * with setting video.playbackRate during live catch-up, so the tick gate's
+   * `playbackRate ≈ catchupRate` test passes and audio keeps sounding (pitched up by `rate`) instead
+   * of muting as it does for J/L scrub. A change re-locks: the media→context slope changes, so the
+   * already-scheduled lookahead is stopped and the next tick re-anchors at the current playhead.
+   */
+  setCatchupRate(rate: number): void {
+    const r = rate > 0 ? rate : 1;
+    if (Math.abs(r - this.catchupRate) <= 1e-6) return;
+    this.catchupRate = r;
+    if (this.anchored) this.unlock('rate-change');
   }
 
   /** Create the AudioContext (PCM that MSE can't play is routed here). Pinned to the source rate. */
@@ -196,7 +220,7 @@ export class WebAudioController {
     this.stopSources();
     this.runId++;
     const v = this.video;
-    if (this.anchored && this.cxt && !v.paused && !v.seeking && Math.abs(v.playbackRate - 1) <= 0.01)
+    if (this.anchored && this.cxt && !v.paused && !v.seeking && Math.abs(v.playbackRate - this.catchupRate) <= 0.01)
       this.pump(v.currentTime);
   }
 
@@ -344,14 +368,16 @@ export class WebAudioController {
     if (!cxt) return;
     const v = this.video;
     const cur = v.currentTime;
+    const R = this.catchupRate; // 1 normally; >1 while the player is catching up to the live edge
     this.evict(cur);
 
-    // Emit only while the picture is genuinely advancing at 1×, derived purely from the element's own
-    // state — so audio follows playback no matter what started it (play(), the 'play' event, autoplay,
-    // native controls). This single gate also makes audio follow the cold-start buffer gate (paused),
-    // seeks/scrubs (seeking/paused) and stalls (paused) for free, and mutes during J/L fast-forward/
-    // rewind (rate≠1) instead of thrashing on resync.
-    if (v.paused || v.seeking || Math.abs(v.playbackRate - 1) > 0.01) {
+    // Emit only while the picture is genuinely advancing at the rate we follow (1×, or the catch-up
+    // rate the player set), derived purely from the element's own state — so audio follows playback no
+    // matter what started it (play(), the 'play' event, autoplay, native controls). This single gate
+    // also makes audio follow the cold-start buffer gate (paused), seeks/scrubs (seeking/paused) and
+    // stalls (paused) for free, and mutes during J/L fast-forward/rewind (rate≠catchupRate) instead of
+    // thrashing on resync.
+    if (v.paused || v.seeking || Math.abs(v.playbackRate - R) > 0.01) {
       if (this.anchored) this.unlock('gate');
       this.lastWall = -1; // re-probe progress when playback resumes
       return;
@@ -364,7 +390,9 @@ export class WebAudioController {
     if (this.lastWall >= 0) {
       const wallDelta = wall - this.lastWall;
       const mediaDelta = cur - this.lastMedia;
-      if (wallDelta > 0.005 && mediaDelta < 0.25 * wallDelta) {
+      // Media advances ~R× wall while playing at rate R; the playhead is frozen (rebuffering) when it
+      // advances far less than that.
+      if (wallDelta > 0.005 && mediaDelta < 0.25 * R * wallDelta) {
         this.rec('stall', true, cur, { wallDelta: +wallDelta.toFixed(3), mediaDelta: +mediaDelta.toFixed(3) });
         if (this.anchored) this.unlock('stall');
         this.lastWall = wall; this.lastMedia = cur;
@@ -377,9 +405,9 @@ export class WebAudioController {
       this.lockTo(cur);
     } else {
       // Resync only on a real divergence (e.g. audio vs video hardware-clock drift). The audio sample
-      // sounding now is at media time (cxt.currentTime - anchorCtx) + anchorMedia; compare to the
+      // sounding now is at media time (cxt.currentTime - anchorCtx)·R + anchorMedia; compare to the
       // picture. Steady play stays well under MAX_DRIFT, so we never re-cut already-scheduled audio.
-      const audioMediaNow = (wall - this.anchorCtx) + this.anchorMedia;
+      const audioMediaNow = (wall - this.anchorCtx) * R + this.anchorMedia;
       if (Math.abs(audioMediaNow - cur) > MAX_DRIFT) this.lockTo(cur);
     }
     if (this.diag) {
@@ -405,6 +433,7 @@ export class WebAudioController {
   /** Schedule every not-yet-handled chunk whose window reaches into [cur, cur+LOOKAHEAD). */
   private pump(cur: number): void {
     const cxt = this.cxt!;
+    const R = this.catchupRate;             // context time runs 1/R per media second while sped up
     const horizon = cur + LOOKAHEAD;
     const now = cxt.currentTime;
     for (const c of this.store) {
@@ -419,27 +448,32 @@ export class WebAudioController {
         continue;
       }
 
-      const ctxStart = this.anchorCtx + (c.mediaStart - this.anchorMedia);
-      const into = now - ctxStart;            // seconds already elapsed into this chunk
-      if (into >= c.duration - 0.002) {        // missed its window (underrun) — drop
-        if (this.diag && !c.scheduledOnce && into - c.duration < 0.5)
-          this.rec('drop', true, c.mediaStart, { reason: 'missed', into: +into.toFixed(4), dur: +c.duration.toFixed(4) });
+      // media m sounds at context time anchorCtx + (m - anchorMedia)/R; the chunk occupies
+      // c.duration/R seconds of context time (played back at rate R).
+      const ctxDuration = c.duration / R;
+      const ctxStart = this.anchorCtx + (c.mediaStart - this.anchorMedia) / R;
+      const into = now - ctxStart;            // context seconds already elapsed into this chunk
+      if (into >= ctxDuration - 0.002) {       // missed its window (underrun) — drop
+        if (this.diag && !c.scheduledOnce && into - ctxDuration < 0.5)
+          this.rec('drop', true, c.mediaStart, { reason: 'missed', into: +into.toFixed(4), dur: +ctxDuration.toFixed(4) });
         continue;
       }
       const source = this.makeSource(c);
       if (!source) continue;
+      source.playbackRate.value = R;          // pitch/tempo up to match the sped-up picture
       if (into <= 0) source.start(ctxStart);  // future chunk: start at its exact time (gapless tile)
-      else source.start(now, into);           // straddles the playhead: start now, offset in
+      else source.start(now, into * R);       // straddles the playhead: start now, offset (source time) in
       c.source = source;
       c.scheduledOnce = true;
       source.onended = () => { c.source = null; };
       if (this.diag) {
         // Consecutive sources should tile sample-exactly. A non-zero gap vs the previous source's
         // context-time end is an audible click (positive = silence, negative = overlap).
-        const ctxEnd = into <= 0 ? ctxStart + c.duration : now + (c.duration - into);
+        const ctxEnd = into <= 0 ? ctxStart + ctxDuration : now + (ctxDuration - into);
         const gap = this.schedCtxEnd >= 0 ? ctxStart - this.schedCtxEnd : 0;
         this.rec('sched', this.schedCtxEnd >= 0 && Math.abs(gap) > 0.001, c.mediaStart,
           { mode: into <= 0 ? 'future' : 'straddle', gap: +gap.toFixed(5), ctxStart: +ctxStart.toFixed(4), ctxEnd: +ctxEnd.toFixed(4) });
+        if (Math.abs(gap) > Math.abs(this._diagMaxSchedGap)) this._diagMaxSchedGap = gap; // DIAG: worst tiling gap since last snapshot
         this.schedCtxEnd = ctxEnd;
       }
     }
@@ -506,6 +540,9 @@ export class WebAudioController {
    *  rate-limited per type so one stutter can't produce a wall of logs. */
   private rec(type: string, anomaly: boolean, media: number, detail: Record<string, unknown>): void {
     if (!this.diag) return;
+    // DIAG: count ONLY anomalies (warns are rate-limited, so the count is the true glitch frequency).
+    // Non-anomaly recs (arrive/sched-with-tiny-gap/initial relock) are NOT glitches — don't count them.
+    if (anomaly) this.diagCounts[type] = (this.diagCounts[type] ?? 0) + 1;
     const t = this.cxt ? this.cxt.currentTime : 0;
     this.diagBuf[this.diagHead] = { seq: this.diagSeq++, t, media, type, anomaly, detail };
     this.diagHead = (this.diagHead + 1) % WebAudioController.DIAG_CAP;
@@ -525,6 +562,36 @@ export class WebAudioController {
    * (where the glitch was). Includes a state snapshot and a boundary-sample probe: a large jump at a
    * tile join with no scheduling anomaly means the click is in the decoded data/mix, not the scheduler.
    */
+  /**
+   * DIAG (remove after debug): a sampler-friendly snapshot of the live audio↔picture relationship.
+   * `avOffset` = the media time the audio is SOUNDING now minus video.currentTime (the perceived
+   * async): ~0 = locked, |large| = audio ahead(+)/behind(−) the picture. Audio relocks at 80 ms, so a
+   * sustained large value should be impossible — if the user hears async while this stays ~0, the
+   * PICTURE is mislabeled (a worker/decoder issue), not the audio scheduler. `counts` are cumulative
+   * per-anomaly totals (NOT rate-limited like the console warns), so a sampler sees true glitch
+   * frequency. `coverAhead` = contiguous decoded audio ahead of the playhead (0 = about to underrun).
+   */
+  diagSnapshot(): {
+    avOffset: number; anchored: boolean; coverAhead: number; rate: number;
+    chunks: number; maxSchedGap: number; counts: Record<string, number>;
+  } {
+    const cur = this.video.currentTime;
+    const avOffset = (this.anchored && this.cxt)
+      ? (this.cxt.currentTime - this.anchorCtx) * this.catchupRate + this.anchorMedia - cur
+      : NaN;
+    const maxSchedGap = this._diagMaxSchedGap;
+    this._diagMaxSchedGap = 0; // reset per read → caller sees the worst gap in each sample window
+    return {
+      avOffset: Number.isFinite(avOffset) ? +avOffset.toFixed(4) : NaN,
+      anchored: this.anchored,
+      coverAhead: +this.bufferedAhead(cur).toFixed(3),
+      rate: this.catchupRate,
+      chunks: this.store.length,
+      maxSchedGap: +maxSchedGap.toFixed(5),
+      counts: { ...this.diagCounts },
+    };
+  }
+
   dumpDiag(label = ''): void {
     /* eslint-disable no-console */
     if (!this.diag) { console.warn('[audio-diag] diagnostics are off (construct WebAudioController with diag=true)'); return; }
@@ -586,6 +653,7 @@ export class WebAudioController {
     this.cxt = null;
     this.gainNode = null; // recreated with the next context (this.volume carries the level over)
     this.anchored = false;
+    this.catchupRate = 1; // next file starts at normal speed; the player re-engages catch-up if needed
     this.channelCount = 0; // re-announced on the next file's first chunk
     // Reset diagnostics for the next file.
     this.diagBuf = []; this.diagHead = 0; this.diagSeq = 0; this.diagWarnAt = {};

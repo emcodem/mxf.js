@@ -568,6 +568,8 @@ const START = { SEQUENCE: 0xB3, SLICE_FIRST: 0x01, SLICE_LAST: 0xAF, PICTURE: 0x
 // ---------------------------------------------------------------------------
 
 export class Mpeg2Decoder implements Mpeg2DecoderImpl {
+  static _diagDrop = 0;    // DIAG (remove after debug): undecodable-header picture count
+  static _diagCorrupt = 0; // DIAG (remove after debug): incomplete-coverage (macroblock) picture count
   private bits: BitBuffer;
   private onFrame: (frame: YUVFrame) => void;
 
@@ -651,6 +653,10 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
 
   // macroblock state
   private macroblockAddress = 0;
+  // DIAG (remove after debug): highest macroblockAddress reached in the current picture. A clean
+  // picture covers every MB (ends at mbSize-1); a truncated/desynced one stops short, leaving stale
+  // or grey regions = the visible "macroblocks". Reset per picture, checked after the slice loop.
+  private _diagMbMax = -1;
   private mbRow = 0;
   private mbCol = 0;
   private macroblockType = 0;
@@ -907,7 +913,18 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
     this.pictureType = this.bits.read(3);
     this.bits.skip(16); // vbv_delay
 
-    if (this.pictureType <= 0 || this.pictureType > PICTURE_TYPE.B) return;
+    if (this.pictureType <= 0 || this.pictureType > PICTURE_TYPE.B) {
+      // Corrupt picture header (garbage pictureType): the slice data is undecodable — drop it (baseline
+      // behaviour). DIAG (remove after debug): count + log at a bounded rate so heavy corruption can't
+      // spam the worker console.
+      const n = ++Mpeg2Decoder._diagDrop;
+      if (n <= 3 || n % 50 === 0) {
+        // eslint-disable-next-line no-console
+        console.warn(`[mxfdiag] dec drop #${n} type=${this.pictureType} tr=${this.curTempRef}`);
+      }
+      return;
+    }
+    this._diagMbMax = -1; // DIAG: start MB-coverage tracking for this picture
 
     if (!this.isMPEG2) {
       // MPEG-1
@@ -946,6 +963,18 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
         code = this.bits.findNextStartCode();
       }
       if (code !== -1) this.bits.rewind(32);
+    }
+
+    // DIAG (remove after debug): a picture whose decoded MBs don't reach the last MB is truncated or
+    // slice-desynced — the uncovered region renders as stale/grey = the visible "macroblocks". This is
+    // the ONLY place corruption is observable: the transcoder re-encodes it to VALID H.264, so every
+    // downstream probe (corruptedVideoFrames etc.) reads clean.
+    if (this._diagMbMax >= 0 && this._diagMbMax + 1 < this.mbSize) {
+      const n = ++Mpeg2Decoder._diagCorrupt;
+      if (n <= 3 || n % 50 === 0) {
+        // eslint-disable-next-line no-console
+        console.warn(`[mxfdiag] dec corrupt #${n} cover=${this._diagMbMax + 1}/${this.mbSize} (${Math.round((this._diagMbMax + 1) / this.mbSize * 100)}%) type=${this.pictureType} tr=${this.curTempRef}`);
+      }
     }
 
     // Display reordering: I/P frames hold back previous anchor; B frames emit immediately
@@ -1133,6 +1162,7 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
     }
     this.mbRow = (this.macroblockAddress / this.mbWidth) | 0;
     this.mbCol = this.macroblockAddress % this.mbWidth;
+    if (this.macroblockAddress > this._diagMbMax) this._diagMbMax = this.macroblockAddress; // DIAG
 
     const mbTable = MACROBLOCK_TYPE[this.pictureType]!;
     this.macroblockType = this.readHuffman(mbTable);
