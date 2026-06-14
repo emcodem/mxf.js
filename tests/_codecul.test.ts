@@ -1,5 +1,5 @@
 import { describe, it } from 'vitest';
-import { statSync, openSync, readSync } from 'node:fs';
+import { statSync, openSync, readSync, existsSync } from 'node:fs';
 import { MxfFile } from '../src/mxf-file.js';
 
 function loader(p: string): any {
@@ -19,7 +19,9 @@ function loader(p: string): any {
 
 describe('codec UL probe', () => {
   it('prints picture essence coding UL', async () => {
-    const bs = await new MxfFile(loader('C:/temp/mxf.js/xavc_l_1080p50.mxf')).open();
+    const FILE = process.env.TEST_MXF_FILE ?? 'C:/temp/mxf.js/xavc_l_1080p50.mxf';
+    if (!existsSync(FILE)) { console.log(`skip: ${FILE} not found`); return; }
+    const bs = await new MxfFile(loader(FILE)).open();
     const pd = bs.metadata.pictureDescriptor as any;
     const ul: Uint8Array | null = pd?.pictureEssenceCodingUL ?? null;
     console.log('codec =', pd?.codec);

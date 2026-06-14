@@ -727,7 +727,9 @@ class _ extends R {
     const e = this.video;
     if (typeof e.requestVideoFrameCallback != "function") return;
     const i = (t, s) => {
-      this.destroyed || (this.updateTimecode(s.mediaTime), this.rvfcHandle = e.requestVideoFrameCallback(i));
+      if (this.destroyed) return;
+      const r = s.mediaTime || this.video.currentTime;
+      this.updateTimecode(r), this.rvfcHandle = e.requestVideoFrameCallback(i);
     };
     this.rvfcHandle = e.requestVideoFrameCallback(i);
   }

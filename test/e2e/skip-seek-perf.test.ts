@@ -22,6 +22,7 @@
  * the slow case worth measuring. Override with TEST_SKIP_FILE. Skips gracefully if absent.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'vitest';
+import { getChromePath } from './chrome-path.js';
 import puppeteer, { type Browser, type Page } from 'puppeteer';
 import { createServer, type ViteDevServer } from 'vite';
 import { fileURLToPath } from 'url';
@@ -52,7 +53,7 @@ beforeAll(async () => {
 
   browser = await puppeteer.launch({
     headless: false,
-    executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    executablePath: getChromePath(),
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=WebCodecs'],
   });
 }, 60_000);

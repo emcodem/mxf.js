@@ -73,6 +73,9 @@ export class Mpeg2Pipeline {
   readonly displayHeight: number;
   /** Chroma format the stream opened with (1 = 4:2:0, 2 = 4:2:2). */
   readonly chromaFormat: number;
+  /** Source coded dims — used for mid-stream format-change detection (encoder dims may differ). */
+  private readonly _srcCodW: number;
+  private readonly _srcCodH: number;
 
   private constructor(
     private readonly decoder: Mpeg2Decoder,
@@ -87,10 +90,13 @@ export class Mpeg2Pipeline {
     this.pps = pps;
     this.frameDurUs = frameDurUs;
     this.editUnitCounter = BigInt(startFrame);
-    this.codedWidth = probe.codedWidth;
-    this.codedHeight = probe.codedHeight;
-    this.displayWidth = probe.width;
-    this.displayHeight = probe.height;
+    this._srcCodW = probe.codedWidth;
+    this._srcCodH = probe.codedHeight;
+    // Encoder dims (may be half-res when scaleFactor=0.5 was used for Safari workaround).
+    this.codedWidth    = transcoder.encoderCodW;
+    this.codedHeight   = transcoder.encoderCodH;
+    this.displayWidth  = transcoder.encoderDisplayW;
+    this.displayHeight = transcoder.encoderDisplayH;
     this.chromaFormat = probe.chromaFormat;
   }
 
@@ -128,7 +134,7 @@ export class Mpeg2Pipeline {
     const fps = editRateNumerator / editRateDenominator;
     const frameDurUs = Math.round(editRateDenominator * 1_000_000 / editRateNumerator);
 
-    const transcoder = new Mpeg2Transcoder(
+    let transcoder = new Mpeg2Transcoder(
       probe.codedWidth, probe.codedHeight,
       probe.width, probe.height,
       fps,
@@ -137,6 +143,17 @@ export class Mpeg2Pipeline {
     // Encode the first frame to force the encoder to emit SPS/PPS, then discard the chunk.
     transcoder.encodeFrame(probe, 0, true);
     await transcoder.flush();
+
+    if (!transcoder.spspps) {
+      // Safari 16.x VideoEncoder silently drops frames at ≥1920px wide — flush() resolves but zero
+      // chunks are produced. Retry at ½ scale; all subsequent frames will be downscaled before encode.
+      transcoder.close();
+      console.warn(`[mxf.js] VideoEncoder silent failure at ${probe.codedWidth}×${probe.codedHeight} — retrying at ½ scale (Safari 16.x workaround)`);
+      transcoder = new Mpeg2Transcoder(probe.codedWidth, probe.codedHeight, probe.width, probe.height, fps, 0.5);
+      transcoder.encodeFrame(probe, 0, true);
+      await transcoder.flush();
+    }
+
     const spspps = transcoder.spspps;
     if (!spspps) {
       transcoder.close();
@@ -150,12 +167,12 @@ export class Mpeg2Pipeline {
       // (the probe). A later frame that differs (multi-programme MXF, mid-stream resolution/chroma
       // change) would silently produce a wrong-sized VideoFrame or mis-downsampled chroma — surface
       // it as an error instead. (The decoder independently rejects an unsupported chroma_format.)
-      if (decoded.codedWidth !== pipeline.codedWidth ||
-          decoded.codedHeight !== pipeline.codedHeight ||
+      if (decoded.codedWidth !== pipeline._srcCodW ||
+          decoded.codedHeight !== pipeline._srcCodH ||
           decoded.chromaFormat !== pipeline.chromaFormat) {
         throw new Error(
           `Mid-stream format change not supported: a later frame is ${decoded.codedWidth}×${decoded.codedHeight} ` +
-          `chroma=${decoded.chromaFormat}, but the stream opened as ${pipeline.codedWidth}×${pipeline.codedHeight} ` +
+          `chroma=${decoded.chromaFormat}, but the stream opened as ${pipeline._srcCodW}×${pipeline._srcCodH} ` +
           `chroma=${pipeline.chromaFormat}`,
         );
       }

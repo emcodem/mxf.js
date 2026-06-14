@@ -97,13 +97,27 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
     const fps = editRateNumerator / editRateDenominator;
     const frameDurUs = Math.round(editRateDenominator * 1_000_000 / editRateNumerator);
 
-    const transcoder = new Mpeg2Transcoder(cw, ch, dw, dh, fps);
+    let transcoder = new Mpeg2Transcoder(cw, ch, dw, dh, fps);
     transcoder.encodeRgbaFrame(first.data, srcW, srcH, 0, true);
     await transcoder.flush();
+
+    if (!transcoder.spspps) {
+      // Safari 16.x VideoEncoder silently drops frames at ≥1920px wide. Retry at ½ scale.
+      transcoder.close();
+      console.warn(`[mxf.js] VideoEncoder silent failure at ${cw}×${ch} — retrying at ½ scale (Safari 16.x workaround)`);
+      transcoder = new Mpeg2Transcoder(cw, ch, dw, dh, fps, 0.5);
+      transcoder.encodeRgbaFrame(first.data, srcW, srcH, 0, true);
+      await transcoder.flush();
+    }
+
     const spspps = transcoder.spspps;
     if (!spspps) { transcoder.close(); throw new Error(`VideoEncoder did not produce SPS/PPS (coded=${cw}×${ch})`); }
 
-    return new WasmTranscodePipeline(decoder, transcoder, spspps.sps, spspps.pps, frameDurUs, cw, ch, dw, dh);
+    return new WasmTranscodePipeline(
+      decoder, transcoder, spspps.sps, spspps.pps, frameDurUs,
+      transcoder.encoderCodW, transcoder.encoderCodH,
+      transcoder.encoderDisplayW, transcoder.encoderDisplayH,
+    );
   }
 
   get codecString(): string {

@@ -4,6 +4,7 @@
  * playhead stalls despite a healthy buffer). Logs which decode path is active.
  */
 import { describe, test, beforeAll, afterAll } from 'vitest';
+import { getChromePath } from './chrome-path.js';
 import puppeteer, { type Browser } from 'puppeteer';
 import { createServer, type ViteDevServer } from 'vite';
 import { fileURLToPath } from 'url';
@@ -23,7 +24,7 @@ beforeAll(async () => {
   await vite.listen();
   browser = await puppeteer.launch({
     headless: false,
-    executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    executablePath: getChromePath(),
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=WebCodecs', '--autoplay-policy=no-user-gesture-required'],
   });
 }, 30_000);

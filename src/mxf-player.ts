@@ -221,7 +221,12 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     if (typeof v.requestVideoFrameCallback !== 'function') return; // timeupdate drives it instead
     const cb = (_now: number, meta: { mediaTime: number }): void => {
       if (this.destroyed) return;
-      this.updateTimecode(meta.mediaTime);
+      // Safari (MSE) reports meta.mediaTime === 0 for every frame during playback, which would snap
+      // the timecode back to edit unit 0 on every callback. Fall back to currentTime when mediaTime
+      // is 0; Chrome reports the true per-frame mediaTime (more precise than currentTime), so prefer
+      // it there. mediaTime is legitimately 0 only on the very first frame, where currentTime ≈ 0 too.
+      const mediaTime = meta.mediaTime || this.video.currentTime;
+      this.updateTimecode(mediaTime);
       this.rvfcHandle = v.requestVideoFrameCallback!(cb);
     };
     this.rvfcHandle = v.requestVideoFrameCallback(cb);
