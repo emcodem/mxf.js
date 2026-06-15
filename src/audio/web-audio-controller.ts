@@ -295,8 +295,26 @@ export class WebAudioController {
     for (let i = this.store.length - 1; i >= 0; i--) {
       const c = this.store[i];
       if (c.mediaEnd - chunk.mediaStart > eps && chunk.mediaEnd - c.mediaStart > eps) {
-        if (c.source) { try { c.source.onended = null; c.source.stop(); } catch { /* already stopped */ } }
-        this.store.splice(i, 1);
+        if (c.mediaStart < chunk.mediaStart - eps) {
+          // c has a non-overlapping head before the new chunk: trim c's tail to chunk.mediaStart,
+          // preserving coverage for the non-overlapping portion. This prevents the audio gap at
+          // gapless file rotation where the new worker's first batch overlaps the old worker's last
+          // batch by 1-2 EUs, which would otherwise evict the entire old chunk and drop 20+ EUs.
+          // If c.source is already running it plays its original buffer — the brief overlap is ~2 EU
+          // (~80 ms) of slightly doubled audio, far better than evicting 23 EU (~920 ms).
+          const keepSecs = chunk.mediaStart - c.mediaStart;
+          c.samples = c.samples.slice(0, Math.round(keepSecs * c.sampleRate) * c.channelCount);
+          c.mediaEnd = chunk.mediaStart;
+          c.duration = keepSecs;
+          if (this.diag) {
+            this.rec('seam-trim', false, c.mediaStart, { trimEnd: +chunk.mediaStart.toFixed(3) });
+            // eslint-disable-next-line no-console
+            console.log(`[audio-diag] seam-trim media=${c.mediaStart.toFixed(3)}s kept=${keepSecs.toFixed(3)}s trimEnd=${chunk.mediaStart.toFixed(3)}s`);
+          }
+        } else {
+          if (c.source) { try { c.source.onended = null; c.source.stop(); } catch { /* already stopped */ } }
+          this.store.splice(i, 1);
+        }
       }
     }
     let lo = 0, hi = this.store.length;
@@ -551,7 +569,7 @@ export class WebAudioController {
       if (t - last >= 0.2) {
         this.diagWarnAt[type] = t;
         // eslint-disable-next-line no-console
-        console.warn(`[audio-diag] ${type} media=${media.toFixed(3)}s t=${t.toFixed(3)}s`, detail);
+        console.warn(`[audio-diag] ${type} media=${media.toFixed(3)}s t=${t.toFixed(3)}s ${JSON.stringify(detail)}`);
       }
     }
   }
@@ -573,7 +591,7 @@ export class WebAudioController {
    */
   diagSnapshot(): {
     avOffset: number; anchored: boolean; coverAhead: number; rate: number;
-    chunks: number; maxSchedGap: number; counts: Record<string, number>;
+    chunks: number; maxSchedGap: number; outputLatency: number; counts: Record<string, number>;
   } {
     const cur = this.video.currentTime;
     const avOffset = (this.anchored && this.cxt)
@@ -588,6 +606,7 @@ export class WebAudioController {
       rate: this.catchupRate,
       chunks: this.store.length,
       maxSchedGap: +maxSchedGap.toFixed(5),
+      outputLatency: this.cxt ? +(this.cxt.outputLatency ?? 0).toFixed(4) : 0,
       counts: { ...this.diagCounts },
     };
   }

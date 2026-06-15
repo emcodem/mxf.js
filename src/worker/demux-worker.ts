@@ -1084,6 +1084,8 @@ async function handleLiveFetch(frameCount: number, seqBase: number): Promise<voi
           audioFrames.map(f => ({ editUnit: f.editUnit, data: f.data, aes3: f.aes3 })),
           { bitDepth: sd.bitDepth, blockAlign: sd.blockAlign, channelCount: sd.channelCount },
         );
+        // eslint-disable-next-line no-console
+        if (workerDebug) console.log(`[mxfdiag] pcm eu=${audioEditUnit}..${liveAudioFrontier - 1} samples=${float32.length}`);
         post({ type: 'pcmSamples', samples: float32, editUnit: audioEditUnit, sampleRate: sd.sampleRate, channelCount }, [float32.buffer]);
       } else {
         const seg = fragmenter.buildAudioSegment(audioFrames);
@@ -1156,7 +1158,8 @@ async function handleFlushLiveTail(seqBase: number): Promise<void> {
   // Audio store replaces the overlapped chunk (a sub-frame audio re-tile, not a stall).
   const v = liveOutputFrontier, a = liveAudioFrontier;
   const base = v > 0 && a > 0 ? Math.min(v, a) : (v > 0 ? v : a);
-  if (workerDebug) console.log(`[live] flushTail base=${base} (videoFrontier=${v} audioFrontier=${a})`);
+  // eslint-disable-next-line no-console
+  if (workerDebug) console.log(`[mxfdiag] flush base=${base} vFront=${v} aFront=${a} gap=${a > v ? 0 : v - a}eu`);
   post({ type: 'liveTailFlushed', nextEditUnit: base });
 }
 
