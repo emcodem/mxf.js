@@ -56,6 +56,39 @@ export interface MxfConfig {
    */
   resumeBufferSeconds?: number;
   debug?: boolean;
+  /**
+   * Open files via loadLive() as growing live recordings: the index is ignored, playback starts near
+   * the file's end and follows it forward, there is no seeking/scrubbing, and the player emits
+   * 'live-end' when a file completes so the consumer can switch to the next one. Default false.
+   */
+  live?: boolean;
+  /**
+   * Live catch-up strategy — how to close the gap when the playhead falls behind the live edge (a
+   * stall, a backgrounded tab, decode falling behind). Playback runs at 1× by default, so lag never
+   * shrinks on its own.
+   * - 'speed' (default): nudge playback to `catchupRate` (audio pitches up slightly) to drain
+   *   accumulated lag, restoring 1× at the edge; falls back to a hard jump for lag ≥ catchupJumpSeconds.
+   * - 'jump': no speed change — hard re-anchor to the live edge (via a 'catchup-jump' event the
+   *   consumer wires to reanchorLive) once lag ≥ catchupJumpSeconds.
+   * - 'off': never catch up.
+   */
+  liveCatchupStrategy?: 'speed' | 'jump' | 'off';
+  /** Playback rate used by the 'speed' strategy while catching up (default 1.1). Kept gentle: the
+   *  Web Audio path follows this rate, so it pitches up audibly — 1.05–1.15 is a sensible range. */
+  catchupRate?: number;
+  /** Engage the 'speed' catch-up when at least this many seconds behind the edge (default 5). Set
+   *  above the steady-state latency so normal play never triggers it — only a real stall / backgrounded
+   *  tab does. */
+  catchupStartSeconds?: number;
+  /** Disengage the 'speed' catch-up once within this many seconds of the edge (default 2). This is a
+   *  TARGET LATENCY, not zero: stopping here leaves a safety buffer so playback never presses the
+   *  bleeding edge (which, with a thin live buffer, causes single-frame edge-starvation rebuffers).
+   *  Catch-up restores this safe latency after a stall rather than chasing zero. */
+  catchupStopSeconds?: number;
+  /** Lag (seconds behind the edge) at/above which to hard-jump to the edge instead of speeding —
+   *  the 'jump' strategy's only trigger, and the 'speed' strategy's far-behind fallback (default 15).
+   *  Must exceed maxBufferSeconds to be reachable, since lag beyond it is reported by the consumer. */
+  catchupJumpSeconds?: number;
   /** Optional decoder plugin. When the MXF codec matches, this wasm decoder is used instead
    *  of the built-in JS decoder, enabling new codecs and Firefox-compatible paths. */
   plugins?: {
@@ -82,6 +115,12 @@ const DEFAULT_CONFIG: Required<MxfConfig> = {
   seekMode: 'accurate',
   resumeBufferSeconds: RESUME_BUFFER_SECONDS,
   debug: false,
+  live: false,
+  liveCatchupStrategy: 'speed',
+  catchupRate: 1.1,
+  catchupStartSeconds: 5,
+  catchupStopSeconds: 2,
+  catchupJumpSeconds: 15,
   plugins: {},
 };
 
@@ -148,6 +187,51 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   // we do NOT re-pause on every micro-underrun — that oscillates against itself; mid-playback stalls
   // are surfaced as the buffering indicator only and the element recovers natively.
   private startupGating = false;
+
+  // ── Live mode (growing recording, follow-the-edge + seamless file switch) ─────
+  // True between loadLive() and the file completing. In live mode there is no seeking/scrubbing and
+  // no EOF cap on fetching; the worker streams forward and reports the live edge via 'liveUpdate'.
+  private liveMode = false;
+  // True when the worker's live reader has caught up to the file's current end (no new frames). While
+  // set, forward fetching pauses and we poll the source size until it grows.
+  private liveAtEdge = false;
+  // Consecutive at-edge polls with no growth — used (with a ready standby) to declare the file done.
+  private liveStallPolls = 0;
+  private readonly LIVE_POLL_MS = 1000;
+  private readonly LIVE_STALL_MAX = 3;
+  private livePollTimer: ReturnType<typeof setTimeout> | null = null;
+  // Standby worker pre-bootstrapping the NEXT file so the switch is (near-)seamless. Captures its
+  // manifest + init segment during preload; activated when the current file completes.
+  private standbyWorker: Worker | null = null;
+  private standbyReady = false;
+  private standbyManifest: Extract<WorkerEvent, { type: 'manifest' }> | null = null;
+  // The standby worker's preload message listener (manifest/initSegment capture), kept so it can be
+  // removed before the full listener set is attached at activation (avoids double message handling).
+  private standbyListener: ((e: MessageEvent<WorkerEvent>) => void) | null = null;
+  // Captured standby init segment, so a clean re-anchor (reanchorLive) can re-append it to a fresh
+  // MSE without re-parsing the header (it's identical across same-encoder chunks).
+  private standbyInitSegment: ArrayBuffer | null = null;
+  // reanchorLive() target + a flag to swap as soon as the standby finishes pre-parsing.
+  private reanchorPending = false;
+  // True between beginGaplessSwitch() (flushLiveTail posted to the old worker) and activateStandby()
+  // running on the liveTailFlushed reply. Guards against re-entrancy and stray liveUpdates mid-switch.
+  private switching = false;
+  // The next file's URL captured by switchLive/preloadNextUrl, surfaced in the 'live-switched' event.
+  private pendingNextUrl: string | null = null;
+  // Guards a single 'live-end' emission per completed file (re-armed on switch / new load).
+  private liveEndEmitted = false;
+
+  // ── Live catch-up (close the gap to the live edge) ────────────────────────────
+  // True while the 'speed' strategy has playback nudged above 1× to drain lag.
+  private catchupActive = false;
+  // Latches one 'catchup-jump' emission while lag stays above the jump threshold; re-armed once lag
+  // drops back under it (e.g. after the consumer re-anchors to the edge) so it can fire again later.
+  private catchupJumpPending = false;
+  // Lag estimate (seconds behind the live edge) reported by the consumer (it owns the playlist, so it
+  // is the authority on large, file-scale lag — the jump trigger). 0 until reported. The fine-grained
+  // small-lag signal for the speed strategy is bufferedAhead() (≈ min(maxBuffer, true lag): when we're
+  // behind, the worker fills the buffer toward the cap; at the edge it drains to ~0).
+  private reportedLagSeconds = 0;
 
   // ── Timecode ────────────────────────────────────────────────────────────────
   // Computed package start timecodes (material/file/source), from the manifest. Per-frame System
@@ -374,9 +458,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.setBuffering(false);
   }
 
-  /** Seek to a time in seconds. The <video> 'seeking' event drives the worker fetch. */
+  /** Seek to a time in seconds. The <video> 'seeking' event drives the worker fetch. No-op in live
+   *  mode (the timeline is open-ended and playback only streams forward). */
   seek(timeSeconds: number): void {
-    if (!this.manifest) return;
+    if (!this.manifest || this.liveMode) return;
     const clamped = Math.max(0, Math.min(timeSeconds, this.manifest.duration));
     this.video.currentTime = clamped;
   }
@@ -462,11 +547,34 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.audio.dumpDiag(label);
   }
 
+  /** DIAG (remove after debug): live audio↔picture snapshot for an external sampler — the perceived
+   *  A/V offset (avOffset), audio coverage ahead, and cumulative anomaly counts. See
+   *  WebAudioController.diagSnapshot. */
+  audioDiag(): ReturnType<WebAudioController['diagSnapshot']> {
+    return this.audio.diagSnapshot();
+  }
+
   loadUrl(url: string): void {
     this.setup();
     const plugins = this.config.plugins?.videoDecoder
       ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
     const cmd: WorkerCommand = { type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins };
+    this.worker!.postMessage(cmd);
+  }
+
+  /**
+   * Open a still-growing recording as a live stream: start near the file's current end, follow it
+   * forward, and emit 'live-end' when it completes (call {@link switchLive}/{@link preloadNextUrl} to
+   * continue with the next file). No seeking/scrubbing while live. The index is ignored (frames are
+   * streamed straight forward), so this works for any codec/index. `startEditUnit` is 0 for the first
+   * file; rotated files inherit a continuous counter automatically on switch.
+   */
+  loadLive(url: string): void {
+    this.setup();
+    const plugins = this.config.plugins?.videoDecoder
+      ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
+    // First live file: jump to its edge (liveFromStart=false), number frames from 0.
+    const cmd: WorkerCommand = { type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins, live: true, startEditUnit: 0, liveFromStart: false };
     this.worker!.postMessage(cmd);
   }
 
@@ -478,26 +586,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.worker!.postMessage(cmd);
   }
 
-  private setup(): void {
-    this.destroyInternal();
-    this.worker = this.createWorker();
-    this.worker.addEventListener('message', (e: MessageEvent<WorkerEvent>) => this.onWorkerMessage(e.data));
-    this.worker.addEventListener('error', (e: ErrorEvent) => {
-      // A bare ErrorEvent with no message usually means the worker MODULE failed to load/evaluate
-      // (e.g. the dev server restarted — Vite restarts on vite.config.ts changes — and an already
-      // open tab's worker died; reload the page). Surface filename/line and the underlying error
-      // so it's diagnosable instead of an opaque "Worker error".
-      const detail = [e.message, e.filename && `${e.filename}:${e.lineno ?? '?'}:${e.colno ?? '?'}`,
-        (e.error as Error | undefined)?.stack].filter(Boolean).join(' — ');
-      console.error('[mxf.js] worker error:', e, e.error);
-      this.emit('error', {
-        message: detail || 'Worker failed to load — reload the page (the dev server may have restarted)',
-        fatal: true,
-      });
-    });
-    this.worker.addEventListener('messageerror', (e) => {
-      this.emit('error', { message: `Worker message error: ${String(e)}`, fatal: true });
-    });
+  /** Create + wire a fresh MseController. Shared by setup() and the clean live re-anchor
+   *  (reanchorToStandby), so both behave identically. */
+  private createMseController(): void {
     this.mseController = new MseController(this.video, !!this.config.debug);
     this.mseController.on('error', ({ track, message }) => {
       this.emit('error', { message: `MSE ${track}: ${message}`, fatal: false });
@@ -511,9 +602,38 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     });
   }
 
+  private setup(): void {
+    this.destroyInternal();
+    this.worker = this.createWorker();
+    this.attachWorkerListeners(this.worker);
+    this.createMseController();
+  }
+
   private createWorker(): Worker {
     const workerUrl = new URL('./demux-worker.js', import.meta.url);
     return new Worker(workerUrl, { type: 'module' });
+  }
+
+  /** Wire the message / error / messageerror handlers onto a worker. Shared by setup() and the
+   *  standby→active worker swap (activateStandby), so the new live worker behaves identically. */
+  private attachWorkerListeners(worker: Worker): void {
+    worker.addEventListener('message', (e: MessageEvent<WorkerEvent>) => this.onWorkerMessage(e.data));
+    worker.addEventListener('error', (e: ErrorEvent) => {
+      // A bare ErrorEvent with no message usually means the worker MODULE failed to load/evaluate
+      // (e.g. the dev server restarted — Vite restarts on vite.config.ts changes — and an already
+      // open tab's worker died; reload the page). Surface filename/line and the underlying error
+      // so it's diagnosable instead of an opaque "Worker error".
+      const detail = [e.message, e.filename && `${e.filename}:${e.lineno ?? '?'}:${e.colno ?? '?'}`,
+        (e.error as Error | undefined)?.stack].filter(Boolean).join(' — ');
+      console.error('[mxf.js] worker error:', e, e.error);
+      this.emit('error', {
+        message: detail || 'Worker failed to load — reload the page (the dev server may have restarted)',
+        fatal: true,
+      });
+    });
+    worker.addEventListener('messageerror', (e) => {
+      this.emit('error', { message: `Worker message error: ${String(e)}`, fatal: true });
+    });
   }
 
   private async onWorkerMessage(event: WorkerEvent): Promise<void> {
@@ -604,6 +724,21 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
         this.scrub.onPreviewDone(event.editUnit);
         break;
 
+      case 'liveUpdate':
+        this.onLiveUpdate(event);
+        break;
+
+      case 'liveTailFlushed':
+        // The old worker has drained its held reorder frames (the flushed tail videoSegment landed
+        // just before this) and reports the seam base = the EARLIER of its two track frontiers, so
+        // neither track gaps (the lagging one abuts, the leading one overlaps a few units — replaced,
+        // not gapped). Adopt it as the next file's continuous base and complete the swap.
+        if (this.switching) {
+          this.nextFetchFrame = event.nextEditUnit;
+          this.activateStandby();
+        }
+        break;
+
       case 'codecUnsupported':
         this.emit('codec-unsupported', { codec: event.codec, reason: event.reason });
         break;
@@ -617,6 +752,14 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private async onManifest(event: Extract<WorkerEvent, { type: 'manifest' }>): Promise<void> {
     const pd = event.pictureDescriptor;
     const sd = event.soundDescriptor;
+
+    // Live mode: there's no meaningful total duration (the file is still growing), so the timeline is
+    // open-ended — use Infinity for MSE/duration (the standard live convention). The forward frontier
+    // (nextFetchFrame) and the playhead operate in the worker's continuous edit-unit space.
+    this.liveMode = event.live ?? false;
+    this.liveAtEdge = false;
+    this.liveStallPolls = 0;
+    const effectiveDuration = this.liveMode ? Infinity : event.duration;
 
     this.editRateNumerator = event.editRateNumerator;
     this.editRateDenominator = event.editRateDenominator;
@@ -638,7 +781,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.currentTimecodeBundle = null;
 
     this.manifest = {
-      duration: event.duration,
+      duration: effectiveDuration,
       editRateNumerator: event.editRateNumerator,
       editRateDenominator: event.editRateDenominator,
       tracks: event.tracks,
@@ -650,6 +793,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       indexMode: event.indexMode,
       longGop: event.longGop,
       timecodes: event.timecodes ?? [],
+      live: this.liveMode,
     };
 
     // Use the resolved output codec for the MIME type (e.g. 'h264' for transcoded MPEG-2).
@@ -679,7 +823,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       return;
     }
 
-    this.mseController!.setDuration(event.duration);
+    this.mseController!.setDuration(effectiveDuration);
 
     // Flush init segment if it arrived before sourceopen (the other ordering is
     // handled in the initSegment case above — it appends directly and calls fetchNextChunk).
@@ -738,6 +882,18 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     const requestedAheadSeconds = this.nextFetchFrame / fps - currentTime;
     if (requestedAheadSeconds >= this.config.maxBufferSeconds) return;
 
+    // Live mode: no EOF cap — stream forward. If the worker is caught up to the live edge, don't spin;
+    // poll the source size and resume when it grows. nextFetchFrame is NOT advanced here — the worker
+    // reports the authoritative forward frontier (the continuous edit unit) back via 'liveUpdate'.
+    if (this.liveMode) {
+      if (this.liveAtEdge) { this.scheduleLivePoll(); return; }
+      const frameCount = explicitFrames ?? this.nextRampChunk();
+      this.fetchPending = true;
+      this.worker!.postMessage({ type: 'fetchSegment', startFrame: this.nextFetchFrame, frameCount, seqBase: this.seqBase } as WorkerCommand);
+      this.seqBase += 2;
+      return;
+    }
+
     const totalFrames = Math.round(
       this.manifest.duration * this.editRateNumerator / this.editRateDenominator
     );
@@ -774,6 +930,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
   private onVideoSeeking(): void {
     if (!this.manifest) return;
+    // Live mode has no seeking — the timeline is open-ended and the worker streams strictly forward.
+    // Ignore any 'seeking' (e.g. a user dragging native controls) so it can't desync the live reader.
+    if (this.liveMode) return;
     // Ignore 'seeking' events we caused ourselves (rendering a preview frame, or the endScrub
     // settle) — otherwise they'd be mistaken for a user drag/seek and re-trigger work.
     if (this.scrub.consumeSuppressedSeeking()) return;
@@ -897,6 +1056,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // Fallback timecode update (rVFC drives it per-frame where available; this covers paused/seek
     // settle and browsers without rVFC). Deduped by edit unit so it never double-emits with rVFC.
     this.updateTimecode(currentTime);
+    if (this.liveMode) this.evaluateCatchup(); // drain/disengage catch-up as the buffer changes
   }
 
   /** Buffered-ahead seconds of video at the current playhead (0 if unknown). */
@@ -1002,6 +1162,324 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     }
   }
 
+  // ── Live mode ────────────────────────────────────────────────────────────────
+
+  /**
+   * Worker forward-frontier / edge report (replaces segmentDone for live). Adopts the authoritative
+   * forward frontier (continuous edit unit), tracks the edge/stall state, switches to the next file
+   * when the current one completes, and keeps the forward buffer topped up.
+   */
+  private onLiveUpdate(event: Extract<WorkerEvent, { type: 'liveUpdate' }>): void {
+    if (!this.liveMode) return;
+    // Mid-switch: the old worker is being drained (flushLiveTail) and torn down; ignore its trailing
+    // liveUpdates so they can't re-trigger a switch or advance the frontier past the aligned base.
+    if (this.switching) { this.fetchPending = false; return; }
+    this.fetchPending = false;
+    this.nextFetchFrame = event.nextEditUnit; // authoritative frontier — never over/under-counts
+    this.liveAtEdge = event.atEdge;
+
+    if (event.atEdge) {
+      this.liveStallPolls = event.grew ? 0 : this.liveStallPolls + 1;
+      if (this.maybeCompleteLive()) return; // switched to next file — that path resumes fetching
+      this.scheduleLivePoll();
+    } else {
+      this.liveStallPolls = 0;
+    }
+
+    if (this.playIntent && this.video.paused) this.maybeResumePlayback();
+    this.fetchNextChunk(); // no-op when at edge or buffer full
+    this.evaluateCatchup();
+  }
+
+  /** Schedule one source-size poll (single timer). */
+  private scheduleLivePoll(): void {
+    if (this.livePollTimer !== null || !this.liveMode) return;
+    this.livePollTimer = setTimeout(() => {
+      this.livePollTimer = null;
+      this.worker?.postMessage({ type: 'pollLive' } as WorkerCommand);
+    }, this.LIVE_POLL_MS);
+  }
+
+  /**
+   * The current file has stopped growing (stalled at the edge). If the next file is already
+   * bootstrapped, hand off to it seamlessly; otherwise emit 'live-end' once so the consumer can load
+   * it (a brief gap until the standby is ready — see the v2 gapless mitigation in the plan).
+   * Returns true if it activated the standby (the caller should stop further work this tick).
+   */
+  private maybeCompleteLive(): boolean {
+    // A ready standby means the page already saw the NEXT contiguous file in the recorder's listing —
+    // positive proof THIS file rotated (closed). So once the reader has reached its edge even once
+    // (stallPolls >= 1, i.e. one no-growth poll confirming real EOF, not a transient mid-file catch-up)
+    // hand off immediately, instead of burning LIVE_STALL_MAX (~3 s) of buffer headroom waiting — that
+    // drain is exactly what left the playhead at the buffer end and caused the seam micro-rebuffer.
+    if (this.standbyReady && this.liveStallPolls >= 1) { this.beginGaplessSwitch(); return true; }
+    if (this.liveStallPolls < this.LIVE_STALL_MAX) return false;
+    if (!this.liveEndEmitted) { this.liveEndEmitted = true; this.emit('live-end', undefined as unknown as void); }
+    return false;
+  }
+
+  /**
+   * Live mode: report how far (seconds) the playhead is behind the true live edge. The consumer owns
+   * the playlist (e.g. /api/live-files), so it is the only authority on lag once it exceeds the local
+   * buffer cap — `bufferedAhead()` saturates at maxBufferSeconds. Used together with bufferedAhead to
+   * drive catch-up (see evaluateCatchup). No-op outside live mode.
+   */
+  setLiveLag(seconds: number): void {
+    if (!this.liveMode) return;
+    this.reportedLagSeconds = Math.max(0, seconds || 0);
+    this.evaluateCatchup();
+  }
+
+  /**
+   * Decide whether to catch up to the live edge, per liveCatchupStrategy. Called on the live cadence
+   * (each liveUpdate/poll and each timeupdate). Lag = max(consumer-reported, local bufferedAhead):
+   * the report covers large lag the local buffer can't see, bufferedAhead gives fine resolution for
+   * the small-lag (speed) regime. Idempotent — state flags make the warnings fire only on transitions.
+   */
+  private evaluateCatchup(): void {
+    const strategy = this.config.liveCatchupStrategy;
+    if (!this.liveMode || strategy === 'off') {
+      if (this.catchupActive) this.setCatchupSpeed(false, 0);
+      return;
+    }
+    // A switch / jump is mid-flight: leave it to settle (its reset re-arms us) rather than stacking
+    // another action on top.
+    if (this.switching || this.reanchorPending) return;
+
+    const buffered = this.bufferedAhead();
+    const lag = Math.max(this.reportedLagSeconds, buffered);
+    if (lag < this.config.catchupJumpSeconds) this.catchupJumpPending = false; // re-arm under the threshold
+
+    // Hard jump (far behind): the 'jump' strategy's sole action, and 'speed''s far-behind fallback.
+    // The player can't name files, so request the edge re-anchor via an event the consumer wires to
+    // reanchorLive(newestUrl). Latched so it fires once per excursion above the threshold.
+    if (lag >= this.config.catchupJumpSeconds) {
+      if (this.catchupActive) this.setCatchupSpeed(false, lag); // drop any speed-up before the hard cut
+      if (!this.catchupJumpPending) {
+        this.catchupJumpPending = true;
+        // eslint-disable-next-line no-console
+        console.warn(`[live-catchup] jump → live edge (${lag.toFixed(1)}s behind)`);
+        this.emit('catchup-jump', { lagSeconds: lag });
+      }
+      return;
+    }
+
+    if (strategy !== 'speed') return; // 'jump' strategy does nothing below the jump threshold
+
+    if (!this.catchupActive) {
+      if (lag >= this.config.catchupStartSeconds) this.setCatchupSpeed(true, lag);
+    } else if (lag <= this.config.catchupStopSeconds) {
+      this.setCatchupSpeed(false, lag); // drained back to the edge
+    }
+  }
+
+  /** Engage/disengage the 'speed' catch-up: set the video element's rate AND tell the audio scheduler
+   *  to follow it (so audio stays audible, pitched up, instead of muting as it does for J/L scrub). */
+  private setCatchupSpeed(active: boolean, lag: number): void {
+    if (this.catchupActive === active) return;
+    this.catchupActive = active;
+    const rate = active ? this.config.catchupRate : 1;
+    this.audio.setCatchupRate(rate);
+    this.video.playbackRate = rate;
+    if (active) {
+      // eslint-disable-next-line no-console
+      console.warn(`[live-catchup] speed-up ×${rate} (${lag.toFixed(1)}s behind)`);
+    } else {
+      this.log('live-catchup: caught up — restored 1× speed');
+    }
+    this.emit('catchup', { active, rate, lagSeconds: lag });
+  }
+
+  /**
+   * Bootstrap the NEXT file in a standby worker so the switch is (near-)seamless. The standby opens
+   * the file live-from-start (its beginning is contiguous with the current file's end) and continues
+   * the continuous edit-unit counter; the exact base is locked at activation. Captures the standby's
+   * manifest + init segment but does NOT append the init to MSE (same codec → the existing
+   * SourceBuffer continues). Idempotent while a standby is already pending.
+   */
+  preloadNextUrl(url: string): void {
+    if (!this.liveMode || this.standbyWorker) return;
+    this.standbyReady = false;
+    this.standbyManifest = null;
+    this.pendingNextUrl = url;
+    const w = this.createWorker();
+    this.standbyWorker = w;
+    this.standbyListener = (e: MessageEvent<WorkerEvent>) => {
+      const ev = e.data;
+      if (ev.type === 'manifest') {
+        this.standbyManifest = ev;
+      } else if (ev.type === 'initSegment') {
+        this.standbyReady = true;
+        // Standby finished bootstrapping. If the current file already reached its edge (rotated), hand
+        // off now rather than waiting for the next poll — same first-edge rule as maybeCompleteLive.
+        if (this.liveAtEdge && this.liveStallPolls >= 1) this.beginGaplessSwitch();
+      } else if (ev.type === 'error' && ev.fatal) {
+        this.emit('error', { message: `standby preload: ${ev.message}`, fatal: false });
+      }
+    };
+    w.addEventListener('message', this.standbyListener);
+    const plugins = this.config.plugins?.videoDecoder
+      ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
+    w.postMessage({
+      type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins,
+      live: true, startEditUnit: this.nextFetchFrame, liveFromStart: true,
+    } as WorkerCommand);
+  }
+
+  /**
+   * Switch to the next live file. If it isn't already being preloaded, start preloading it now; the
+   * actual hand-off happens as soon as the standby is ready and the current file is done. Call this
+   * from the 'live-end' handler, or proactively when the next file appears in your playlist.
+   */
+  switchLive(url: string): void {
+    if (!this.liveMode) { this.loadLive(url); return; }
+    if (!this.standbyWorker) this.preloadNextUrl(url);
+    if (this.standbyReady) this.beginGaplessSwitch();
+  }
+
+  /**
+   * Begin the gapless hand-off to a ready standby. Before swapping, drain the OLD worker's held
+   * reorder frames (flushLiveTail) so its video OUTPUT frontier catches up to its AUDIO frontier as far
+   * as the file allows. The flushed tail video lands in MSE, then liveTailFlushed reports the seam base
+   * = the earlier of the two track frontiers (so a mid-GOP cut where audio leads video can't leave a
+   * video gap) and runs activateStandby(). Idempotent while a switch is in flight.
+   */
+  private beginGaplessSwitch(): void {
+    if (this.switching) return;
+    if (!this.standbyWorker || !this.standbyReady || !this.standbyManifest) return;
+    this.switching = true;
+    // Stop polling the old file; we're done with it.
+    if (this.livePollTimer !== null) { clearTimeout(this.livePollTimer); this.livePollTimer = null; }
+    this.seqBase += 2;
+    this.worker?.postMessage({ type: 'flushLiveTail', seqBase: this.seqBase } as WorkerCommand);
+  }
+
+  /**
+   * Swap the standby worker in as the active one, continuing the timeline on the SAME MSE buffer +
+   * audio context with no gap (no teardown → no black/refill). Called from the liveTailFlushed reply,
+   * so `nextFetchFrame` is the seam base (the earlier of the old file's two track frontiers); the next
+   * file's first frame of each track continues from there — the lagging track abuts, the leading one
+   * overlaps a few units (replaced, not gapped).
+   */
+  private activateStandby(): void {
+    const sw = this.standbyWorker;
+    const sm = this.standbyManifest;
+    if (!sw || !this.standbyReady || !sm) { this.switching = false; return; }
+
+    if (this.livePollTimer !== null) { clearTimeout(this.livePollTimer); this.livePollTimer = null; }
+    // Lock the next file's continuous base to the seam frontier (min of audio/video frontiers).
+    sw.postMessage({ type: 'setStartEditUnit', startEditUnit: this.nextFetchFrame } as WorkerCommand);
+
+    // Swap: terminate the old worker, promote the standby. Replace its preload listener with the full
+    // set. Its already-received init segment is NOT appended (same codec → existing buffer continues).
+    this.worker?.terminate();
+    if (this.standbyListener) { sw.removeEventListener('message', this.standbyListener); this.standbyListener = null; }
+    this.worker = sw;
+    this.standbyWorker = null;
+    this.standbyReady = false;
+    this.standbyManifest = null;
+    this.attachWorkerListeners(sw);
+
+    // Adopt the next file's edit rate (same rate assumed; refresh defensively) and reset edge state.
+    this.editRateNumerator = sm.editRateNumerator;
+    this.editRateDenominator = sm.editRateDenominator;
+    this.audio.setEditRate(sm.editRateNumerator, sm.editRateDenominator);
+    this.liveAtEdge = false;
+    this.liveStallPolls = 0;
+    this.liveEndEmitted = false;
+    this.fetchPending = false;
+    this.previewParked = false;
+    this.bufferFull = false;
+    this.switching = false;
+
+    const switchedUrl = this.pendingNextUrl;
+    this.pendingNextUrl = null;
+    this.log(`live: gapless switch to next file at editUnit ${this.nextFetchFrame}`);
+    if (switchedUrl) this.emit('live-switched', { url: switchedUrl });
+    this.fetchNextChunk();
+    this.scheduleLivePoll();
+  }
+
+  /**
+   * Edge re-anchor: jump to the live edge of `url` (a newer chunk just produced by the recorder) with
+   * a CLEAN reset (fresh MSE + audio), reusing a pre-parsed standby worker so there is NO header
+   * re-parse. Combines the standby pre-bootstrap (instant) with a clean cut (no A/V seam) — the basis
+   * for low-latency edge-seeking live playback. Falls back to loadLive() when not in live mode.
+   */
+  reanchorLive(url: string): void {
+    if (!this.liveMode) { this.loadLive(url); return; }
+    if (this.standbyReady && this.standbyWorker) { this.reanchorToStandby(); return; }
+    this.reanchorPending = true;
+    if (!this.standbyWorker) this.preloadEdge(url);
+  }
+
+  /** Pre-parse `url` in a background standby worker (header + transcoder + init segment built while
+   *  the current file keeps playing), so the swap in reanchorToStandby() is near-instant.
+   *  liveFromStart:false → EDGE-SCAN (findLiveStartByte) to start near the file's current END, snapped
+   *  to a clean keyframe. This is the catch-up-to-edge path: it must land at the live edge regardless of
+   *  how old the target file is (it can be a freshly-rotated 1-2 s chunk OR the mid-write newest file
+   *  ~a whole rotation old when we've fallen far behind). Starting at the file's BEGINNING here (the old
+   *  behaviour) left us a whole file-duration behind → an immediate re-jump loop. Same as loadLive's
+   *  first-file behaviour. startEditUnit:0 → fresh timeline. */
+  private preloadEdge(url: string): void {
+    if (this.standbyWorker) return;
+    this.standbyReady = false; this.standbyManifest = null; this.standbyInitSegment = null;
+    const w = this.createWorker();
+    this.standbyWorker = w;
+    this.standbyListener = (e: MessageEvent<WorkerEvent>) => {
+      const ev = e.data;
+      if (ev.type === 'manifest') {
+        this.standbyManifest = ev;
+      } else if (ev.type === 'initSegment') {
+        this.standbyInitSegment = ev.data;
+        this.standbyReady = true;
+        if (this.reanchorPending) this.reanchorToStandby();
+      } else if (ev.type === 'error' && ev.fatal) {
+        this.emit('error', { message: `edge preload: ${ev.message}`, fatal: false });
+      }
+    };
+    w.addEventListener('message', this.standbyListener);
+    const plugins = this.config.plugins?.videoDecoder
+      ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
+    w.postMessage({ type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins,
+      live: true, startEditUnit: 0, liveFromStart: false } as WorkerCommand);
+  }
+
+  /** Promote the pre-parsed standby worker with a clean MSE + audio reset (no gapless continuation,
+   *  so no A/V seam). Reuses the standby's already-built transcoder + init segment — no header
+   *  re-parse. Re-driving onManifest with the pre-parsed manifest re-opens MSE, recreates the audio
+   *  context, flushes the (reused) init segment, and kicks the first edge fetch. */
+  private reanchorToStandby(): void {
+    const sw = this.standbyWorker; const sm = this.standbyManifest; const init = this.standbyInitSegment;
+    if (!sw || !this.standbyReady || !sm || !init) return;
+    this.reanchorPending = false;
+    if (this.livePollTimer !== null) { clearTimeout(this.livePollTimer); this.livePollTimer = null; }
+
+    // Promote the standby (do NOT terminate it); tear down only the outgoing worker.
+    this.worker?.terminate();
+    if (this.standbyListener) { sw.removeEventListener('message', this.standbyListener); this.standbyListener = null; }
+    this.worker = sw;
+    this.standbyWorker = null; this.standbyReady = false; this.standbyManifest = null; this.standbyInitSegment = null;
+    this.attachWorkerListeners(sw);
+
+    // Clean cut: fresh MSE + audio (mirrors loadLive's destroyInternal→onManifest reset, minus the
+    // worker teardown so the pre-parsed transcoder survives).
+    this.mseController?.destroy();
+    this.createMseController();
+    this.audio.destroy();
+    this.nextFetchFrame = 0; this.seqBase = 0;
+    this.fetchPending = false; this.bufferFull = false; this.previewParked = false;
+    this.liveAtEdge = false; this.liveStallPolls = 0; this.liveEndEmitted = false;
+    // Catch-up is satisfied by landing at the edge: clear speed/jump state (audio.destroy() above
+    // already reset the scheduler's rate; restore the element's too).
+    this.catchupActive = false; this.catchupJumpPending = false; this.reportedLagSeconds = 0;
+    this.video.playbackRate = 1;
+    this.playIntent = true;
+    this.pendingInitSegment = init;
+    this.log('live: re-anchored to edge (reused header, clean reset)');
+    void this.onManifest(sm);
+  }
+
   private log(msg: string): void {
     if (this.config.debug) console.log('[mxf.js]', msg);
   }
@@ -1018,6 +1496,23 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private destroyInternal(): void {
     this.worker?.terminate();
     this.worker = null;
+    if (this.standbyListener && this.standbyWorker) this.standbyWorker.removeEventListener('message', this.standbyListener);
+    this.standbyWorker?.terminate();
+    this.standbyWorker = null;
+    this.standbyListener = null;
+    this.standbyReady = false;
+    this.standbyManifest = null;
+    this.switching = false;
+    this.pendingNextUrl = null;
+    if (this.livePollTimer !== null) { clearTimeout(this.livePollTimer); this.livePollTimer = null; }
+    this.liveMode = false;
+    this.liveAtEdge = false;
+    this.liveStallPolls = 0;
+    this.liveEndEmitted = false;
+    this.catchupActive = false;
+    this.catchupJumpPending = false;
+    this.reportedLagSeconds = 0;
+    this.video.playbackRate = 1;
     this.mseController?.destroy();
     this.mseController = null;
     this.audio.destroy();

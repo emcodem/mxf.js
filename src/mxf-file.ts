@@ -8,6 +8,8 @@ import {
   isPartitionPack,
   isIndexTableSegment,
   isGenericContainerElement,
+  isPictureEssence,
+  isSystemItem,
   ulEquals,
   UL_RANDOM_INDEX_PACK,
   isFill,
@@ -20,6 +22,7 @@ import {
   HEADER_METADATA_MIN_READ,
   HEADER_METADATA_FALLBACK_READ,
   INDEX_SEGMENT_MAX,
+  LIVE_START_SCAN_WINDOW,
 } from './core/constants.js';
 
 export interface RandomIndexPackEntry {
@@ -171,6 +174,120 @@ export class MxfFile {
 
     this.bootstrap = { headerPartition, metadata, indexSegments, ripEntries, essenceStart, essenceBodySID, indexMode };
     return this.bootstrap;
+  }
+
+  /**
+   * Live-mode bootstrap for a growing recording. Reads ONLY what's needed to build the manifest /
+   * init segment — the header Partition Pack, the header metadata, and the essence container start —
+   * and deliberately SKIPS the tail / Random Index Pack / footer / VBE index machinery (a still-being-
+   * written file has no footer, and we don't seek in live mode anyway). The index mode is forced to
+   * 'none' so the essence extractor reads frames sequentially forward (see EssenceExtractor). Pair
+   * with {@link findLiveStartByte} to start near the file's end rather than at frame 0.
+   */
+  async openLive(): Promise<MxfBootstrap> {
+    if (this.bootstrap) return this.bootstrap;
+
+    const fileSize = await this.loader.fileSize;
+
+    // Step 1: header Partition Pack (same as open()).
+    const ppBuf = await this.loader.fetchRange(0, Math.min(PARTITION_PACK_READ_SIZE, fileSize) - 1, 'live bootstrap: header partition pack');
+    const ppStartOffset = KLVIterator.skipRunIn(ppBuf);
+    const headerPartition = parsePartitionPack(ppBuf, 0);
+    const ppKlv = readKLV(ppBuf, ppStartOffset);
+    const afterPP = ppStartOffset + ppKlv.totalLength;
+
+    // Step 2: header metadata (same generous read as open()).
+    const metaSize = Number(headerPartition.headerByteCount);
+    const wantBytes = metaSize > 0 ? Math.max(metaSize, HEADER_METADATA_MIN_READ) : HEADER_METADATA_FALLBACK_READ;
+    const readSize = Math.min(wantBytes, fileSize - afterPP);
+    const metaBuf = await this.loader.fetchRange(afterPP, afterPP + readSize - 1, 'live bootstrap: header metadata');
+    const { primer, metadataStart, metadataLength } = this.findHeaderMetadata(metaBuf);
+    let metadata = parseHeaderMetadata(metaBuf, metadataStart, metadataLength, primer, this.debug);
+    metadata = { ...metadata, operationalPattern: headerPartition.operationalPattern };
+
+    // Step 5: locate the essence container start (needed for sequential reads + the start-byte snap).
+    // A growing file has no RIP, so locateEssence can't seek to a body partition by SID; it walks
+    // forward to the first Generic Container element. Start that walk at `afterPP` (right after the
+    // header Partition Pack — a guaranteed KLV boundary) rather than `afterPP + metaSize`: encoders
+    // like XDCAM/D-10 UNDERSTATE headerByteCount, so trusting it lands mid-metadata and the KLV walk
+    // never resyncs. Walking from afterPP strides primer → metadata → index → body PP → essence.
+    const { essenceStart, bodySID: essenceBodySID } =
+      await this.locateEssence([], headerPartition, afterPP, fileSize);
+
+    // No index in live mode: force 'none' so fetchFrames() always scans sequentially.
+    this.bootstrap = {
+      headerPartition, metadata, indexSegments: [], ripEntries: [],
+      essenceStart, essenceBodySID, indexMode: 'none',
+    };
+    if (this.debug) console.log(`[mxf.js] openLive: essenceStart=${essenceStart}, essenceBodySID=${essenceBodySID}, indexMode=none`);
+    return this.bootstrap;
+  }
+
+  /**
+   * Live mode: find a byte offset near the current EOF to begin sequential reading from, so playback
+   * starts at the file's live edge rather than its beginning. Reads a window back from EOF and walks
+   * KLVs forward, returning the offset of the most recent *complete* content-package start (the System
+   * Item that precedes a picture element, else the picture element itself). Starting on a package
+   * boundary keeps edit-unit counting clean; for MPEG-2 the decoder syncs at the first sequence header
+   * within ~1 GOP of that point. Falls back to `essenceStart` if no complete picture element is found
+   * in the window (e.g. a frame larger than the window, or a file barely past its header).
+   */
+  async findLiveStartByte(fileSize: number, isKeyframeData?: (value: Uint8Array) => boolean): Promise<bigint> {
+    const essStart = Number(this.bootstrap?.essenceStart ?? 0n);
+    const winStart = Math.max(essStart, fileSize - LIVE_START_SCAN_WINDOW);
+    if (winStart >= fileSize) return BigInt(essStart);
+
+    let buf: ArrayBuffer;
+    try {
+      buf = await this.loader.fetchRange(winStart, fileSize - 1, 'live: locate start byte near EOF');
+    } catch {
+      return BigInt(essStart);
+    }
+    const u8 = new Uint8Array(buf);
+
+    const iter = new KLVIterator(buf, 0);
+    // Align to the first real KLV key in the window (the window almost certainly begins mid-KLV).
+    if (!this.bufferStartsWithKey(buf, 0) && !iter.resync()) return BigInt(essStart);
+
+    // Walk forward, capturing the EARLIEST keyframe package in the window (set once) — starting there
+    // rather than at the very last keyframe gives ~a window's worth of buffer ahead, which the startup
+    // resume gate needs (at the exact edge, data only arrives at real time and the gate never fills).
+    // When `isKeyframeData` is given (e.g. MPEG-2: a GOP/sequence header in the picture bytes), only
+    // KEYFRAME picture elements qualify — starting mid-GOP would make the decoder discard video until
+    // the next sequence header while its package audio already played, desyncing A/V. The earliest
+    // picture of any kind is kept as a fallback if no keyframe is found.
+    let firstKeyPkgOff = -1;     // earliest keyframe package start (preferred)
+    let firstVideoPkgOff = -1;   // earliest picture package start (fallback)
+    let pendingSystemOff = -1;
+    while (iter.hasMore()) {
+      const off = iter.offset;
+      const pkt = iter.next();
+      if (!pkt) { if (iter.resync()) continue; break; } // partial trailing KLV (the growing edge) → stop
+      const k = pkt.key;
+      if (isPartitionPack(k) || isFill(k)) { pendingSystemOff = -1; continue; }
+      if (isSystemItem(k)) { pendingSystemOff = off; continue; }
+      if (isPictureEssence(k)) {
+        const pkgOff = pendingSystemOff >= 0 ? pendingSystemOff : off;
+        if (firstVideoPkgOff < 0) firstVideoPkgOff = pkgOff;
+        if (!isKeyframeData || isKeyframeData(u8.subarray(pkt.valueOffset, pkt.valueOffset + pkt.valueLength))) {
+          firstKeyPkgOff = pkgOff; // earliest keyframe → start here (max headroom in this window)
+          break;
+        }
+        pendingSystemOff = -1;
+      }
+    }
+
+    // Prefer the earliest keyframe's package; else the earliest picture (accepts a short decoder-sync
+    // gap); else the essence start.
+    const rel = firstKeyPkgOff >= 0 ? firstKeyPkgOff : firstVideoPkgOff;
+    if (rel < 0) return BigInt(essStart);
+    return BigInt(winStart + rel);
+  }
+
+  /** True when `buf` at `offset` begins with the MXF UL key prefix (06 0E 2B 34). */
+  private bufferStartsWithKey(buf: ArrayBuffer, offset: number): boolean {
+    const u8 = new Uint8Array(buf);
+    return u8[offset] === 0x06 && u8[offset + 1] === 0x0e && u8[offset + 2] === 0x2b && u8[offset + 3] === 0x34;
   }
 
   // ---------------------------------------------------------------------------

@@ -44,6 +44,12 @@ export interface ManifestData {
   longGop: boolean;
   /** Computed start timecodes from the Material / File / Source package timecode tracks. */
   timecodes: ManifestTimecode[];
+  /**
+   * True when the file is being played as a growing live recording (loadLive). In live mode the
+   * index is ignored, playback follows the file's end forward, there is no seeking/scrubbing, and
+   * `duration` is not meaningful (it behaves like a live stream).
+   */
+  live?: boolean;
 }
 
 export interface MxfPlayerEvents {
@@ -71,6 +77,34 @@ export interface MxfPlayerEvents {
   'pcm-audio': { samples: Float32Array; sampleRate: number; channelCount: number; editUnit: number };
   /** Fired when the PCM audio channel count is first known or changes — populate a channel selector. */
   'audio-info': { channelCount: number; activeChannels: number[] };
+  /**
+   * Live mode: the current file is complete (recording finished / rotated) and playback has reached
+   * its end. The consumer should call `switchLive(nextUrl)` (or `preloadNextUrl` ahead of time) to
+   * continue with the next file in the playlist. Never fired for non-live playback.
+   */
+  'live-end': void;
+  /**
+   * Live mode: a gapless hand-off to the next rotated file just completed (same MSE/audio, no
+   * teardown). `url` is the file now playing. The consumer updates its "current file" bookkeeping
+   * here instead of re-anchoring. Fired by switchLive/preloadNextUrl-driven rotation, not by loadLive.
+   */
+  'live-switched': { url: string };
+  /**
+   * Live mode: catch-up speed state changed. `active: true` means the player has nudged playback
+   * above 1× to drain accumulated lag and close the gap to the live edge (audio pitches up slightly
+   * while active); `active: false` means it has restored normal speed. `rate` is the playback rate
+   * now in effect, `lagSeconds` the estimated lag at the transition. UI can show a "catching up…"
+   * hint. Only fired for the 'speed' catch-up strategy.
+   */
+  catchup: { active: boolean; rate: number; lagSeconds: number };
+  /**
+   * Live mode: the player has fallen too far behind the live edge to close smoothly and is
+   * requesting a hard re-anchor to the edge. The player cannot name files, so the consumer responds
+   * by calling `reanchorLive(newestUrl)` with the newest file from its playlist. `lagSeconds` is the
+   * estimated lag that triggered it. Fired by the 'jump' strategy and as the 'speed' strategy's
+   * large-lag fallback.
+   */
+  'catchup-jump': { lagSeconds: number };
   destroyed: void;
 }
 

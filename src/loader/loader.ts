@@ -7,6 +7,13 @@ export interface ILoader {
    *        wanted. Aborted reads reject with an AbortError.
    */
   fetchRange(start: number, end: number, reason?: string, signal?: AbortSignal): Promise<ArrayBuffer>;
+  /**
+   * Live mode only: re-query the current size of a growing source (a recording still being written),
+   * so the live reader can discover bytes appended since {@link fileSize} was first resolved. A
+   * lightweight call (HTTP HEAD); ranges are already known to work by the time this is used. Optional
+   * because static/finished sources (e.g. a picked File) never grow and don't implement it.
+   */
+  refreshFileSize?(): Promise<number>;
   destroy(): void;
 }
 

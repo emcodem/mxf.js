@@ -35,6 +35,16 @@ export const HEADER_METADATA_FALLBACK_READ = 2 * 1024 * 1024;
  *  while still catching corruption. */
 export const INDEX_SEGMENT_MAX = 100 * 1024 * 1024;
 
+// ── Live mode (mxf-file.ts, demux-worker.ts) ─────────────────────────────────
+/** Window read back from EOF to locate the live-edge start (MxfFile.findLiveStartByte). We start at
+ *  the EARLIEST keyframe in this window, NOT the very last one: starting at the exact edge leaves no
+ *  buffer ahead (data only arrives at real time as the file grows), so the startup buffer gate can
+ *  never fill and playback never begins. This window therefore doubles as the live-delay headroom —
+ *  ~2.5 s at XDCAM HD422 50 Mbit (16 MB), enough to satisfy the resume gate and absorb decode jitter
+ *  while staying close to live. One-time read on the FIRST file only (rotated files start at their
+ *  beginning, which is already the live point). */
+export const LIVE_START_SCAN_WINDOW = 16 * 1024 * 1024;
+
 // ── Sequential (no-index) essence reads (essence-extractor.ts) ───────────────
 /** Default windowed read size when scanning essence without an index. */
 export const SEQ_WINDOW = 4 * 1024 * 1024;
