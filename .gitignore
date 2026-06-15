@@ -13,3 +13,4 @@ asm/build/
 
 # local Claude Code config / state
 .claude/
+dist/
