@@ -1,0 +1,65 @@
+name: Deploy demo to GitHub Pages
+
+# Build the dist bundle in CI and publish the demo + dist as a Pages artifact.
+# This does NOT commit anything: no gh-pages branch, no committed dist/ — the
+# built output is uploaded as an artifact and served directly by Pages.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # allow manual runs from the Actions tab
+
+# Least-privilege token scoped for the Pages deploy.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One in-flight deploy at a time; don't cancel a running publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # Produces dist/{mxf.esm.js,mxf.umd.js,demux-worker.js,kernels.wasm}.
+      - run: npm run build
+
+      # Assemble the publish root, preserving the demo/ <-> dist/ sibling layout
+      # so the demo's `../dist/mxf.esm.js` import resolves. A root redirect sends
+      # visitors from the site root to the demo.
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp -r dist _site/dist
+          cp -r demo _site/demo
+          cat > _site/index.html <<'HTML'
+          <!doctype html><meta charset="utf-8">
+          <meta http-equiv="refresh" content="0; url=./demo/">
+          <title>mxf.js</title>
+          <a href="./demo/">mxf.js demo</a>
+          HTML
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
