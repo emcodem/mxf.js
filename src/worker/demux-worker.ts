@@ -79,6 +79,22 @@ let liveAudioFrontier = 0;
 // logs only TRANSITIONS (a growing |divergence| = accumulating A/V desync) instead of every fetch.
 let _diagLastDiv = NaN;
 let _diagFetchN = 0; // DIAG (remove after debug): fetch counter for the "still alive" heartbeat
+let _diagFirstSegLogged = false; // DIAG (remove after seam debug): log only this worker's first video seg
+
+/** DIAG (remove after seam debug): scan an AVCC (length-prefixed) H.264 buffer for SPS(7)/PPS(8)/IDR(5)
+ *  NAL units, so we can tell whether a new file's first keyframe carries its parameter sets in-band
+ *  (it must, since the standby's init segment is NOT re-appended at the gapless swap). */
+function _diagAvccParamSets(buf: ArrayBuffer): { sps: boolean; pps: boolean; idr: boolean } {
+  const d = new Uint8Array(buf); let sps = false, pps = false, idr = false, i = 0;
+  while (i + 4 <= d.length) {
+    const len = ((d[i] << 24) | (d[i + 1] << 16) | (d[i + 2] << 8) | d[i + 3]) >>> 0;
+    const t = d[i + 4] & 0x1f;
+    if (t === 7) sps = true; else if (t === 8) pps = true; else if (t === 5) idr = true;
+    i += 4 + len;
+    if (len === 0) break;
+  }
+  return { sps, pps, idr };
+}
 // Config for the wasm plugin, carried from the init command so handleInit can use it.
 let activePluginConfig: WorkerPluginConfig | null = null;
 
@@ -218,6 +234,10 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
   try {
     const bootstrap = live ? await mxfFile.openLive() : await mxfFile.open();
     const { metadata } = bootstrap;
+    // Surfaced in the manifest so the player can cache them and drive a header-skip continuation
+    // (continueLiveFile) onto the next contiguous live file without re-parsing its header.
+    const essenceStartNum = Number(bootstrap.essenceStart);
+    const firstEssenceKey = bootstrap.firstEssenceKey ? Array.from(bootstrap.firstEssenceKey) : [];
     fragmenter = new Mp4Fragmenter(metadata);
     const pd = metadata.pictureDescriptor;
     const sd = metadata.soundDescriptor;
@@ -314,6 +334,8 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
         longGop: false,
         audioChannelCount,
         live: liveMode,
+        essenceStart: essenceStartNum,
+        firstEssenceKey,
       });
 
       const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
@@ -405,6 +427,8 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
         longGop: false, // MPEG-2 transcode path handles reorder inside the decoder, not here
         audioChannelCount,
         live: liveMode,
+        essenceStart: essenceStartNum,
+        firstEssenceKey,
       });
 
       const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
@@ -512,6 +536,8 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       longGop: longGop !== null,
       audioChannelCount,
       live: liveMode,
+      essenceStart: essenceStartNum,
+      firstEssenceKey,
     });
 
     if (resolvedMode === 'webcodecs' && pendingVideoInit) {
@@ -1063,6 +1089,13 @@ async function handleLiveFetch(frameCount: number, seqBase: number): Promise<voi
         const { chunks, framesEmitted } = await transcodePipeline.decodeSegment(videoFrames, false, () => false);
         const seg = fragmenter.buildTranscodedVideoSegment(chunks);
         if (chunks.length > 0) liveOutputFrontier = Number(chunks[chunks.length - 1].editUnit) + 1;
+        // DIAG (remove after seam debug): this worker's FIRST emitted video segment is the seam's first
+        // frames after a gapless swap — confirm it's a keyframe carrying SPS/PPS in-band (cause-2 check).
+        if (workerDebug && !_diagFirstSegLogged && chunks.length > 0) {
+          _diagFirstSegLogged = true;
+          const ps = _diagAvccParamSets(chunks[0].data);
+          console.log(`[mxfdiag] firstSeg eu=${Number(chunks[0].editUnit)} kf=${chunks[0].isKeyframe} sps=${ps.sps} pps=${ps.pps} idr=${ps.idr} startEU=${liveStartEditUnit} fromStart=${liveFromStart}`);
+        }
         if (workerDebug) console.log(`[live] fetch: read ${videoFrames.length}v/${audioFrames.length}a, emitted ${framesEmitted}, chunks ${chunks.length} eu[${chunks[0] ? Number(chunks[0].editUnit) : '-'}..${chunks.length ? Number(chunks[chunks.length - 1].editUnit) : '-'}] frontier=${liveOutputFrontier} atEdge=${liveReader.atEdge}`);
         if (seg) post({ type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: segEditUnit, systemTcAnchors: anchors }, [seg.buffer]);
       } else {
@@ -1164,6 +1197,69 @@ async function handleFlushLiveTail(seqBase: number): Promise<void> {
 }
 
 /**
+ * Live header-skip continuation (liveReuseHeader). Swap to the next contiguous rotated file WITHOUT
+ * fetching/parsing its header: reuse the cached metadata + warm transcode pipeline + fragmenter, swap
+ * the loader, validate the assumed essence offset with a 16-byte key compare (full openLive fallback
+ * on mismatch / short read), reset the pipeline counter to the post-flush seam base, and reply with
+ * liveContinued so the player resumes the forward-fetch loop. Posted only AFTER flushLiveTail has
+ * drained the old file's reorder tail (the player serialises: flush → liveTailFlushed → continueLiveFile,
+ * and sends no fetch until liveContinued — so the loader swap never races an in-flight handleLiveFetch).
+ */
+async function handleContinueLiveFile(
+  url: string, assumeEssenceStart: number, startEditUnit: number, expectEssenceKey: number[],
+): Promise<void> {
+  if (!mxfFile || !transcodePipeline || !fragmenter) {
+    postError('continueLiveFile: worker not initialized for live transcode', true);
+    return;
+  }
+  try {
+    const newLoader = new HttpLoader(url);
+
+    // Cheap validation: the next file is assumed to start essence at the same offset as the previous
+    // one (fixed-length header for this recorder). Confirm by comparing the 16-byte key there; a
+    // header-length drift makes this read land in metadata / mid-element → mismatch → full parse.
+    let reusedHeader = false;
+    if (expectEssenceKey.length === 16) {
+      try {
+        const keyBuf = await newLoader.fetchRange(assumeEssenceStart, assumeEssenceStart + 15, 'continueLive: validate essence key');
+        const got = new Uint8Array(keyBuf);
+        reusedHeader = got.length === 16 && expectEssenceKey.every((b, i) => b === got[i]);
+      } catch { reusedHeader = false; }
+    }
+
+    if (reusedHeader) {
+      mxfFile = mxfFile.adoptLiveContinuation(newLoader, BigInt(assumeEssenceStart));
+    } else {
+      if (workerDebug) console.log('[live] continueLiveFile: key mismatch/short read → full openLive fallback');
+      mxfFile = new MxfFile(newLoader, workerDebug);
+      await mxfFile.openLive();
+    }
+    loader = newLoader;
+
+    // Reset the per-file live state WITHOUT re-creating the decoder/encoder/fragmenter (same codec,
+    // dims, SPS/PPS). The reader is recreated lazily at essenceStart on the next fetch (liveFromStart).
+    liveMode = true;
+    liveFromStart = true;
+    liveReader = null;
+    liveLastSize = 0;
+    liveStartEditUnit = startEditUnit;
+    liveOutputFrontier = startEditUnit;
+    liveAudioFrontier = startEditUnit;
+    _diagLastDiv = NaN;
+    _diagFirstSegLogged = false;
+    // useDisplayBase=false: continuous live counter (matches handleLiveFetch's reader-creation reset).
+    // Drops the decoder's stale reference frames; the new file opens on a sequence header + I-frame and
+    // decodeSegment force-keys its first emitted frame, so the reused encoder resyncs cleanly.
+    transcodePipeline.reset(startEditUnit, false);
+
+    if (workerDebug) console.log(`[live] continueLiveFile: ${reusedHeader ? 'reused header' : 'full parse'} url=${url} essStart=${mxfFile.getBootstrap()?.essenceStart} base=${startEditUnit}`);
+    post({ type: 'liveContinued', nextEditUnit: startEditUnit, reusedHeader });
+  } catch (e) {
+    postError(`continueLiveFile failed: ${e instanceof Error ? e.message : String(e)}`, true);
+  }
+}
+
+/**
  * Live-mode poll: re-query the source size and tell the player whether it grew and whether the reader
  * has caught up to the current edge. Drives the follow-the-edge cadence on the player side.
  */
@@ -1222,6 +1318,10 @@ const commandHandlers: CommandHandlers = {
   pollLive: () => { handlePollLive().catch(e => postError(String(e))); },
   setStartEditUnit: (cmd) => { liveStartEditUnit = cmd.startEditUnit; },
   flushLiveTail: (cmd) => { handleFlushLiveTail(cmd.seqBase).catch(e => postError(String(e))); },
+  continueLiveFile: (cmd) => {
+    handleContinueLiveFile(cmd.url, cmd.assumeEssenceStart, cmd.startEditUnit, cmd.expectEssenceKey)
+      .catch(e => postError(String(e), true));
+  },
 };
 
 self.addEventListener('message', (event: MessageEvent<WorkerCommand>) => {

@@ -105,6 +105,20 @@ export type WorkerCommand =
        *  the standby from that aligned base. `seqBase` numbers the flushed video segment. */
       type: 'flushLiveTail';
       seqBase: number;
+    }
+  | {
+      /** Live mode (liveReuseHeader): continue onto the next contiguous rotated file WITHOUT re-parsing
+       *  its header. Swaps the worker's loader to `url`, reuses the cached metadata/descriptors and the
+       *  warm transcode pipeline, validates by comparing the 16-byte key at `assumeEssenceStart` against
+       *  `expectEssenceKey` (full openLive fallback on mismatch), resets the pipeline counter to
+       *  `startEditUnit` (the post-flush seam base, useDisplayBase=false), and replies with
+       *  `liveContinued`. The player drives forward fetches only after that reply (no in-flight race). */
+      type: 'continueLiveFile';
+      url: string;
+      assumeEssenceStart: number;
+      startEditUnit: number;
+      /** The 16-byte first essence KLV key observed in the previous file (manifest.firstEssenceKey). */
+      expectEssenceKey: number[];
     };
 
 // Events sent from worker to main thread
@@ -141,6 +155,13 @@ export type WorkerEvent =
       audioChannelCount: number;
       /** Live mode: this file was opened as a growing recording (index ignored, follow-the-edge). */
       live?: boolean;
+      /** Live mode: absolute byte offset of this file's essence container start (= bootstrap.essenceStart).
+       *  The player caches it and reuses it as `assumeEssenceStart` for the next contiguous file's
+       *  header-skip continuation (continueLiveFile). */
+      essenceStart?: number;
+      /** Live mode: the 16-byte first essence KLV key, used to validate that a header-skip continuation
+       *  landed on a real GC element (else fall back to a full parse). Empty when unknown. */
+      firstEssenceKey?: number[];
     }
   | { type: 'initSegment'; data: ArrayBuffer }
   | { type: 'videoInit'; codec: string; description: ArrayBuffer; width: number; height: number }
@@ -206,5 +227,14 @@ export type WorkerEvent =
        *  the next file's audio AND video both continue from the same edit unit (no A/V seam). */
       type: 'liveTailFlushed';
       nextEditUnit: number;
+    }
+  | {
+      /** Live mode (liveReuseHeader): reply to continueLiveFile. The worker has swapped to the next
+       *  file and reset the pipeline to `nextEditUnit` (the seam base); the player clears `switching`
+       *  and resumes the forward-fetch loop. `reusedHeader` = false when validation failed and the
+       *  worker fell back to a full openLive parse (diagnostic / A-B telemetry). */
+      type: 'liveContinued';
+      nextEditUnit: number;
+      reusedHeader: boolean;
     }
   | { type: 'error'; message: string; fatal: boolean };

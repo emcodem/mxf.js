@@ -50,6 +50,10 @@ export interface MxfBootstrap {
   essenceBodySID: number;
   /** Seeking strategy this file supports — see {@link IndexMode} */
   indexMode: IndexMode;
+  /** The 16-byte key of the first generic-container element at {@link essenceStart}. Captured during
+   *  the essence-partition walk; used by live header-skip continuation to validate that the assumed
+   *  essence offset of a rotated file still lands on a real GC element. Undefined when not resolved. */
+  firstEssenceKey?: Uint8Array;
 }
 
 export class MxfFile {
@@ -211,16 +215,38 @@ export class MxfFile {
     // header Partition Pack — a guaranteed KLV boundary) rather than `afterPP + metaSize`: encoders
     // like XDCAM/D-10 UNDERSTATE headerByteCount, so trusting it lands mid-metadata and the KLV walk
     // never resyncs. Walking from afterPP strides primer → metadata → index → body PP → essence.
-    const { essenceStart, bodySID: essenceBodySID } =
+    const { essenceStart, bodySID: essenceBodySID, firstEssenceKey } =
       await this.locateEssence([], headerPartition, afterPP, fileSize);
 
     // No index in live mode: force 'none' so fetchFrames() always scans sequentially.
     this.bootstrap = {
       headerPartition, metadata, indexSegments: [], ripEntries: [],
-      essenceStart, essenceBodySID, indexMode: 'none',
+      essenceStart, essenceBodySID, indexMode: 'none', firstEssenceKey,
     };
     if (this.debug) console.log(`[mxf.js] openLive: essenceStart=${essenceStart}, essenceBodySID=${essenceBodySID}, indexMode=none`);
     return this.bootstrap;
+  }
+
+  /**
+   * Live header-skip continuation (liveReuseHeader). Build a sibling MxfFile for the next contiguous
+   * rotated file that REUSES this file's cached metadata / descriptors / edit rate / essenceBodySID
+   * (constant within a recording) instead of fetching + parsing the new file's header. `essenceStart`
+   * is the ASSUMED essence offset (the previous file's, which is fixed for this recorder); the worker
+   * validates it against {@link firstEssenceKey} before trusting it, and falls back to a full
+   * {@link openLive} on the new loader if the key doesn't match. Index/RIP are empty and indexMode is
+   * 'none' (live forward never uses the index). Throws if this file hasn't been bootstrapped yet.
+   */
+  adoptLiveContinuation(loader: ILoader, essenceStart: bigint): MxfFile {
+    if (!this.bootstrap) throw new Error('adoptLiveContinuation: source file not bootstrapped');
+    const next = new MxfFile(loader, this.debug);
+    next.bootstrap = {
+      ...this.bootstrap,
+      essenceStart,
+      indexSegments: [],
+      ripEntries: [],
+      indexMode: 'none',
+    };
+    return next;
   }
 
   /**
@@ -397,7 +423,7 @@ export class MxfFile {
     _header: PartitionPack,
     fallback: number,
     fileSize: number
-  ): Promise<{ essenceStart: bigint; bodySID: number; indexSegments: IndexTableSegment[] }> {
+  ): Promise<{ essenceStart: bigint; bodySID: number; indexSegments: IndexTableSegment[]; firstEssenceKey?: Uint8Array }> {
     const body = rip.find(e => e.bodySID > 0);
     const partOffset = Number(body?.byteOffset ?? BigInt(fallback));
     const indexSegments: IndexTableSegment[] = [];
@@ -437,7 +463,8 @@ export class MxfFile {
         catch { break; }
 
         if (isGenericContainerElement(hdr.key)) {
-          return { essenceStart: BigInt(abs), bodySID, indexSegments };
+          // Copy the key out of the (reused / re-fetched) probe buffer so it survives.
+          return { essenceStart: BigInt(abs), bodySID, indexSegments, firstEssenceKey: Uint8Array.from(hdr.key) };
         }
 
         if (isIndexTableSegment(hdr.key) && hdr.valueLength > 0 && hdr.valueLength <= INDEX_SEGMENT_MAX) {

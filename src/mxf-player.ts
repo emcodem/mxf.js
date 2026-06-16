@@ -89,6 +89,12 @@ export interface MxfConfig {
    *  the 'jump' strategy's only trigger, and the 'speed' strategy's far-behind fallback (default 15).
    *  Must exceed maxBufferSeconds to be reachable, since lag beyond it is reported by the consumer. */
   catchupJumpSeconds?: number;
+  /** Live mode: skip the per-rotation header GET + parse. From the second segment on, keep ONE warm
+   *  worker and continue onto the next contiguous file by reusing the cached header/descriptors and the
+   *  warm transcode pipeline (continueLiveFile), validating the assumed essence offset with a 16-byte
+   *  key compare and falling back to a full parse on mismatch. Off (default) uses the standby-worker
+   *  gapless path. Only changes the gapless rotation path; the catch-up/jump re-anchor is unchanged. */
+  liveReuseHeader?: boolean;
   /** Optional decoder plugin. When the MXF codec matches, this wasm decoder is used instead
    *  of the built-in JS decoder, enabling new codecs and Firefox-compatible paths. */
   plugins?: {
@@ -121,6 +127,7 @@ const DEFAULT_CONFIG: Required<MxfConfig> = {
   catchupStartSeconds: 5,
   catchupStopSeconds: 2,
   catchupJumpSeconds: 15,
+  liveReuseHeader: false,
   plugins: {},
 };
 
@@ -220,6 +227,16 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private pendingNextUrl: string | null = null;
   // Guards a single 'live-end' emission per completed file (re-armed on switch / new load).
   private liveEndEmitted = false;
+
+  // ── Live header-reuse (liveReuseHeader: one warm worker, skip header GET/parse for files 2+) ───
+  // The current file's essence-container start + first-KLV key, cached from the manifest and reused as
+  // the next contiguous file's assumed offset + validation key in continueLiveFile. Refreshed on every
+  // manifest (including after a re-anchor) so a continuation always uses the current file's layout.
+  private cachedEssenceStart = 0;
+  private cachedEssenceKey: number[] = [];
+  // Reuse mode: the consumer has named the next contiguous file (switchLive) — switch on the first edge.
+  // The single-worker analogue of standbyReady (which doubles as the "next file exists" proof).
+  private reuseNextArmed = false;
 
   // ── Live catch-up (close the gap to the live edge) ────────────────────────────
   // True while the 'speed' strategy has playback nudged above 1× to drain lag.
@@ -735,8 +752,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
         // not gapped). Adopt it as the next file's continuous base and complete the swap.
         if (this.switching) {
           this.nextFetchFrame = event.nextEditUnit;
-          this.activateStandby();
+          // Reuse mode: hand the SAME worker onto the next file (no standby, no terminate); else swap
+          // in the pre-parsed standby. Both adopt the post-flush seam base as the next file's base.
+          if (this.config.liveReuseHeader) this.continueLiveToNext();
+          else this.activateStandby();
         }
+        break;
+
+      case 'liveContinued':
+        this.onLiveContinued(event);
         break;
 
       case 'codecUnsupported':
@@ -760,6 +784,13 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.liveAtEdge = false;
     this.liveStallPolls = 0;
     const effectiveDuration = this.liveMode ? Infinity : event.duration;
+
+    // Cache this file's essence layout for a header-reuse continuation onto the next contiguous file.
+    // Refreshed on every manifest (including after a re-anchor) so the assumed offset/key stay current.
+    if (this.liveMode) {
+      if (event.essenceStart !== undefined) this.cachedEssenceStart = event.essenceStart;
+      if (event.firstEssenceKey?.length) this.cachedEssenceKey = event.firstEssenceKey;
+    }
 
     this.editRateNumerator = event.editRateNumerator;
     this.editRateDenominator = event.editRateDenominator;
@@ -1212,7 +1243,12 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // (stallPolls >= 1, i.e. one no-growth poll confirming real EOF, not a transient mid-file catch-up)
     // hand off immediately, instead of burning LIVE_STALL_MAX (~3 s) of buffer headroom waiting — that
     // drain is exactly what left the playhead at the buffer end and caused the seam micro-rebuffer.
-    if (this.standbyReady && this.liveStallPolls >= 1) { this.beginGaplessSwitch(); return true; }
+    // "Armed" = next file confirmed to exist: standbyReady (standby path) or reuseNextArmed (reuse path).
+    const armed = this.config.liveReuseHeader ? this.reuseNextArmed : this.standbyReady;
+    if (armed && this.liveStallPolls >= 1) {
+      if (this.config.liveReuseHeader) this.beginReuseSwitch(); else this.beginGaplessSwitch();
+      return true;
+    }
     if (this.liveStallPolls < this.LIVE_STALL_MAX) return false;
     if (!this.liveEndEmitted) { this.liveEndEmitted = true; this.emit('live-end', undefined as unknown as void); }
     return false;
@@ -1333,6 +1369,14 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    */
   switchLive(url: string): void {
     if (!this.liveMode) { this.loadLive(url); return; }
+    // Reuse mode: spawn NO standby — just record the next URL and arm. The consumer's call IS the
+    // "next file exists" proof (replacing standbyReady). Switch on the first edge (same rule below).
+    if (this.config.liveReuseHeader) {
+      this.pendingNextUrl = url;
+      this.reuseNextArmed = true;
+      if (this.liveAtEdge && this.liveStallPolls >= 1) this.beginReuseSwitch();
+      return;
+    }
     if (!this.standbyWorker) this.preloadNextUrl(url);
     if (this.standbyReady) this.beginGaplessSwitch();
   }
@@ -1395,6 +1439,81 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     const switchedUrl = this.pendingNextUrl;
     this.pendingNextUrl = null;
     this.log(`live: gapless switch to next file at editUnit ${this.nextFetchFrame}`);
+    // DIAG (remove after seam debug): seam continuity. seamSec = the new file's base in media-seconds
+    // (same absolute epoch as video.currentTime / buffered). overlap = bufEnd − seamSec > 0 means the
+    // new file restarts BEHIND the already-buffered video frontier → those samples are OVERWRITTEN in
+    // MSE (cause-1 macroblock suspect). ahead = how much buffer remains past the playhead at the swap
+    // (small/negative → readyState dip / spinner, cause-3).
+    if (this.config.debug) {
+      const b = this.video.buffered;
+      let bufEnd = 0; for (let i = 0; i < b.length; i++) bufEnd = Math.max(bufEnd, b.end(i));
+      const seamSec = this.editRateNumerator ? this.nextFetchFrame * this.editRateDenominator / this.editRateNumerator : 0;
+      const cur = this.video.currentTime;
+      // eslint-disable-next-line no-console
+      console.log(`[mxfdiag] SEAM base=${this.nextFetchFrame} seamSec=${seamSec.toFixed(3)} bufEnd=${bufEnd.toFixed(3)} cur=${cur.toFixed(3)} ahead=${(bufEnd - cur).toFixed(3)}s overlap=${(bufEnd - seamSec).toFixed(3)}s ranges=${this.videoRanges()}`);
+    }
+    if (switchedUrl) this.emit('live-switched', { url: switchedUrl });
+    this.fetchNextChunk();
+    this.scheduleLivePoll();
+  }
+
+  /**
+   * Reuse-mode gapless switch (liveReuseHeader). Same first half as beginGaplessSwitch — drain the
+   * current file's reorder tail via flushLiveTail — but the liveTailFlushed reply runs continueLiveToNext
+   * (single warm worker) instead of activateStandby (standby swap). Idempotent while a switch is live.
+   */
+  private beginReuseSwitch(): void {
+    if (this.switching) return;
+    if (!this.pendingNextUrl) return;
+    this.switching = true;
+    if (this.livePollTimer !== null) { clearTimeout(this.livePollTimer); this.livePollTimer = null; }
+    this.seqBase += 2;
+    this.worker?.postMessage({ type: 'flushLiveTail', seqBase: this.seqBase } as WorkerCommand);
+  }
+
+  /**
+   * Posted from the liveTailFlushed reply (reuse mode): tell the SAME warm worker to continue onto the
+   * next file at the seam base, skipping its header GET/parse. The worker validates the assumed offset
+   * and replies with liveContinued (→ onLiveContinued resumes fetching). No new Worker, no terminate.
+   */
+  private continueLiveToNext(): void {
+    if (!this.pendingNextUrl) { this.switching = false; return; }
+    this.worker?.postMessage({
+      type: 'continueLiveFile',
+      url: this.pendingNextUrl,
+      assumeEssenceStart: this.cachedEssenceStart,
+      startEditUnit: this.nextFetchFrame,
+      expectEssenceKey: this.cachedEssenceKey,
+    } as WorkerCommand);
+  }
+
+  /**
+   * The warm worker has swapped to the next file (header reused, or full-parsed on a validation miss)
+   * and reset to the seam base. Resume the timeline on the SAME MSE + audio with no teardown — mirrors
+   * activateStandby's tail, minus the worker swap and edit-rate refresh (same recording → same rate).
+   */
+  private onLiveContinued(event: Extract<WorkerEvent, { type: 'liveContinued' }>): void {
+    this.nextFetchFrame = event.nextEditUnit;
+    this.reuseNextArmed = false;
+    this.liveAtEdge = false;
+    this.liveStallPolls = 0;
+    this.liveEndEmitted = false;
+    this.fetchPending = false;
+    this.previewParked = false;
+    this.bufferFull = false;
+    this.switching = false;
+
+    const switchedUrl = this.pendingNextUrl;
+    this.pendingNextUrl = null;
+    this.log(`live: header-reuse continuation at editUnit ${this.nextFetchFrame} (reusedHeader=${event.reusedHeader})`);
+    if (this.config.debug) {
+      const b = this.video.buffered;
+      let bufEnd = 0; for (let i = 0; i < b.length; i++) bufEnd = Math.max(bufEnd, b.end(i));
+      const seamSec = this.editRateNumerator ? this.nextFetchFrame * this.editRateDenominator / this.editRateNumerator : 0;
+      const cur = this.video.currentTime;
+      // eslint-disable-next-line no-console
+      console.log(`[mxfdiag] SEAM(reuse) base=${this.nextFetchFrame} seamSec=${seamSec.toFixed(3)} bufEnd=${bufEnd.toFixed(3)} cur=${cur.toFixed(3)} ahead=${(bufEnd - cur).toFixed(3)}s overlap=${(bufEnd - seamSec).toFixed(3)}s reused=${event.reusedHeader} ranges=${this.videoRanges()}`);
+    }
     if (switchedUrl) this.emit('live-switched', { url: switchedUrl });
     this.fetchNextChunk();
     this.scheduleLivePoll();
@@ -1470,6 +1589,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.nextFetchFrame = 0; this.seqBase = 0;
     this.fetchPending = false; this.bufferFull = false; this.previewParked = false;
     this.liveAtEdge = false; this.liveStallPolls = 0; this.liveEndEmitted = false;
+    this.reuseNextArmed = false; this.pendingNextUrl = null;
     // Catch-up is satisfied by landing at the edge: clear speed/jump state (audio.destroy() above
     // already reset the scheduler's rate; restore the element's too).
     this.catchupActive = false; this.catchupJumpPending = false; this.reportedLagSeconds = 0;
@@ -1504,6 +1624,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.standbyManifest = null;
     this.switching = false;
     this.pendingNextUrl = null;
+    this.reuseNextArmed = false;
     if (this.livePollTimer !== null) { clearTimeout(this.livePollTimer); this.livePollTimer = null; }
     this.liveMode = false;
     this.liveAtEdge = false;
