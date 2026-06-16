@@ -349,6 +349,10 @@ $env:TEST_MXF_FILE="C:/temp/mxf.js/vistek.mxf"; npm run test:e2e
 
 System Chrome is expected at `C:\Program Files\Google\Chrome\Application\chrome.exe`.
 
+### Hosted demo (GitHub Pages)
+
+The [live demo](https://emcodem.github.io/mxf.js/demo/index.html) is built and published automatically by [`.github/workflows/pages.yml`](.github/workflows/pages.yml) on every push to `main`: it runs `npm run build` and uploads `demo/` + `dist/` as a Pages artifact via `actions/deploy-pages`. Nothing is committed — `dist/` is generated output and is gitignored; CI rebuilds it for the deploy. (One-time setup: **Settings → Pages → Source: GitHub Actions**.)
+
 ---
 
 ## Architecture
