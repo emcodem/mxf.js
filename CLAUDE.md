@@ -14,6 +14,8 @@ npm run typecheck  # tsc --noEmit
 
 ## E2E test setup
 
-Puppeteer uses system Chrome at `C:\Program Files\Google\Chrome\Application\chrome.exe` (headless — bundled Chromium lacks proprietary codec support).
+Chrome path is resolved by `test/e2e/chrome-path.ts`: `CHROME_PATH` env → Puppeteer's bundled Chrome for Testing (`puppeteer.executablePath()`, has proprietary codecs) → Windows system-Chrome fallback. Set `CHROME_PATH` to force a specific binary.
+
+Safari E2E (`test/e2e/safari.test.ts`) drives safaridriver via raw WebDriver; requires Develop → Allow Remote Automation. Validates the Safari 16.x VideoEncoder ½-scale fallback.
 
 **E2E tests run the built `dist` bundle** — run `npm run build` after changing player/worker source. Latency test knobs (env vars): `MXF_RATE_HIGH` (bytes/sec, 0=unlimited), `MXF_LAT_HIGH`/`MXF_LAT_LOW` (ms RTT), `TEST_URL_MXF`.

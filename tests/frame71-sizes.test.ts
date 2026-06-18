@@ -1,8 +1,12 @@
 import { it } from 'vitest';
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { MxfFile } from '../src/mxf-file.js';
 import { EssenceExtractor } from '../src/essence/essence-extractor.js';
 import type { ILoader } from '../src/loader/loader.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 class FsLoader implements ILoader {
   readonly fileSize: Promise<number>;
@@ -21,7 +25,8 @@ class FsLoader implements ILoader {
 }
 
 it('frame sizes around 71', async () => {
-  const FILE = 'C:/dev/mxf.js/media/xdcamhd_1920_25i_16tracks.mxf';
+  const FILE = process.env.TEST_MXF_FILE ?? path.resolve(__dirname, '../media/xdcamhd_1920_25i_16tracks.mxf');
+  if (!fs.existsSync(FILE)) { console.log(`skip: ${FILE} not found`); return; }
   const loader = new FsLoader(FILE);
   const bootstrap = await new MxfFile(loader, false).open();
   const ex = new EssenceExtractor(loader, bootstrap);
