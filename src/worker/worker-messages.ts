@@ -162,6 +162,10 @@ export type WorkerEvent =
       /** Live mode: the 16-byte first essence KLV key, used to validate that a header-skip continuation
        *  landed on a real GC element (else fall back to a full parse). Empty when unknown. */
       firstEssenceKey?: number[];
+      /** Live mode: byte offset just past the first complete video frame (essenceStart + frame-0 KLV).
+       *  The player caches it as the minimum size a contiguous successor must reach before it's worth
+       *  preloading a standby — below it, the successor's frame 0 isn't fully written yet. */
+      firstFrameEndByte?: number;
     }
   | { type: 'initSegment'; data: ArrayBuffer }
   | { type: 'videoInit'; codec: string; description: ArrayBuffer; width: number; height: number }

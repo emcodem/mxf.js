@@ -49,6 +49,21 @@ let storedEditRateDenominator = 1;
 // are unconditional; these are progress/diagnostic lines that would otherwise spam every consumer.
 let workerDebug = false;
 
+// ── Live open timing instrumentation (gated by workerDebug && liveMode) ──────
+// Wall-clock milestones for the live-mode open path, so the time-to-first-frame can be attributed
+// to each blocking phase (bootstrap reads, frame-0 probes, the EOF scan, first decode). Complements
+// the per-read byte logger (globalThis.MXFJS_LOG_READS). performance.now() is available in workers.
+let liveOpenT0 = 0;             // captured at handleInit start (live only)
+let liveTPrev = 0;              // previous milestone, for per-phase deltas
+let liveFirstSegLogged = false; // one-shot guard for the init→first-video-segment total
+function liveMark(label: string): void {
+  if (!workerDebug || !liveMode) return;
+  const now = performance.now();
+  // eslint-disable-next-line no-console
+  console.log(`[livetime] ${label}: +${(now - liveOpenT0).toFixed(0)} ms total (Δ ${(now - liveTPrev).toFixed(0)} ms)`);
+  liveTPrev = now;
+}
+
 // Active transcode pipeline: the native JS MPEG-2 pipeline OR a wasm-backed plugin pipeline.
 // Only one is set at a time; null for the H.264 remux path (no transcode needed).
 let transcodePipeline: ITranscodePipeline | null = null;
@@ -59,6 +74,13 @@ let transcodePipeline: ITranscodePipeline | null = null;
 // There is no seeking/scrubbing in live mode. See handleLiveFetch / handlePollLive and MxfFile.openLive.
 let liveMode = false;
 let liveReader: LiveSequentialReader | null = null;
+// Live fetch serialization. The player pipelines live fetches (posts several before the first
+// replies) to keep the worker decoding back-to-back with no round-trip idle. But handleLiveFetch
+// mutates shared per-file state (the LiveSequentialReader cursor, liveOutputFrontier, the transcode
+// pipeline's held anchor), so the calls must run strictly one-at-a-time. This promise chain
+// serialises them: each fetchSegment appends to the tail, so fetch N+1 starts only after fetch N
+// fully completes — preserving the original "reader cursor never raced" invariant under pipelining.
+let liveFetchChain: Promise<void> = Promise.resolve();
 // Continuous edit-unit counter base for THIS file's first emitted frame — 0 for the first file, and
 // the previous file's final edit unit for a rotated next file, so timestamps stay continuous across
 // the seam (seamless stitch). Set from the init command and refined via setStartEditUnit at handoff.
@@ -213,6 +235,50 @@ async function loadKernelsOnce(): Promise<void> {
   }
 }
 
+/** Max time the live first-frame probe waits for a too-fresh (still-writing) file to finish frame 0. */
+const LIVE_FIRST_FRAME_TIMEOUT_MS = 4000;
+/** Backoff between no-store HEAD re-polls while waiting for the first frame. */
+const LIVE_PROBE_POLL_MS = 150;
+
+/** Resolve after `ms` (dedicated workers have setTimeout). */
+function delay(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
+
+/**
+ * Live-mode first-video-frame probe that tolerates a still-growing source. A freshly-rotated file
+ * may have its header written but frame 0 only partly on disk; the non-live EssenceExtractor would
+ * then yield 0 video frames and the caller would fatally error (treating a TRANSIENT "not written
+ * yet" as permanent). Instead, drive a disposable LiveSequentialReader (it carries the incomplete
+ * trailing KLV and stops at the frontier WITHOUT throwing) and poll refreshFileSize until the first
+ * complete video frame lands — or give up after `timeoutMs`. A static source (no refreshFileSize,
+ * e.g. a picked File) gets ONE pass → immediate null, preserving the fast fatal for a genuinely
+ * empty file. Returns the first video EssenceFrame, or null if none arrived within the timeout.
+ */
+async function findFirstVideoFrameLive(
+  loader_: ILoader, bootstrap: MxfBootstrap, timeoutMs = LIVE_FIRST_FRAME_TIMEOUT_MS,
+): Promise<EssenceFrame | null> {
+  const tcBase = storedEditRateDenominator > 0 ? Math.round(storedEditRateNumerator / storedEditRateDenominator) : 0;
+  // Disposable reader from the file START (frame 0) — NOT the module `liveReader`, which handleLiveFetch
+  // creates later near EOF. We only need frame 0's bytes for the encoder/SPS setup; startEditUnit is moot.
+  const reader = new LiveSequentialReader(loader_, bootstrap.essenceStart, 0n, tcBase);
+  const canRefresh = typeof loader_.refreshFileSize === 'function';
+  let size: number;
+  try { size = canRefresh ? await loader_.refreshFileSize!() : await loader_.fileSize; }
+  catch { size = await loader_.fileSize; }
+  const deadline = performance.now() + timeoutMs;
+  for (;;) {
+    // readForward persists cursor + carry across calls, so each poll resumes where the last stopped
+    // and retries the incomplete first picture KLV once its bytes land. Audio frames yielded before
+    // frame 0 don't satisfy the loop (we only return on video) and don't consume the video budget.
+    for await (const f of reader.readForward(1, size)) {
+      if (f.trackType === 'video') return f;
+    }
+    if (!canRefresh) return null;                   // static source: one pass, never waits
+    if (performance.now() >= deadline) return null; // timed out waiting for frame 0 to be written
+    await delay(LIVE_PROBE_POLL_MS);
+    try { size = await loader_.refreshFileSize!(); } catch { /* keep last good size on a HEAD blip */ }
+  }
+}
+
 async function handleInit(loader_: ILoader, debug = false, live = false, startEditUnit = 0, fromStart = false): Promise<void> {
   loader = loader_;
   workerDebug = debug;
@@ -224,6 +290,9 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
   abortSpeculation();
   scrubSegmentCache.clear();
   liveMode = live;
+  liveOpenT0 = performance.now();
+  liveTPrev = liveOpenT0;
+  liveFirstSegLogged = false;
   liveReader = null;
   liveStartEditUnit = startEditUnit;
   liveLastSize = 0;
@@ -233,6 +302,7 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
 
   try {
     const bootstrap = live ? await mxfFile.openLive() : await mxfFile.open();
+    liveMark('bootstrap done (header PP + metadata + locateEssence)');
     const { metadata } = bootstrap;
     // Surfaced in the manifest so the player can cache them and drive a header-skip continuation
     // (continueLiveFile) onto the next contiguous live file without re-parsing its header.
@@ -261,6 +331,7 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
           ).channelCount;
         }
       } catch { /* refined later from pcmSamples if this fails */ }
+      liveMark('PCM channel-count probe (fetchFrames from frame 0)');
     }
 
     const durationSec = pd
@@ -271,18 +342,26 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
     // Wasm decoder plugin path — overrides native decoders when pd.codec matches
     // -----------------------------------------------------------------------
     if (activePluginConfig && pd?.codec === activePluginConfig.mxfCodec) {
+      // LIVE: wait/poll for frame 0 on a too-fresh file (see findFirstVideoFrameLive); VOD: one-shot scan.
       let firstVideoFrame: EssenceFrame | null = null;
-      for (const probeCount of [2, 50]) {
-        const extractor = new EssenceExtractor(loader_, bootstrap);
-        for await (const frame of extractor.fetchFrames(0n, probeCount)) {
-          if (frame.trackType === 'video') { firstVideoFrame = frame; break; }
+      if (liveMode) {
+        firstVideoFrame = await findFirstVideoFrameLive(loader_, bootstrap);
+      } else {
+        for (const probeCount of [2, 50]) {
+          const extractor = new EssenceExtractor(loader_, bootstrap);
+          for await (const frame of extractor.fetchFrames(0n, probeCount)) {
+            if (frame.trackType === 'video') { firstVideoFrame = frame; break; }
+          }
+          if (firstVideoFrame) break;
         }
-        if (firstVideoFrame) break;
       }
       if (!firstVideoFrame) {
-        postError(`Plugin (${activePluginConfig.ffmpegCodec}): no video frames found`, true);
+        postError(liveMode
+          ? `Plugin (${activePluginConfig.ffmpegCodec}): no complete video frame within ${LIVE_FIRST_FRAME_TIMEOUT_MS} ms (live source too fresh)`
+          : `Plugin (${activePluginConfig.ffmpegCodec}): no video frames found`, true);
         return;
       }
+      const firstFrameEndByte = Number(firstVideoFrame.byteOffset) + firstVideoFrame.data.byteLength + 64;
 
       let decoder: WasmFfmpegDecoder;
       try {
@@ -336,6 +415,7 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
         live: liveMode,
         essenceStart: essenceStartNum,
         firstEssenceKey,
+        firstFrameEndByte,
       });
 
       const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
@@ -357,27 +437,43 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       // ramp re-reads frame 0 anyway. Standard OP1a/D-10 puts the first picture element in edit unit 0,
       // so read just the first edit unit or two; escalate to the wide scan only if pathological
       // interleaving hides it, keeping the common case a tiny read.
+      // Find the first video frame for the probe-decode. In LIVE mode the file may be too fresh
+      // (header written, frame 0 not fully on disk) — wait/poll for it instead of erroring (a
+      // freshly-rotated standby successor hits this). VOD keeps the cheap one-shot [2,50] scan.
       let firstVideoFrame: EssenceFrame | null = null;
-      for (const probeCount of [2, 50]) {
-        const extractor = new EssenceExtractor(loader_, bootstrap);
-        for await (const frame of extractor.fetchFrames(0n, probeCount)) {
-          if (frame.trackType === 'video') { firstVideoFrame = frame; break; }
+      if (liveMode) {
+        liveMark('MPEG-2 live first-frame probe START (waiting for frame 0 if too fresh)');
+        firstVideoFrame = await findFirstVideoFrameLive(loader_, bootstrap);
+        liveMark(`MPEG-2 live first-frame probe → ${firstVideoFrame ? 'got frame' : 'TIMEOUT/none'}`);
+      } else {
+        for (const probeCount of [2, 50]) {
+          const extractor = new EssenceExtractor(loader_, bootstrap);
+          for await (const frame of extractor.fetchFrames(0n, probeCount)) {
+            if (frame.trackType === 'video') { firstVideoFrame = frame; break; }
+          }
+          if (firstVideoFrame) break;
         }
-        if (firstVideoFrame) break;
       }
       if (!firstVideoFrame) {
-        postError('MPEG-2: no video frames found in first 50 edit units', true);
+        postError(liveMode
+          ? `MPEG-2: no complete video frame within ${LIVE_FIRST_FRAME_TIMEOUT_MS} ms (live source too fresh)`
+          : 'MPEG-2: no video frames found in first 50 edit units', true);
         return;
       }
+      // Byte offset just past frame 0's complete KLV — the player's min-preload threshold (see manifest).
+      const firstFrameEndByte = Number(firstVideoFrame.byteOffset) + firstVideoFrame.data.byteLength + 64;
 
       // Probe-decode the first frame for coded dimensions + chroma, then build the transcode
       // pipeline (encoder → SPS/PPS → persistent stream decoder). See Mpeg2Pipeline.
+      liveMark('MPEG-2 first frame fetched (probe-decoding)');
       const probe = Mpeg2Pipeline.probeFirstFrame(firstVideoFrame.data);
       if (!probe) {
         postError('MPEG-2: failed to decode first frame', true);
         return;
       }
+      liveMark('MPEG-2 first frame decoded → creating pipeline (VideoEncoder setup)');
       const pipeline = await Mpeg2Pipeline.create(probe, storedEditRateNumerator, storedEditRateDenominator);
+      liveMark(`MPEG-2 pipeline create returned (${pipeline ? 'ok' : 'null'})`);
       if (!pipeline) {
         postError('MPEG-2: VideoEncoder did not produce SPS/PPS', true);
         return;
@@ -429,10 +525,12 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
         live: liveMode,
         essenceStart: essenceStartNum,
         firstEssenceKey,
+        firstFrameEndByte,
       });
 
       const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
       post({ type: 'initSegment', data: initBuf }, [initBuf]);
+      liveMark('manifest + init posted (MPEG-2) — handing to player');
       return;
     }
 
@@ -445,6 +543,8 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
     // with the SPS-coded frame size (the descriptor's StoredHeight is per-field for interlaced AVC).
     let videoDisplayWidth = pd?.storedWidth ?? 0;
     let videoDisplayHeight = pd?.storedHeight ?? 0;
+    // Byte offset past frame 0's complete KLV (player min-preload threshold); 0 if not an h264 probe.
+    let firstFrameEndByte = 0;
 
     if (pd?.codec === 'h264') {
       // The init segment's avc1/avcC box is built from the SPS/PPS in the FIRST video frame (it must
@@ -454,9 +554,19 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       let spsPocInfo: SpsPocInfo | null = null;
       let ppsFlagMap: Map<number, PpsPocInfo> = new Map();
       try {
-        const extractor = new EssenceExtractor(loader_, bootstrap);
-        for await (const frame of extractor.fetchFrames(0n, 1)) {
-          if (frame.trackType !== 'video') continue;
+        // LIVE: wait/poll for frame 0 on a too-fresh file (see findFirstVideoFrameLive); VOD: one-shot.
+        let frame: EssenceFrame | null = null;
+        if (liveMode) {
+          liveMark('H.264 live first-frame probe START (waiting for frame 0 if too fresh)');
+          frame = await findFirstVideoFrameLive(loader_, bootstrap);
+        } else {
+          const extractor = new EssenceExtractor(loader_, bootstrap);
+          for await (const f of extractor.fetchFrames(0n, 1)) {
+            if (f.trackType === 'video') { frame = f; break; }
+          }
+        }
+        if (frame) {
+          firstFrameEndByte = Number(frame.byteOffset) + frame.data.byteLength + 64;
           const avccData = isAnnexB(frame.data) ? annexBtoAVCC(frame.data) : frame.data;
           const { sps, pps } = extractSPSPPS(avccData);
           if (sps.length > 0 && pps.length > 0) {
@@ -475,16 +585,18 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
               pendingVideoInit = { codec, description: desc, width: pd.width, height: pd.height };
             }
           }
-          break;
         }
       } catch (e) {
         postError(`H.264: failed to read SPS/PPS from the first frame: ${e instanceof Error ? e.message : String(e)}`, true);
         return;
       }
       if (!gotSpsPps) {
-        postError('H.264: no SPS/PPS in the first video frame — cannot build an init segment (the first frame must be a keyframe carrying parameter sets)', true);
+        postError(liveMode
+          ? `H.264: no complete first video frame within ${LIVE_FIRST_FRAME_TIMEOUT_MS} ms (live source too fresh), or it lacked SPS/PPS`
+          : 'H.264: no SPS/PPS in the first video frame — cannot build an init segment (the first frame must be a keyframe carrying parameter sets)', true);
         return;
       }
+      liveMark('H.264 SPS/PPS probe fetched (from frame 0)');
 
       // Detect Long-GOP: probe ~2 GOPs for any B slice. Reorder works with a VBE index (GOP-aligned
       // via the index entry flags — Tier 1/2) and with NO index (Tier 3: GOP-aligned by scanning for
@@ -510,6 +622,7 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
         } catch (e) {
           if (workerDebug) console.log('[longgop] B-slice probe failed, treating as non-Long-GOP:', e);
         }
+        liveMark('H.264 Long-GOP B-slice probe (~30 frames from frame 0)');
       }
     }
 
@@ -538,6 +651,7 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       live: liveMode,
       essenceStart: essenceStartNum,
       firstEssenceKey,
+      firstFrameEndByte,
     });
 
     if (resolvedMode === 'webcodecs' && pendingVideoInit) {
@@ -550,6 +664,7 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
       post({ type: 'initSegment', data: initBuf }, [initBuf]);
     }
+    liveMark('manifest + init posted (H.264) — handing to player');
 
   } catch (e) {
     postError(`Failed to parse MXF: ${e instanceof Error ? e.message : String(e)}`, true);
@@ -1054,12 +1169,19 @@ async function handleLiveFetch(frameCount: number, seqBase: number): Promise<voi
     // continuous counter, and (for MPEG-2) number the transcode pipeline's output from that base.
     if (!liveReader) {
       const fileSize = await loader.fileSize;
-      // First file → jump to its live edge; rotated next file → start at its beginning (contiguous).
-      // For the edge jump, snap to a KEYFRAME so the decoder syncs immediately and A/V stay aligned
-      // (starting mid-GOP would discard video until the next sequence header while audio played).
-      const startByte = liveFromStart
-        ? bootstrap.essenceStart
-        : await mxfFile.findLiveStartByte(fileSize, liveKeyframeDetector());
+      liveMark('first live fetch begins (player round-trip done)');
+      // Snap to a keyframe in both cases so the reader always opens on an I-frame:
+      //   liveFromStart=false (initial load): scan the last LIVE_START_SCAN_WINDOW bytes → keyframe
+      //     near the live edge (maximum headroom before the frontier).
+      //   liveFromStart=true (gapless rotation): scan the first 2 MB of essence → first keyframe in
+      //     the new file. Using essenceStart directly was wrong when the recorder cuts at a fixed time
+      //     interval rather than a GOP boundary: the first frames are P/B, suppression skips them, and
+      //     the gap (seam_base .. firstIDR−1) left an unfilled hole in MSE → macroblocking + stall.
+      const startScanEnd = liveFromStart
+        ? Math.min(fileSize, Number(bootstrap.essenceStart) + 2 * 1024 * 1024)
+        : fileSize;
+      const startByte = await mxfFile.findLiveStartByte(startScanEnd, liveKeyframeDetector());
+      liveMark(`findLiveStartByte (${liveFromStart ? 'file-start' : 'EOF'} scan) → key @${startByte}, ${((fileSize - Number(startByte)) / 1048576).toFixed(2)} MB behind EOF`);
       const tcBase = storedEditRateDenominator > 0 ? Math.round(storedEditRateNumerator / storedEditRateDenominator) : 0;
       liveReader = new LiveSequentialReader(loader, startByte, BigInt(liveStartEditUnit), tcBase);
       liveLastSize = fileSize;
@@ -1073,6 +1195,7 @@ async function handleLiveFetch(frameCount: number, seqBase: number): Promise<voi
     const currentSize = liveLastSize > 0 ? liveLastSize : await loader.fileSize;
     const frames: EssenceFrame[] = [];
     for await (const f of liveReader.readForward(frameCount, currentSize)) frames.push(f);
+    if (!liveFirstSegLogged) liveMark(`first readForward done (${frames.length} frames, ${frameCount} requested)`);
     const videoFrames = frames.filter(f => f.trackType === 'video');
     const audioFrames = frames.filter(f => f.trackType === 'audio');
 
@@ -1103,6 +1226,10 @@ async function handleLiveFetch(frameCount: number, seqBase: number): Promise<voi
         // Remux path: no reorder hold, so the output frontier is simply past the last frame read.
         liveOutputFrontier = Number(videoFrames[videoFrames.length - 1].editUnit) + 1;
         if (seg) post({ type: 'videoSegment', data: seg.buffer as ArrayBuffer, seq: seqBase, editUnit: segEditUnit, systemTcAnchors: anchors }, [seg.buffer]);
+      }
+      if (!liveFirstSegLogged) {
+        liveFirstSegLogged = true;
+        liveMark('FIRST video segment posted to player (worker time-to-first-frame)');
       }
     }
 
@@ -1204,6 +1331,10 @@ async function handleFlushLiveTail(seqBase: number): Promise<void> {
  * liveContinued so the player resumes the forward-fetch loop. Posted only AFTER flushLiveTail has
  * drained the old file's reorder tail (the player serialises: flush → liveTailFlushed → continueLiveFile,
  * and sends no fetch until liveContinued — so the loader swap never races an in-flight handleLiveFetch).
+ *
+ * No first-frame probe here (so no too-fresh hazard): the reused-header swap keeps the warm pipeline and
+ * only validates the essence key, and its full-openLive fallback needs just the header (already written).
+ * The subsequent handleLiveFetch already tolerates a growing frontier via its at-edge/poll machinery.
  */
 async function handleContinueLiveFile(
   url: string, assumeEssenceStart: number, startEditUnit: number, expectEssenceKey: number[],
@@ -1297,10 +1428,14 @@ const commandHandlers: CommandHandlers = {
     handleInit(new FileLoader(cmd.file), cmd.debug, cmd.live, cmd.startEditUnit, cmd.liveFromStart).catch(e => postError(String(e), true));
   },
   fetchSegment: (cmd) => {
-    // Live mode streams forward via the persistent LiveSequentialReader (no index / seek). Fetches
-    // are serial (the player waits for segmentDone), so the reader's cursor is never raced.
+    // Live mode streams forward via the persistent LiveSequentialReader (no index / seek). The player
+    // pipelines fetches (several posted before the first replies), so chain them onto liveFetchChain
+    // to run strictly serially — the reader cursor / frontier / held anchor are shared state that must
+    // not be raced. Each fetch starts only after the previous one fully completes.
     if (liveMode) {
-      handleLiveFetch(cmd.frameCount, cmd.seqBase).catch(e => postError(String(e)));
+      liveFetchChain = liveFetchChain.then(() =>
+        handleLiveFetch(cmd.frameCount, cmd.seqBase).catch(e => postError(String(e)))
+      );
       return;
     }
     fetchQ.enqueue({
@@ -1315,12 +1450,20 @@ const commandHandlers: CommandHandlers = {
   // Scrub started: drop in-flight/queued forward prefetch so the worker is free for previews. The
   // in-flight transcode checks the generation after each frame and bails; queued jobs are cleared.
   cancelPrefetch: () => { fetchQ.supersede(); },
-  pollLive: () => { handlePollLive().catch(e => postError(String(e))); },
+  // pollLive / flushLiveTail / continueLiveFile all read or reset the same shared live state as
+  // handleLiveFetch, so they ride liveFetchChain too — guaranteeing they run AFTER any pipelined
+  // fetches posted before them (the player may post flushLiveTail while fetches are still in flight).
+  pollLive: () => {
+    liveFetchChain = liveFetchChain.then(() => handlePollLive().catch(e => postError(String(e))));
+  },
   setStartEditUnit: (cmd) => { liveStartEditUnit = cmd.startEditUnit; },
-  flushLiveTail: (cmd) => { handleFlushLiveTail(cmd.seqBase).catch(e => postError(String(e))); },
+  flushLiveTail: (cmd) => {
+    liveFetchChain = liveFetchChain.then(() => handleFlushLiveTail(cmd.seqBase).catch(e => postError(String(e))));
+  },
   continueLiveFile: (cmd) => {
-    handleContinueLiveFile(cmd.url, cmd.assumeEssenceStart, cmd.startEditUnit, cmd.expectEssenceKey)
-      .catch(e => postError(String(e), true));
+    liveFetchChain = liveFetchChain.then(() =>
+      handleContinueLiveFile(cmd.url, cmd.assumeEssenceStart, cmd.startEditUnit, cmd.expectEssenceKey)
+        .catch(e => postError(String(e), true)));
   },
 };
 

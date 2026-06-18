@@ -202,11 +202,36 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   // True when the worker's live reader has caught up to the file's current end (no new frames). While
   // set, forward fetching pauses and we poll the source size until it grows.
   private liveAtEdge = false;
+  // Pipelined live fetch: keep several fetches in flight so the worker drains them back-to-back with
+  // no player↔worker round-trip idle between chunks. The serial one-chunk-per-reply loop delivered
+  // only ~1.2× realtime (the round-trip gap dominated); pipelining lifts it toward the raw
+  // read+decode+encode rate (~2.5×), which is what lets the cushion refill after a rotation gap
+  // instead of draining to a spinner. The worker serialises these on its live-op chain so the
+  // stateful LiveSequentialReader cursor is never raced. `liveInFlight` holds the frameCount of each
+  // outstanding fetch (one entry pushed per post, shifted per liveUpdate) so the prefetch cap can
+  // account for not-yet-confirmed frames.
+  private readonly LIVE_PIPELINE_DEPTH = 3;
+  private liveInFlight: number[] = [];
   // Consecutive at-edge polls with no growth — used (with a ready standby) to declare the file done.
   private liveStallPolls = 0;
   private readonly LIVE_POLL_MS = 1000;
   private readonly LIVE_STALL_MAX = 3;
   private livePollTimer: ReturnType<typeof setTimeout> | null = null;
+  // Standby readiness watchdog: a standby that errors or never readies (e.g. preloaded on a too-fresh
+  // successor, or a 404 once the recorder deletes an older segment) must NOT permanently wedge rotation
+  // (switchLive won't re-preload while standbyWorker is set, beginGaplessSwitch needs standbyReady). If a
+  // standby hasn't readied within this window, discardStandby() tears it down so it can be re-preloaded.
+  // MUST exceed the worker's live first-frame wait (LIVE_FIRST_FRAME_TIMEOUT_MS=4s) + bootstrap + a poll,
+  // or it would kill standbies that are legitimately waiting for a fresh file's frame 0.
+  private standbyReadyTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly STANDBY_READY_TIMEOUT_MS = 8000;
+  // Throttle re-preload after a discard so a persistently-bad successor (404 / too-fresh) can't spin the
+  // terminate→spawn cycle; the consumer's switchLive poll retries after the window.
+  private readonly STANDBY_REPRELOAD_BACKOFF_MS = 1000;
+  private lastStandbyDiscardAt = 0;
+  // Min successor size (bytes) worth preloading — frame 0 isn't fully written below it. Cached from the
+  // manifest's firstFrameEndByte (×1.25 margin); 0 = unknown (skip the pre-gate, rely on the worker wait).
+  private liveMinPreloadBytes = 0;
   // Standby worker pre-bootstrapping the NEXT file so the switch is (near-)seamless. Captures its
   // manifest + init segment during preload; activated when the current file completes.
   private standbyWorker: Worker | null = null;
@@ -587,7 +612,17 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    * file; rotated files inherit a continuous counter automatically on switch.
    */
   loadLive(url: string): void {
+    this.liveOpenT0 = performance.now();
+    this.liveFirstPaintLogged = false;
+    this.liveFirstPlayLogged = false;
     this.setup();
+    // Mark live mode NOW, not on the first manifest. loadLive is unambiguously a live load, and the
+    // consumer's rotation poll can call switchLive()/reanchorLive() within ~1 s — before the (possibly
+    // multi-second) bootstrap posts its manifest. If liveMode were still false then, those calls would
+    // fall into their `!liveMode → loadLive()` fallback and do a DESTRUCTIVE re-anchor instead of a
+    // gapless standby switch — clobbering the bootstrap and desyncing the consumer's currentLiveFile
+    // bookkeeping, which strands playback after the first segment (acute with short ~1 s rotation).
+    this.liveMode = true;
     const plugins = this.config.plugins?.videoDecoder
       ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
     // First live file: jump to its edge (liveFromStart=false), number frames from 0.
@@ -673,6 +708,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
       case 'videoSegment':
         this.mseController?.appendSegment('video', event.data);
+        if (!this.liveFirstPaintLogged) { this.liveFirstPaintLogged = true; this.liveMark('first video segment appended to MSE (first paint imminent)'); }
         if (event.systemTcAnchors?.length) this.mergeSystemAnchors(event.systemTcAnchors);
         // Long-GOP fetches are GOP-aligned and may cover more frames than requested; adopt the
         // worker's reported next start so forward fetches stay keyframe-aligned and tile exactly.
@@ -790,6 +826,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     if (this.liveMode) {
       if (event.essenceStart !== undefined) this.cachedEssenceStart = event.essenceStart;
       if (event.firstEssenceKey?.length) this.cachedEssenceKey = event.firstEssenceKey;
+      // Min size a contiguous successor must reach before preloading a standby is worthwhile (frame 0
+      // isn't fully written below it). ×1.25 margin; same-encoder chunks have ~equal frame-0 extent.
+      if (event.firstFrameEndByte) this.liveMinPreloadBytes = Math.round(event.firstFrameEndByte * 1.25);
     }
 
     this.editRateNumerator = event.editRateNumerator;
@@ -899,10 +938,22 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     if (this.previewParked) return;
     // SourceBuffer is full and can't be trimmed yet — wait for the playhead to advance.
     if (this.bufferFull) return;
-    if (this.fetchPending || !this.manifest) return;
+    if (!this.manifest) return;
 
     const currentTime = this.video.currentTime;
     const fps = this.editRateNumerator / this.editRateDenominator;
+
+    // Live mode: no EOF cap — stream forward, pipelined (multiple fetches in flight). If the worker is
+    // caught up to the live edge, don't spin; poll the source size and resume when it grows.
+    // nextFetchFrame is NOT advanced here — the worker reports the authoritative forward frontier (the
+    // continuous edit unit) back via 'liveUpdate'.
+    if (this.liveMode) {
+      if (this.liveAtEdge) { this.scheduleLivePoll(); return; }
+      this.pumpLiveFetches(currentTime, fps);
+      return;
+    }
+
+    if (this.fetchPending) return;
 
     // Cap by REQUESTED-ahead, not buffered-ahead. nextFetchFrame is exactly how far ahead we've
     // already asked for, so this bounds prefetch to maxBufferSeconds regardless of how the decoded
@@ -912,18 +963,6 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // fine to fill the full look-ahead here regardless of play/pause state.
     const requestedAheadSeconds = this.nextFetchFrame / fps - currentTime;
     if (requestedAheadSeconds >= this.config.maxBufferSeconds) return;
-
-    // Live mode: no EOF cap — stream forward. If the worker is caught up to the live edge, don't spin;
-    // poll the source size and resume when it grows. nextFetchFrame is NOT advanced here — the worker
-    // reports the authoritative forward frontier (the continuous edit unit) back via 'liveUpdate'.
-    if (this.liveMode) {
-      if (this.liveAtEdge) { this.scheduleLivePoll(); return; }
-      const frameCount = explicitFrames ?? this.nextRampChunk();
-      this.fetchPending = true;
-      this.worker!.postMessage({ type: 'fetchSegment', startFrame: this.nextFetchFrame, frameCount, seqBase: this.seqBase } as WorkerCommand);
-      this.seqBase += 2;
-      return;
-    }
 
     const totalFrames = Math.round(
       this.manifest.duration * this.editRateNumerator / this.editRateDenominator
@@ -948,6 +987,32 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.seqBase += 2;
     this.nextFetchFrame += frameCount;
     this.worker!.postMessage(cmd);
+  }
+
+  /**
+   * Live forward fetch, pipelined. Posts up to LIVE_PIPELINE_DEPTH fetches without waiting for each
+   * reply, so the worker decodes them back-to-back with no round-trip idle (the gap that capped serial
+   * delivery at ~1.2× realtime). In live mode the worker ignores `startFrame` — it streams from its
+   * persistent LiveSequentialReader cursor and reports the authoritative frontier via liveUpdate — so
+   * we do NOT advance nextFetchFrame here; we only track the frame counts in flight so the prefetch
+   * cap can include them. Each posted fetch pushes its frameCount onto liveInFlight; onLiveUpdate
+   * shifts one off per reply.
+   */
+  private pumpLiveFetches(currentTime: number, fps: number): void {
+    while (this.liveInFlight.length < this.LIVE_PIPELINE_DEPTH) {
+      // Cap by requested-ahead = (confirmed frontier + frames already in flight) − playhead. Including
+      // in-flight frames stops the pipeline from over-requesting past maxBufferSeconds while replies
+      // are still pending (each reply moves nextFetchFrame forward, not this loop).
+      const inFlightFrames = this.liveInFlight.reduce((a, b) => a + b, 0);
+      const requestedAheadSeconds = (this.nextFetchFrame + inFlightFrames) / fps - currentTime;
+      if (requestedAheadSeconds >= this.config.maxBufferSeconds) break;
+
+      const frameCount = this.nextRampChunk();
+      this.fetchPending = true;
+      this.liveInFlight.push(frameCount);
+      this.worker!.postMessage({ type: 'fetchSegment', startFrame: this.nextFetchFrame, frameCount, seqBase: this.seqBase } as WorkerCommand);
+      this.seqBase += 2;
+    }
   }
 
   /** Return the current cold-start ramp size, then grow it ×2 toward framesPerChunk. A fresh load
@@ -1152,11 +1217,20 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // catches up as the playhead advances and re-opens the fetch window.
     const requestedAhead = this.nextFetchFrame / fps - this.video.currentTime;
     const audioStuck = fetchedToEof || requestedAhead >= this.config.maxBufferSeconds;
-    const willPlay = (videoAhead >= target && (audioAhead >= target || audioStuck)) || fetchedToEof;
+    // Live edge with nothing more to fetch right now: a growing recording — especially short rotating
+    // segments — may never buffer `target` seconds from a single file before it rotates, so the gate
+    // would hold forever (and at the TRUE live edge data only arrives at real time, so `target` ahead
+    // is unreachable by definition). Once we've consumed up to the current edge (liveAtEdge) and can't
+    // pull more, start with whatever decoded: the first picture shows immediately and the normal
+    // live-follow / rebuffer path takes over as the file grows or rotates. Require a non-empty video
+    // buffer and audio not trailing it, so we don't start on an empty/half-ready buffer.
+    const liveEdgeStuck = this.liveMode && this.liveAtEdge && videoAhead > 0 &&
+      (audioAhead >= videoAhead || audioStuck);
+    const willPlay = (videoAhead >= target && (audioAhead >= target || audioStuck)) || fetchedToEof || liveEdgeStuck;
     if (this.config.debug) {
       this.log(`gate cur=${this.video.currentTime.toFixed(2)} v=${videoAhead.toFixed(2)} ` +
         `a=${audioAhead === Infinity ? 'inf' : audioAhead.toFixed(2)} target=${target.toFixed(2)} ` +
-        `eof=${fetchedToEof} pending=${this.pendingSeeks} reqAhead=${requestedAhead.toFixed(2)} ` +
+        `eof=${fetchedToEof} edge=${liveEdgeStuck} pending=${this.pendingSeeks} reqAhead=${requestedAhead.toFixed(2)} ` +
         `stuck=${audioStuck} → ${willPlay ? 'PLAY' : 'hold'} vbuf=${this.videoRanges()} abuf=${this.audio.debugStore()}`);
     }
     if (willPlay) {
@@ -1166,6 +1240,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       // After this single attempt, mid-playback stalls are surfaced via the indicator only.
       this.startupGating = false;
       this.setBuffering(false);
+      if (!this.liveFirstPlayLogged) { this.liveFirstPlayLogged = true; this.liveMark(`startup gate released → play() (motion starts; gate target ${target.toFixed(2)}s)`); }
       this.video.play().catch(() => {});
     } else {
       this.setBuffering(true);
@@ -1202,23 +1277,27 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    */
   private onLiveUpdate(event: Extract<WorkerEvent, { type: 'liveUpdate' }>): void {
     if (!this.liveMode) return;
+    // One pipelined fetch replied — retire its in-flight slot.
+    this.liveInFlight.shift();
     // Mid-switch: the old worker is being drained (flushLiveTail) and torn down; ignore its trailing
     // liveUpdates so they can't re-trigger a switch or advance the frontier past the aligned base.
-    if (this.switching) { this.fetchPending = false; return; }
-    this.fetchPending = false;
+    if (this.switching) { this.fetchPending = this.liveInFlight.length > 0; return; }
+    this.fetchPending = this.liveInFlight.length > 0;
     this.nextFetchFrame = event.nextEditUnit; // authoritative frontier — never over/under-counts
     this.liveAtEdge = event.atEdge;
 
     if (event.atEdge) {
       this.liveStallPolls = event.grew ? 0 : this.liveStallPolls + 1;
       if (this.maybeCompleteLive()) return; // switched to next file — that path resumes fetching
-      this.scheduleLivePoll();
+      // Only poll once the pipeline has fully drained — otherwise an early at-edge reply would start
+      // polling while later in-flight fetches are still landing (they cleared the edge already).
+      if (this.liveInFlight.length === 0) this.scheduleLivePoll();
     } else {
       this.liveStallPolls = 0;
     }
 
     if (this.playIntent && this.video.paused) this.maybeResumePlayback();
-    this.fetchNextChunk(); // no-op when at edge or buffer full
+    this.fetchNextChunk(); // tops the pipeline back up; no-op when at edge or buffer full
     this.evaluateCatchup();
   }
 
@@ -1282,6 +1361,14 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // another action on top.
     if (this.switching || this.reanchorPending) return;
 
+    // Before the first playback, the one-shot startup gate is intentionally holding the element paused
+    // to accumulate buffer. A never-played element isn't "behind" in any useful sense — speeding up is
+    // a no-op, and worse, the far-behind JUMP fires on the growing wall-clock lag and reanchors, wiping
+    // the very buffer the gate is waiting on. For segments shorter than resumeBufferSeconds that is a
+    // deadlock (gate needs N s, one file gives <N s, jump resets before it accumulates). Suppress
+    // catch-up entirely until the gate releases on the first play.
+    if (this.startupGating) return;
+
     const buffered = this.bufferedAhead();
     const lag = Math.max(this.reportedLagSeconds, buffered);
     if (lag < this.config.catchupJumpSeconds) this.catchupJumpPending = false; // re-arm under the threshold
@@ -1333,8 +1420,25 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
    * manifest + init segment but does NOT append the init to MSE (same codec → the existing
    * SourceBuffer continues). Idempotent while a standby is already pending.
    */
-  preloadNextUrl(url: string): void {
+  async preloadNextUrl(url: string): Promise<void> {
     if (!this.liveMode || this.standbyWorker) return;
+    // Backoff: don't re-spawn immediately after a discard, or a persistently-bad successor (404 once the
+    // recorder deletes an older segment, or one stuck too-fresh) would spin terminate→spawn. The
+    // consumer's next switchLive poll retries after the window.
+    if (performance.now() - this.lastStandbyDiscardAt < this.STANDBY_REPRELOAD_BACKOFF_MS) return;
+    // Cheap pre-gate (best-effort, HTTP only): skip preloading a successor whose frame 0 isn't fully
+    // written yet (size below the cached threshold). Avoids spawning a standby that would just wait. On
+    // any uncertainty (non-HTTP, HEAD failure, unknown length) fall through — the worker's live
+    // first-frame wait (findFirstVideoFrameLive) is the real safety net.
+    if (this.liveMinPreloadBytes > 0 && /^https?:/i.test(url)) {
+      try {
+        const head = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+        const len = head.headers.get('content-length');
+        if (len && parseInt(len, 10) < this.liveMinPreloadBytes) return; // too fresh; consumer poll retries
+      } catch { /* HEAD blocked/failed → preload anyway, worker waits for frame 0 */ }
+      // The HEAD await yielded; re-check we still want to spawn (state may have changed meanwhile).
+      if (!this.liveMode || this.standbyWorker) return;
+    }
     this.standbyReady = false;
     this.standbyManifest = null;
     this.pendingNextUrl = url;
@@ -1346,10 +1450,14 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
         this.standbyManifest = ev;
       } else if (ev.type === 'initSegment') {
         this.standbyReady = true;
+        this.clearStandbyWatchdog(); // readied — disarm so it can't fire later
         // Standby finished bootstrapping. If the current file already reached its edge (rotated), hand
         // off now rather than waiting for the next poll — same first-edge rule as maybeCompleteLive.
         if (this.liveAtEdge && this.liveStallPolls >= 1) this.beginGaplessSwitch();
       } else if (ev.type === 'error' && ev.fatal) {
+        // Tear the dead standby down BEFORE emitting — the consumer's error handler may synchronously
+        // call switchLive(next), which must see standbyWorker===null to re-preload (the wedge fix).
+        this.discardStandby(`fatal: ${ev.message}`);
         this.emit('error', { message: `standby preload: ${ev.message}`, fatal: false });
       }
     };
@@ -1360,6 +1468,45 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins,
       live: true, startEditUnit: this.nextFetchFrame, liveFromStart: true,
     } as WorkerCommand);
+    this.armStandbyWatchdog();
+  }
+
+  /**
+   * Fully discard the current standby worker (fatal error, or never-ready watchdog): terminate it,
+   * detach its listener, clear the watchdog, and reset all standby state so the next switchLive /
+   * reanchorLive re-preloads a fresher successor. Keeps `pendingNextUrl` (re-preload + live-switched
+   * still need it). Distinct from activateStandby/reanchorToStandby, which PROMOTE the standby into
+   * this.worker and must NOT terminate it. Stamps the re-preload backoff clock.
+   */
+  private discardStandby(reason: string): void {
+    if (this.standbyWorker && this.standbyListener) {
+      this.standbyWorker.removeEventListener('message', this.standbyListener);
+    }
+    this.standbyWorker?.terminate();
+    this.standbyWorker = null;
+    this.standbyListener = null;
+    this.standbyReady = false;
+    this.standbyManifest = null;
+    this.standbyInitSegment = null;
+    this.clearStandbyWatchdog();
+    this.lastStandbyDiscardAt = performance.now();
+    this.log(`live: discarded standby (${reason})`);
+  }
+
+  /** Arm the standby readiness watchdog (single timer; mirrors scheduleLivePoll). Call after spawning. */
+  private armStandbyWatchdog(): void {
+    if (this.standbyReadyTimer !== null) return; // already armed — no double-fire
+    this.standbyReadyTimer = setTimeout(() => {
+      this.standbyReadyTimer = null; // self-clear
+      if (this.standbyReady || this.switching) return; // readied / being promoted → leave it
+      this.discardStandby('readiness timeout');
+      this.emit('error', { message: 'standby preload: readiness timeout', fatal: false });
+    }, this.STANDBY_READY_TIMEOUT_MS);
+  }
+
+  /** Disarm the standby readiness watchdog. */
+  private clearStandbyWatchdog(): void {
+    if (this.standbyReadyTimer !== null) { clearTimeout(this.standbyReadyTimer); this.standbyReadyTimer = null; }
   }
 
   /**
@@ -1377,7 +1524,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       if (this.liveAtEdge && this.liveStallPolls >= 1) this.beginReuseSwitch();
       return;
     }
-    if (!this.standbyWorker) this.preloadNextUrl(url);
+    if (!this.standbyWorker) void this.preloadNextUrl(url); // async (HEAD pre-gate); spawn lands later
     if (this.standbyReady) this.beginGaplessSwitch();
   }
 
@@ -1411,6 +1558,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     if (!sw || !this.standbyReady || !sm) { this.switching = false; return; }
 
     if (this.livePollTimer !== null) { clearTimeout(this.livePollTimer); this.livePollTimer = null; }
+    this.clearStandbyWatchdog(); // standby is being promoted into this.worker — watchdog must not fire
     // Lock the next file's continuous base to the seam frontier (min of audio/video frontiers).
     sw.postMessage({ type: 'setStartEditUnit', startEditUnit: this.nextFetchFrame } as WorkerCommand);
 
@@ -1432,6 +1580,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.liveStallPolls = 0;
     this.liveEndEmitted = false;
     this.fetchPending = false;
+    // New file: the previous file's pipelined fetches are done with (worker swapped, or reader reset
+    // to the seam base). Clear the in-flight queue so the next file's pipeline starts empty — a stale
+    // slot would leave the pipeline permanently "full" and wedge forward fetching.
+    this.liveInFlight = [];
     this.previewParked = false;
     this.bufferFull = false;
     this.switching = false;
@@ -1499,6 +1651,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.liveStallPolls = 0;
     this.liveEndEmitted = false;
     this.fetchPending = false;
+    // New file: the previous file's pipelined fetches are done with (worker swapped, or reader reset
+    // to the seam base). Clear the in-flight queue so the next file's pipeline starts empty — a stale
+    // slot would leave the pipeline permanently "full" and wedge forward fetching.
+    this.liveInFlight = [];
     this.previewParked = false;
     this.bufferFull = false;
     this.switching = false;
@@ -1552,8 +1708,12 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       } else if (ev.type === 'initSegment') {
         this.standbyInitSegment = ev.data;
         this.standbyReady = true;
+        this.clearStandbyWatchdog(); // readied — disarm
         if (this.reanchorPending) this.reanchorToStandby();
       } else if (ev.type === 'error' && ev.fatal) {
+        // Discard the dead edge standby so a subsequent reanchorLive re-preloads (reanchorPending is
+        // intentionally left set). No backoff/pre-gate here: the reanchor is the catch-up escape hatch.
+        this.discardStandby(`edge fatal: ${ev.message}`);
         this.emit('error', { message: `edge preload: ${ev.message}`, fatal: false });
       }
     };
@@ -1562,6 +1722,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
     w.postMessage({ type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins,
       live: true, startEditUnit: 0, liveFromStart: false } as WorkerCommand);
+    this.armStandbyWatchdog();
   }
 
   /** Promote the pre-parsed standby worker with a clean MSE + audio reset (no gapless continuation,
@@ -1573,6 +1734,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     if (!sw || !this.standbyReady || !sm || !init) return;
     this.reanchorPending = false;
     if (this.livePollTimer !== null) { clearTimeout(this.livePollTimer); this.livePollTimer = null; }
+    this.clearStandbyWatchdog(); // standby is being promoted — watchdog must not fire
 
     // Promote the standby (do NOT terminate it); tear down only the outgoing worker.
     this.worker?.terminate();
@@ -1588,6 +1750,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.audio.destroy();
     this.nextFetchFrame = 0; this.seqBase = 0;
     this.fetchPending = false; this.bufferFull = false; this.previewParked = false;
+    this.liveInFlight = []; // old worker terminated — drop its in-flight pipeline slots (see onLiveUpdate)
     this.liveAtEdge = false; this.liveStallPolls = 0; this.liveEndEmitted = false;
     this.reuseNextArmed = false; this.pendingNextUrl = null;
     // Catch-up is satisfied by landing at the edge: clear speed/jump state (audio.destroy() above
@@ -1602,6 +1765,19 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
   private log(msg: string): void {
     if (this.config.debug) console.log('[mxf.js]', msg);
+  }
+
+  // Live open timing (gated by config.debug && liveMode). Origin set in loadLive(); milestones below
+  // measure first-paint and motion-start latency from the user's perspective, complementing the
+  // worker-side [livetime] marks (which measure the open/decode path) and MXFJS_LOG_READS (bytes).
+  private liveOpenT0 = 0;
+  // One-shot PER LOAD (reset in loadLive, deliberately NOT on gapless switch): these mark the startup
+  // first-paint / motion-start latency, not per-rotation events — so they fire once per loadLive only.
+  private liveFirstPaintLogged = false;
+  private liveFirstPlayLogged = false;
+  private liveMark(label: string): void {
+    if (!this.config.debug || !this.liveMode) return;
+    console.log(`[mxf.js][livetime] ${label}: +${(performance.now() - this.liveOpenT0).toFixed(0)} ms since loadLive`);
   }
 
   /** Debug: the <video> element's buffered ranges as "[s1-e1][s2-e2]…" (a gap between ranges is the
@@ -1626,9 +1802,11 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.pendingNextUrl = null;
     this.reuseNextArmed = false;
     if (this.livePollTimer !== null) { clearTimeout(this.livePollTimer); this.livePollTimer = null; }
+    this.clearStandbyWatchdog();
     this.liveMode = false;
     this.liveAtEdge = false;
     this.liveStallPolls = 0;
+    this.liveInFlight = [];
     this.liveEndEmitted = false;
     this.catchupActive = false;
     this.catchupJumpPending = false;
