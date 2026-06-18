@@ -1,0 +1,97 @@
+name: Beta release
+
+# On every push to main, build the dist bundle and publish it as a rolling
+# "beta" prerelease so users can download a ready-to-use zip instead of building
+# from source. The `beta` tag is moved to each new commit, so the download URL
+#   https://github.com/<owner>/<repo>/releases/download/beta/mxf.js-beta.zip
+# always serves the latest main build.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Needed to create/update releases and move the tag.
+permissions:
+  contents: write
+
+# One release publish at a time; don't cancel an in-flight one.
+concurrency:
+  group: beta-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # Produces dist/{mxf.esm.js,mxf.umd.js,demux-worker.js,kernels.wasm}.
+      - run: npm run build
+
+      # Assemble the zip: the minimal demo plus the whole dist/ folder, keeping
+      # the demo/ <-> dist/ sibling layout so the demo's ../dist/mxf.umd.js import
+      # resolves when unzipped. The bundle loads demux-worker.js and kernels.wasm
+      # by relative URL at runtime, so all of dist/ must travel together.
+      - name: Assemble bundle
+        run: |
+          set -e
+          stage="mxf.js-beta"
+          rm -rf "$stage"
+          mkdir -p "$stage/demo" "$stage/dist"
+          cp dist/mxf.esm.js dist/mxf.umd.js dist/demux-worker.js dist/kernels.wasm "$stage/dist/"
+          cp demo/minimal_demo_cjs.html "$stage/demo/"
+          cat > "$stage/README.txt" <<'TXT'
+          mxf.js — beta build
+          ===================
+
+          This is an automated build from the latest commit on main. It lets you
+          embed the MXF player in a web page without building from source.
+
+          Contents
+          --------
+            demo/minimal_demo_cjs.html   A 43-line drop-in example (open in a browser).
+            dist/mxf.umd.js              The player (UMD global `MxfJs`) — <script src> this.
+            dist/mxf.esm.js              The player as an ES module (import { MxfPlayer }).
+            dist/demux-worker.js         Web Worker the player spawns. Keep next to mxf.*.js.
+            dist/kernels.wasm            MPEG-2 decode kernels. Keep next to demux-worker.js.
+
+          Quick start
+          -----------
+            1. Keep the three dist files side by side (the player resolves the worker
+               and wasm by relative URL at runtime).
+            2. <script src="dist/mxf.umd.js"></script>
+            3. const player = new MxfJs.MxfPlayer(document.querySelector('video'));
+               player.loadFile(file);   // a File from an <input type=file>
+               player.loadUrl(url);     // or an .mxf URL (server must support Range)
+
+          Must be served over HTTP(S) — Web Workers and MSE do not work from file://.
+          Tested in Chrome / Chromium-based browsers.
+
+          This is a prerelease/beta. APIs may change.
+          TXT
+          zip -r mxf.js-beta.zip "$stage"
+          ls -l mxf.js-beta.zip
+
+      # Move the rolling `beta` tag to this commit and republish the release with
+      # a fresh asset. --cleanup-tag deletes the old tag so it is recreated at the
+      # new commit; `|| true` tolerates the first run when no release exists yet.
+      - name: Publish rolling beta release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          gh release delete beta --yes --cleanup-tag || true
+          gh release create beta mxf.js-beta.zip \
+            --target "$GITHUB_SHA" \
+            --title "Beta (latest main)" \
+            --prerelease \
+            --notes "Automated beta build from \`${GITHUB_SHA:0:7}\` on $(date -u +%Y-%m-%dT%H:%MZ).
+
+          Download **mxf.js-beta.zip** below — it contains \`dist/\` plus a minimal drop-in demo (\`demo/minimal_demo_cjs.html\`). See the README inside for usage. This release tracks the latest \`main\`; the download URL is stable."
