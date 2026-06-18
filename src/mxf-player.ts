@@ -89,6 +89,13 @@ export interface MxfConfig {
    *  the 'jump' strategy's only trigger, and the 'speed' strategy's far-behind fallback (default 15).
    *  Must exceed maxBufferSeconds to be reachable, since lag beyond it is reported by the consumer. */
   catchupJumpSeconds?: number;
+  /** Live mode: how often (ms) to re-query the growing source's size when the reader is at the edge,
+   *  i.e. how quickly newly-written bytes are discovered (default 1000). This is a floor on live
+   *  latency: the reader only sees data up to the last poll, so the achievable edge distance is roughly
+   *  this interval plus the transcode reorder hold. Lower = lower latency but more frequent HEAD
+   *  requests; very low values approach the bleeding edge and risk edge-starvation rebuffers. Read each
+   *  poll cycle, so it can be changed on a running live player. */
+  livePollMs?: number;
   /** Live mode: skip the per-rotation header GET + parse. From the second segment on, keep ONE warm
    *  worker and continue onto the next contiguous file by reusing the cached header/descriptors and the
    *  warm transcode pipeline (continueLiveFile), validating the assumed essence offset with a 16-byte
@@ -127,6 +134,7 @@ const DEFAULT_CONFIG: Required<MxfConfig> = {
   catchupStartSeconds: 5,
   catchupStopSeconds: 2,
   catchupJumpSeconds: 15,
+  livePollMs: 1000,
   liveReuseHeader: false,
   plugins: {},
 };
@@ -217,7 +225,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   // Last poll's source-file-size verdict: true while the recording is still being written. Suppresses
   // 'live-end' (a still-growing single file never "completes" — reaching the reader's edge is transient).
   private liveSourceGrowing = false;
-  private readonly LIVE_POLL_MS = 1000;
+  // Source-size poll cadence is config.livePollMs (default 1000), read per cycle so it's live-tunable.
   private readonly LIVE_STALL_MAX = 3;
   private livePollTimer: ReturnType<typeof setTimeout> | null = null;
   // Standby readiness watchdog: a standby that errors or never readies (e.g. preloaded on a too-fresh
@@ -1312,13 +1320,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.evaluateCatchup();
   }
 
-  /** Schedule one source-size poll (single timer). */
+  /** Schedule one source-size poll (single timer). Interval re-read from config each cycle so a live
+   *  change to livePollMs takes effect on the next poll. Floored at 50 ms to avoid a HEAD storm. */
   private scheduleLivePoll(): void {
     if (this.livePollTimer !== null || !this.liveMode) return;
+    const interval = Math.max(50, this.config.livePollMs);
     this.livePollTimer = setTimeout(() => {
       this.livePollTimer = null;
       this.worker?.postMessage({ type: 'pollLive' } as WorkerCommand);
-    }, this.LIVE_POLL_MS);
+    }, interval);
   }
 
   /**

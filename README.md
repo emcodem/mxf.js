@@ -188,6 +188,9 @@ A runnable demo is in [`demo/index.html`](demo/index.html) (`npm run dev`, then 
 | `catchupStartSeconds` | `number` | `5` | Engage `'speed'` catch-up when this many seconds behind the edge. Set above steady-state latency so normal play never triggers it. |
 | `catchupStopSeconds` | `number` | `2` | Disengage `'speed'` catch-up once within this many seconds of the edge (the target latency — not zero, to avoid pressing the bleeding edge). |
 | `catchupJumpSeconds` | `number` | `15` | Lag threshold for a hard jump — the `'jump'` strategy's only trigger, and the `'speed'` strategy's large-lag fallback. |
+| `livePollMs` | `number` | `1000` | Live mode: how often (ms) the growing source's size is re-queried at the edge — a floor on live latency. Lower = lower latency but more frequent `HEAD` requests; very low values risk edge-starvation rebuffers. Read each poll, so it's tunable on a running live player. |
+| `liveReuseHeader` | `boolean` | `false` | Live mode: skip the per-rotation header GET + parse. From the second segment on, keep one warm worker and continue onto the next contiguous file by reusing the cached header/descriptors and transcode pipeline (validated by a 16-byte key compare, full re-parse on mismatch). Off uses the standby-worker gapless path. |
+| `plugins` | `{ videoDecoder?: VideoDecoderPluginConfig }` | `{}` | Optional WASM decoder plugin. When the MXF codec matches, an emscripten-compiled ffmpeg decoder is used instead of the built-in JS decoder — enables additional codecs and Firefox-compatible paths. |
 
 ### Methods
 
@@ -202,12 +205,14 @@ A runnable demo is in [`demo/index.html`](demo/index.html) (`npm run dev`, then 
 | `scrubTo(seconds: number)` | Report a live drag position during scrubbing. |
 | `endScrub(seconds?: number)` | Leave scrub mode, settle accurately, resume playback. Defaults to current playhead. |
 | `setAudioChannels(channels: number[])` | Choose 0-based source channels to mix to stereo (`[]` mutes). |
+| `setVolume(volume: number)` | Master volume for the Web Audio PCM path: `0` = silent, `1` = unity (default); above `1` boosts and may clip. Safe to call before playback starts. |
 | `loadLive(url: string)` | Open a growing live recording. Player streams forward and fires `live-end` when the file completes. No seeking or scrubbing. |
 | `preloadNextUrl(url: string)` | Start background-loading the next file while the current one is still playing; the gapless switch completes automatically on `live-end`. |
 | `switchLive(url: string)` | Hand off to the next file gaplessly (same MSE + audio, no teardown). Call on `live-end` if you didn't call `preloadNextUrl`. |
 | `reanchorLive(url: string)` | Hard re-anchor to a new file (clean cut, not gapless). Intended as the `catchup-jump` response. |
 | `setLiveLag(seconds: number)` | Report the current estimated lag to the player so it can evaluate catch-up. Call whenever your playlist refreshes. |
 | `audioDiag()` | Return a diagnostic snapshot: A/V offset, anomaly counts, audio coverage, scheduler gap. Useful for tuning and debugging. |
+| `markAudioGlitch(label?: string)` | Diagnostics: dump recent audio-scheduling history to the console (only active when constructed with `debug: true`). Call the instant a glitch is heard. |
 | `destroy()` | Tear down the worker, MSE, audio, and listeners. |
 
 ### Properties (getters)
@@ -258,6 +263,7 @@ import {
 } from 'mxf.js';
 import type {
   MxfConfig,
+  VideoDecoderPluginConfig,        // plugins.videoDecoder (WASM decoder)
   ManifestData,
   MxfPlayerEvents,
   TimecodeBundle, TimecodeSource, ManifestTimecode,
