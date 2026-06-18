@@ -172,6 +172,11 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private editRateNumerator = 25;
   private editRateDenominator = 1;
   private seqBase = 0;
+  // ── Stats telemetry ── Previous worker byte-total sample, for deriving instantaneous bandwidth
+  // from the delta over wall-clock. Reset per load in setup() (a new worker restarts bytesTotal at 0),
+  // so the first sample after a load yields ~0 rather than a spurious spike. See onWorkerStats.
+  private statsPrevBytes = 0;
+  private statsPrevTime = 0;
   private pendingInitSegment: ArrayBuffer | null = null;
   // Seek coalescing: while scrubbing, many 'seeking' events fire. We post a worker seek for
   // each (so the decoder always tracks the latest position) but only fetch once all have been
@@ -672,6 +677,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
   private setup(): void {
     this.destroyInternal();
+    // A fresh worker restarts the loader's cumulative byte total at 0 — reset the bandwidth baseline
+    // so the first stats sample isn't measured against the previous file's (larger) total.
+    this.statsPrevBytes = 0;
+    this.statsPrevTime = 0;
     this.worker = this.createWorker();
     this.attachWorkerListeners(this.worker);
     this.createMseController();
@@ -813,6 +822,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
       case 'liveContinued':
         this.onLiveContinued(event);
+        break;
+
+      case 'workerStats':
+        this.onWorkerStats(event);
         break;
 
       case 'codecUnsupported':
@@ -1175,6 +1188,45 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   /** Buffered-ahead seconds of video at the current playhead (0 if unknown). */
   private bufferedAhead(): number {
     return this.mseController?.getBufferedAhead('video', this.video.currentTime) ?? 0;
+  }
+
+  /**
+   * Merge a worker stats sample (network reads + encoder backlog) with main-thread buffer state (MSE
+   * buffered-ahead + the fetch frontier) and emit a unified `stats` event. Bandwidth is derived from
+   * the cumulative byte delta since the previous sample over its wall-clock gap.
+   */
+  private onWorkerStats(s: Extract<WorkerEvent, { type: 'workerStats' }>): void {
+    const now = performance.now();
+    // Instantaneous download rate from the byte-total delta. statsPrevTime === 0 (first sample after a
+    // load) yields 0; the `>=` guard avoids a negative rate if a worker swap (live rotation) ever
+    // hands us a smaller cumulative total.
+    let bandwidthBps = 0;
+    if (this.statsPrevTime > 0 && s.bytesTotal >= this.statsPrevBytes) {
+      const dt = (now - this.statsPrevTime) / 1000;
+      if (dt > 0) bandwidthBps = (s.bytesTotal - this.statsPrevBytes) / dt;
+    }
+    this.statsPrevBytes = s.bytesTotal;
+    this.statsPrevTime = now;
+
+    const fps = this.editRateNumerator / this.editRateDenominator;
+    const mseBufferedSeconds = this.bufferedAhead();
+    // Frontier-minus-playhead is how far ahead we've requested; clamp to ≥ buffered so the "in flight"
+    // (amber) portion = requested − buffered is never negative when the transcode timeline lags.
+    const requestedAheadSeconds = fps > 0
+      ? Math.max(mseBufferedSeconds, this.nextFetchFrame / fps - this.video.currentTime)
+      : mseBufferedSeconds;
+
+    this.emit('stats', {
+      bytesTotal: s.bytesTotal,
+      bandwidthBps,
+      requestsInFlight: s.requestsInFlight,
+      requestsTotal: s.requestsTotal,
+      mseBufferedSeconds,
+      requestedAheadSeconds,
+      maxBufferSeconds: this.config.maxBufferSeconds,
+      encodeQueueSize: s.encodeQueueSize,
+      transcoding: s.transcoding,
+    });
   }
 
   /** Seconds of forward buffer required before (re)starting playback: RESUME_BUFFER_SECONDS, capped at

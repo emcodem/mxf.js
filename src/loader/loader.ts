@@ -1,5 +1,18 @@
+/** Cumulative + instantaneous read counters for a loader, surfaced to the UI as traffic stats. */
+export interface LoaderStats {
+  /** Cumulative bytes successfully read (range reads for HTTP, slice reads for File). */
+  bytesTotal: number;
+  /** Reads currently in flight (open range fetches for HTTP; always 0 for the File API). */
+  requestsInFlight: number;
+  /** Cumulative completed reads. */
+  requestsTotal: number;
+}
+
 export interface ILoader {
   readonly fileSize: Promise<number>;
+  /** Optional traffic counters for a stats display. Implemented by all loaders; optional on the
+   *  interface so a future minimal loader need not provide it. */
+  getStats?(): LoaderStats;
   /**
    * @param reason optional label describing the purpose of the read (for read logging).
    * @param signal optional AbortSignal; aborting it cancels the read (e.g. a seek superseding a

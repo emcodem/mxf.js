@@ -52,8 +52,48 @@ export interface ManifestData {
   live?: boolean;
 }
 
+/**
+ * A snapshot of player throughput + buffering, emitted on the `stats` event a couple of times a
+ * second (and only while a file is loaded). Combines worker-side counters (network reads, encoder
+ * backlog) with main-thread state (the MSE buffer and the fetch frontier) into one view a UI can
+ * render directly. Byte counts are cumulative; `bandwidthBps` is the instantaneous download rate.
+ */
+export interface PlayerStats {
+  /** Cumulative bytes downloaded/read since this file loaded. */
+  bytesTotal: number;
+  /** Instantaneous download rate (bytes/sec), measured from the byte-total delta between samples. */
+  bandwidthBps: number;
+  /** Range reads in flight right now (open HTTP fetches; 0 for a picked File — no network). */
+  requestsInFlight: number;
+  /** Cumulative completed reads. */
+  requestsTotal: number;
+  /**
+   * Seconds of contiguous video buffered and PLAYABLE ahead of the playhead (post-encode, in MSE).
+   * The green segment of a buffer bar. Saturates near `maxBufferSeconds`.
+   */
+  mseBufferedSeconds: number;
+  /**
+   * Seconds of media REQUESTED ahead of the playhead (the fetch frontier minus the playhead). Always
+   * ≥ `mseBufferedSeconds`; the excess is in flight / decoding / encoding but not yet playable — the
+   * amber segment of a buffer bar.
+   */
+  requestedAheadSeconds: number;
+  /** Forward buffer target the player fetches up to (the bar's max). */
+  maxBufferSeconds: number;
+  /** Frames queued in the encoder (decoded YUV awaiting encode). MPEG-2/transcode path only; 0 else. */
+  encodeQueueSize: number;
+  /** True when video is being transcoded (MPEG-2 decode→encode); false for the H.264 remux path. */
+  transcoding: boolean;
+}
+
 export interface MxfPlayerEvents {
   manifest: ManifestData;
+  /**
+   * Periodic throughput + buffering telemetry for a stats UI — see {@link PlayerStats}. Emitted a
+   * couple of times a second while a file is loaded; never between loads. Purely informational
+   * (driving it has no effect on playback).
+   */
+  stats: PlayerStats;
   error: { message: string; fatal: boolean };
   /**
    * Fired when the player's buffering STATE changes (not on every tick). `buffering: true` means

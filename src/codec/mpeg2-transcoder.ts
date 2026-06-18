@@ -374,6 +374,9 @@ export class Mpeg2Transcoder {
   get spspps(): SpsppsPair | null { return this._spspps; }
   /** Codec string from decoderConfig (e.g. "avc1.4d4028"), or null if not yet available. */
   get codecStr(): string | null { return this._codecStr; }
+  /** Frames currently queued in the WebCodecs encoder (decoded YUV awaiting encode). A live gauge of
+   *  the decode→encode backlog; spikes during a segment's decode burst and drains on flush(). */
+  get encodeQueueSize(): number { return this.encoder.encodeQueueSize; }
 
   /** Encoder (output) coded dimensions — may differ from source when scaleFactor < 1. */
   get encoderCodW(): number { return this.codedWidth; }
