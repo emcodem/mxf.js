@@ -1,13 +1,22 @@
-import { ILoader, logRead } from './loader.js';
+import { ILoader, LoaderStats, logRead } from './loader.js';
 
 export class FileLoader implements ILoader {
   private readonly file: File;
   readonly fileSize: Promise<number>;
   private readStats = { count: 0, total: 0 };
+  // Cumulative bytes read from the File (no network here, so requestsInFlight is always 0).
+  private bytesTotal = 0;
+  private requestsTotal = 0;
 
   constructor(file: File) {
     this.file = file;
     this.fileSize = Promise.resolve(file.size);
+  }
+
+  /** Traffic counters. A picked File is read locally (no network), so in-flight stays 0; bytesTotal
+   *  still reflects how much of the file the pipeline has pulled. */
+  getStats(): LoaderStats {
+    return { bytesTotal: this.bytesTotal, requestsInFlight: 0, requestsTotal: this.requestsTotal };
   }
 
   fetchRange(start: number, end: number, reason = '', signal?: AbortSignal): Promise<ArrayBuffer> {
@@ -20,8 +29,11 @@ export class FileLoader implements ILoader {
       signal?.addEventListener('abort', onAbort, { once: true });
       reader.onload = () => {
         signal?.removeEventListener('abort', onAbort);
+        const buf = reader.result as ArrayBuffer;
+        this.bytesTotal += buf.byteLength;
+        this.requestsTotal++;
         logRead('File', start, end, reason, performance.now() - t0, this.readStats);
-        resolve(reader.result as ArrayBuffer);
+        resolve(buf);
       };
       reader.onerror = () => {
         signal?.removeEventListener('abort', onAbort);

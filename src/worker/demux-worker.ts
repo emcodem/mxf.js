@@ -177,6 +177,25 @@ function post(event: WorkerEvent, transferables: Transferable[] = []): void {
   self.postMessage(event, transferables);
 }
 
+// ── Stats telemetry ──────────────────────────────────────────────────────────
+// Push worker-side counters (loader traffic + encoder backlog) to the player a couple of times a
+// second while a file is loaded, so it can drive a stats display. One interval per worker (a worker
+// is created fresh per file load and terminated on teardown, so the timer is torn down with it). No
+// transferables — small POD payload, cheap; skipped entirely until a loader exists.
+const STATS_INTERVAL_MS = 500;
+setInterval(() => {
+  if (!loader) return;
+  const s = loader.getStats?.() ?? { bytesTotal: 0, requestsInFlight: 0, requestsTotal: 0 };
+  post({
+    type: 'workerStats',
+    bytesTotal: s.bytesTotal,
+    requestsInFlight: s.requestsInFlight,
+    requestsTotal: s.requestsTotal,
+    encodeQueueSize: transcodePipeline?.encodeQueueSize ?? 0,
+    transcoding: transcodePipeline !== null,
+  });
+}, STATS_INTERVAL_MS);
+
 /**
  * Compress per-frame System Item timecodes into the minimal set of anchors: keep the first, then
  * keep only frames whose timecode breaks linear continuation from the previous kept anchor (a

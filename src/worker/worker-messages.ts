@@ -247,4 +247,22 @@ export type WorkerEvent =
       nextEditUnit: number;
       reusedHeader: boolean;
     }
+  | {
+      /** Periodic worker-side telemetry for a stats display (posted ~every STATS_INTERVAL_MS while a
+       *  file is loaded). Carries what only the worker can see — network/read counters from the loader
+       *  and the transcode encoder backlog. The player merges in the MSE buffer + fetch frontier (which
+       *  only it can see) and re-emits a unified `stats` event. */
+      type: 'workerStats';
+      /** Cumulative bytes read by the loader (HTTP range reads, or File slices). */
+      bytesTotal: number;
+      /** Reads in flight right now (open HTTP range fetches; 0 for the File API). */
+      requestsInFlight: number;
+      /** Cumulative completed reads. */
+      requestsTotal: number;
+      /** Frames queued in the encoder (decoded YUV awaiting encode). 0 when not transcoding. */
+      encodeQueueSize: number;
+      /** True when an MPEG-2 / wasm transcode pipeline is active (decode+encode path); false for the
+       *  H.264 remux path, where there is no decode/encode stage. */
+      transcoding: boolean;
+    }
   | { type: 'error'; message: string; fatal: boolean };

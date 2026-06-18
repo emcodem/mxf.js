@@ -29,6 +29,8 @@ export interface ITranscodePipeline {
   readonly displayWidth: number;
   readonly displayHeight: number;
   readonly codecString: string;
+  /** Frames queued in the encoder (decoded, awaiting encode) — the decode→encode backlog gauge. */
+  readonly encodeQueueSize: number;
   reset(toFrame: number, useDisplayBase?: boolean): void;
   decodeSegment(
     videoFrames: PipelineInputFrame[],
@@ -192,6 +194,8 @@ export class Mpeg2Pipeline {
     const l = this.sps[3].toString(16).padStart(2, '0');
     return `avc1.${p}${c}${l}`;
   }
+
+  get encodeQueueSize(): number { return this.transcoder.encodeQueueSize; }
 
   /**
    * Reset to a seek target: drop the decoder's reference frames (the post-seek fetch starts at a

@@ -1,4 +1,4 @@
-import { ILoader, logRead } from './loader.js';
+import { ILoader, LoaderStats, logRead } from './loader.js';
 
 /** Total attempts for a single range read before giving up (1 initial try + retries). */
 const FETCH_RETRIES = 3;
@@ -25,10 +25,19 @@ export class HttpLoader implements ILoader {
   /** Controllers for in-flight reads, so destroy() can abort them all (teardown / new file). */
   private readonly inflight = new Set<AbortController>();
   private readStats = { count: 0, total: 0 };
+  // Always-on traffic counters (independent of the MXFJS_LOG_READS logger). Cumulative bytes/reads
+  // that actually completed; in-flight is the live size of `inflight`. Surfaced via getStats().
+  private bytesTotal = 0;
+  private requestsTotal = 0;
 
   constructor(url: string) {
     this.url = url;
     this.fileSize = this.fetchFileSize();
+  }
+
+  /** Traffic counters for a stats display. In-flight is the count of open range reads right now. */
+  getStats(): LoaderStats {
+    return { bytesTotal: this.bytesTotal, requestsInFlight: this.inflight.size, requestsTotal: this.requestsTotal };
   }
 
   private async fetchFileSize(): Promise<number> {
@@ -124,6 +133,8 @@ export class HttpLoader implements ILoader {
             lastErr = err; if (attempt < FETCH_RETRIES - 1) await this.backoff(attempt, ac.signal); continue; // 5xx
           }
           const buf = await res.arrayBuffer(); // can also reject on a mid-body network drop
+          this.bytesTotal += buf.byteLength;
+          this.requestsTotal++;
           logRead('HTTP', start, end, reason, performance.now() - t0, this.readStats);
           return buf;
         } catch (e) {

@@ -88,6 +88,28 @@
                   transition: height 0.05s linear; }
     .vu-fill.muted { background: #6a6a6a; }
     /* ─── END VU METER ──────────────────────────────────────────────────────────────────────── */
+
+    /* ─── STATS PANEL ─────────────────────────────────────────────────────────────────────────
+       Live throughput + buffer view, fed by the player's `stats` event (worker network/encoder
+       counters merged with the main-thread MSE buffer + fetch frontier). The bar is scaled to the
+       player's maxBufferSeconds: green = video decoded+encoded and PLAYABLE in MSE; amber = media
+       requested/in-flight/transcoding but not yet playable. The encoder-queue gauge appears only
+       while transcoding (MPEG-2). */
+    #statsPanel { max-width: 960px; margin: 12px 0 16px; font: 12px/1.5 system-ui, sans-serif; color: #aaa; }
+    #statsPanel .stats-row { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; }
+    #statsPanel b { color: #ddd; font-variant-numeric: tabular-nums; }
+    #statsPanel .gauge { color: #888; }
+    #statsPanel .gauge b { color: #4af; }
+    .buf-track { position: relative; height: 18px; background: #1c1c1c; border: 1px solid #333;
+                 border-radius: 3px; overflow: hidden; }
+    .buf-seg { position: absolute; top: 0; bottom: 0; transition: width .2s linear, left .2s linear; }
+    .buf-seg.mse { left: 0; background: #19c37d; }            /* playable (post-encode, in MSE) */
+    .buf-seg.inflight { background: #c9852b; opacity: .85; }  /* requested / in pipeline (pre-MSE) */
+    .buf-max { position: absolute; right: 5px; top: 2px; font-size: 10px; color: #777; pointer-events: none; }
+    .stats-legend { display: flex; gap: 16px; margin-top: 6px; font-size: 11px; color: #777; }
+    .stats-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+                      margin-right: 5px; vertical-align: -1px; }
+    /* ─── END STATS PANEL ─────────────────────────────────────────────────────────────────────── */
   </style>
 </head>
 <body>
@@ -134,6 +156,25 @@
   <div style="color:#666; font-size:12px; max-width:960px; margin:4px 0 12px;">
     Keys: <code>Space</code> play/pause · <code>J</code>/<code>L</code> rewind/forward (press to speed up) ·
     <code>K</code> stop · <code>←</code>/<code>→</code> frame step · <code>↑</code>/<code>↓</code> ±10s
+  </div>
+
+  <div id="statsPanel">
+    <div class="stats-row">
+      <span>↓ <b id="stRate">0.0 Mbit/s</b></span>
+      <span class="gauge">requests in flight: <b id="stInflight">0</b></span>
+      <span class="gauge">downloaded: <b id="stTotal" style="color:#ddd">0 B</b> (<b id="stReqs">0</b> reads)</span>
+      <span class="gauge" id="stEnc" title="Decoded frames queued in the H.264 encoder (decode → encode backlog)">encoder queue: <b id="stEncN">0</b> frames</span>
+    </div>
+    <div class="buf-track" id="bufTrack"
+         title="Forward video buffer ahead of the playhead. Green: decoded + encoded, playable in MSE. Amber: requested / downloading / transcoding, not yet playable.">
+      <div class="buf-seg mse" id="bufMse"></div>
+      <div class="buf-seg inflight" id="bufInflight"></div>
+      <span class="buf-max" id="bufMax">max 8s</span>
+    </div>
+    <div class="stats-legend">
+      <span><i style="background:#19c37d"></i>playable (in MSE) <b id="stMseS">0.0s</b></span>
+      <span><i style="background:#c9852b"></i>in flight / transcoding <b id="stFlightS">0.0s</b></span>
+    </div>
   </div>
 
   <div id="audioChannels" style="display:none; margin:8px 0; font:13px/1.6 system-ui,sans-serif;">
@@ -189,6 +230,20 @@
     const volumeEl        = document.getElementById('volume');
     const volumeValEl     = document.getElementById('volumeVal');
     const bufferingOverlay = document.getElementById('bufferingOverlay');
+    // Stats panel element refs (populated from the player's `stats` event — see renderStats).
+    const st = {
+      rate: document.getElementById('stRate'),
+      inflight: document.getElementById('stInflight'),
+      total: document.getElementById('stTotal'),
+      reqs: document.getElementById('stReqs'),
+      enc: document.getElementById('stEnc'),
+      encN: document.getElementById('stEncN'),
+      bufMse: document.getElementById('bufMse'),
+      bufInflight: document.getElementById('bufInflight'),
+      bufMax: document.getElementById('bufMax'),
+      mseS: document.getElementById('stMseS'),
+      flightS: document.getElementById('stFlightS'),
+    };
     let player = null;
     let seeking = false;
     let fps = 25;   // updated from the manifest; used for frame-step (arrow) keys
@@ -552,6 +607,51 @@
       return `${m}:${Math.floor(s % 60).toString().padStart(2, '0')}`;
     }
 
+    // ── Stats panel ───────────────────────────────────────────────────────────────────────────
+    // Render one PlayerStats snapshot (see src/events.ts). The bar is scaled to maxBufferSeconds:
+    // green = mseBufferedSeconds (playable, post-encode); amber = requestedAhead − mse (in flight /
+    // transcoding, not yet playable), stacked after the green segment. The encoder-queue gauge is
+    // shown only while transcoding (MPEG-2) — the H.264 remux path has no encode stage.
+    function fmtBytes(n) {
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+      return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+    }
+    function fmtRate(bps) {
+      const mbit = (bps * 8) / 1e6;
+      if (mbit >= 1) return `${mbit.toFixed(1)} Mbit/s`;
+      if (bps >= 1) return `${((bps * 8) / 1e3).toFixed(0)} kbit/s`;
+      return '0.0 Mbit/s';
+    }
+    function renderStats(s) {
+      st.rate.textContent = fmtRate(s.bandwidthBps);
+      st.inflight.textContent = s.requestsInFlight;
+      st.total.textContent = fmtBytes(s.bytesTotal);
+      st.reqs.textContent = s.requestsTotal;
+      st.enc.style.display = s.transcoding ? '' : 'none';
+      st.encN.textContent = s.encodeQueueSize;
+      const max = s.maxBufferSeconds || 1;
+      const msePct = Math.max(0, Math.min(100, (s.mseBufferedSeconds / max) * 100));
+      const flightSec = Math.max(0, s.requestedAheadSeconds - s.mseBufferedSeconds);
+      const flightPct = Math.max(0, Math.min(100 - msePct, (flightSec / max) * 100));
+      st.bufMse.style.width = `${msePct}%`;
+      st.bufInflight.style.left = `${msePct}%`;
+      st.bufInflight.style.width = `${flightPct}%`;
+      st.bufMax.textContent = `max ${max}s`;
+      st.mseS.textContent = `${s.mseBufferedSeconds.toFixed(1)}s`;
+      st.flightS.textContent = `${flightSec.toFixed(1)}s`;
+    }
+    // Blank the panel back to idle (new load / teardown), reusing the demo's maxBufferSeconds (8s).
+    function resetStats() {
+      renderStats({
+        bytesTotal: 0, bandwidthBps: 0, requestsInFlight: 0, requestsTotal: 0,
+        mseBufferedSeconds: 0, requestedAheadSeconds: 0, maxBufferSeconds: 8,
+        encodeQueueSize: 0, transcoding: false,
+      });
+    }
+    resetStats();
+
     function log(msg, cls = 'info') {
       const line = document.createElement('div');
       line.className = cls;
@@ -575,6 +675,7 @@
       audioChannelsEl.style.display = 'none';
       channelBoxesEl.innerHTML = '';
       vu.reset();   // --- VU METER --- tear down meters/chunks from the previous file
+      resetStats(); // blank the throughput/buffer panel for the new load
       playBtn.disabled = true;
       seekBar.value = 0;
       timeCur.textContent = '0:00';
@@ -661,6 +762,9 @@
 
       // --- VU METER --- feed decoded interleaved PCM (all channels) to the per-channel meters.
       player.on('pcm-audio', (e) => vu.feed(e));
+
+      // Throughput + buffer telemetry → stats panel (fires ~2×/s while a file is loaded).
+      player.on('stats', renderStats);
 
       if (E2E) {
         window.__mxfPlayer = player;

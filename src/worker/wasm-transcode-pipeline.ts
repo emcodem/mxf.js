@@ -113,6 +113,8 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
     return `avc1.${p}${c}${l}`;
   }
 
+  get encodeQueueSize(): number { return this.transcoder.encodeQueueSize; }
+
   // `useDisplayBase` is accepted for interface parity with the JS pipeline but unused: the wasm decoder
   // reorders internally and does not expose per-picture temporal_reference, so it cannot relabel to the
   // keyframe's true presentation edit unit. Seek labelling stays storage-based for this path.
