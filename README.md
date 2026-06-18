@@ -106,7 +106,9 @@ npm run dev        # Vite dev server at http://localhost:5173
 ```
 
 ### Browser requirements
-- **Chrome / Chromium-based browser.** The MPEG-2 path needs the WebCodecs `VideoEncoder`; native H.264 4:2:2 playback needs Chrome's proprietary-codec build. Firefox/Safari are untested and will at minimum lack the codec support required for the transcode path.
+- **Chrome / Chromium-based browser.** The MPEG-2 path needs the WebCodecs `VideoEncoder`. Native H.264 4:2:2 playback works in Chrome (tested on Windows and Android).
+- **Safari** is now tested (16.x): the MPEG-2 transcode path works via a VideoEncoder ½-scale fallback. See `test/e2e/safari.test.ts`.
+- **Firefox** is untested and will at minimum lack the codec support required for the transcode path.
 - Served over HTTP(S) (Web Workers and MSE require it — `file://` won't work).
 
 ---
