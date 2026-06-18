@@ -43,6 +43,8 @@ jobs:
           mkdir -p _site
           cp -r dist _site/dist
           cp -r demo _site/demo
+          # The demo's default source is ../media/…; copy media/ so it resolves.
+          cp -r media _site/media
           cat > _site/index.html <<'HTML'
           <!doctype html><meta charset="utf-8">
           <meta http-equiv="refresh" content="0; url=./demo/">
