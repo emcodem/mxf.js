@@ -217,6 +217,12 @@ export type WorkerEvent =
       type: 'liveUpdate';
       grew: boolean;
       atEdge: boolean;
+      /** Poll replies only (undefined on fetch replies): true when the SOURCE FILE itself grew since the
+       *  last poll — i.e. the recording is still being written. The player uses this to suppress the
+       *  'live-end' (file-complete) signal: reaching the reader's edge on a still-growing single file is a
+       *  transient catch-up, not completion. A closed file stops growing → poll reports false → live-end
+       *  can fire. */
+      sourceGrowing?: boolean;
       /** The continuous OUTPUT frontier — the edit unit AFTER the last video frame actually emitted to
        *  MSE (display order, so it trails the bytes the reader has consumed by the transcode reorder
        *  depth). The player adopts it as the forward-fetch frontier and, at a file switch, as the next

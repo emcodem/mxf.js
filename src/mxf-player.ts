@@ -214,6 +214,9 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private liveInFlight: number[] = [];
   // Consecutive at-edge polls with no growth — used (with a ready standby) to declare the file done.
   private liveStallPolls = 0;
+  // Last poll's source-file-size verdict: true while the recording is still being written. Suppresses
+  // 'live-end' (a still-growing single file never "completes" — reaching the reader's edge is transient).
+  private liveSourceGrowing = false;
   private readonly LIVE_POLL_MS = 1000;
   private readonly LIVE_STALL_MAX = 3;
   private livePollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -819,6 +822,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.liveMode = event.live ?? false;
     this.liveAtEdge = false;
     this.liveStallPolls = 0;
+    this.liveSourceGrowing = false;
     const effectiveDuration = this.liveMode ? Infinity : event.duration;
 
     // Cache this file's essence layout for a header-reuse continuation onto the next contiguous file.
@@ -1286,6 +1290,13 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.nextFetchFrame = event.nextEditUnit; // authoritative frontier — never over/under-counts
     this.liveAtEdge = event.atEdge;
 
+    // Poll replies carry the authoritative source-file-size verdict (fetch replies leave it undefined).
+    // A growing source can't be "complete", so re-arm the live-end latch if it had fired spuriously.
+    if (event.sourceGrowing !== undefined) {
+      this.liveSourceGrowing = event.sourceGrowing;
+      if (event.sourceGrowing) this.liveEndEmitted = false;
+    }
+
     if (event.atEdge) {
       this.liveStallPolls = event.grew ? 0 : this.liveStallPolls + 1;
       if (this.maybeCompleteLive()) return; // switched to next file — that path resumes fetching
@@ -1329,6 +1340,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       return true;
     }
     if (this.liveStallPolls < this.LIVE_STALL_MAX) return false;
+    // Single still-growing source: the last poll saw the file get bigger, so reaching the reader's edge
+    // is a transient catch-up, not completion. Don't emit live-end — the next poll will find more bytes.
+    // (A closed/rotated file stops growing → poll reports sourceGrowing=false → this guard lifts.)
+    if (this.liveSourceGrowing) return false;
     if (!this.liveEndEmitted) { this.liveEndEmitted = true; this.emit('live-end', undefined as unknown as void); }
     return false;
   }
@@ -1579,6 +1594,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.liveAtEdge = false;
     this.liveStallPolls = 0;
     this.liveEndEmitted = false;
+    // New file's growth verdict is unknown until its first poll; clear so a stale "growing" from the
+    // old file can't linger (the next pollLive re-confirms it within a cycle, well before live-end's
+    // LIVE_STALL_MAX could fire). Keeps the reset uniform with onManifest/reanchorToStandby.
+    this.liveSourceGrowing = false;
     this.fetchPending = false;
     // New file: the previous file's pipelined fetches are done with (worker swapped, or reader reset
     // to the seam base). Clear the in-flight queue so the next file's pipeline starts empty — a stale
@@ -1650,6 +1669,10 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.liveAtEdge = false;
     this.liveStallPolls = 0;
     this.liveEndEmitted = false;
+    // New file's growth verdict is unknown until its first poll; clear so a stale "growing" from the
+    // old file can't linger (the next pollLive re-confirms it within a cycle, well before live-end's
+    // LIVE_STALL_MAX could fire). Keeps the reset uniform with onManifest/reanchorToStandby.
+    this.liveSourceGrowing = false;
     this.fetchPending = false;
     // New file: the previous file's pipelined fetches are done with (worker swapped, or reader reset
     // to the seam base). Clear the in-flight queue so the next file's pipeline starts empty — a stale
@@ -1751,7 +1774,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.nextFetchFrame = 0; this.seqBase = 0;
     this.fetchPending = false; this.bufferFull = false; this.previewParked = false;
     this.liveInFlight = []; // old worker terminated — drop its in-flight pipeline slots (see onLiveUpdate)
-    this.liveAtEdge = false; this.liveStallPolls = 0; this.liveEndEmitted = false;
+    this.liveAtEdge = false; this.liveStallPolls = 0; this.liveSourceGrowing = false; this.liveEndEmitted = false;
     this.reuseNextArmed = false; this.pendingNextUrl = null;
     // Catch-up is satisfied by landing at the edge: clear speed/jump state (audio.destroy() above
     // already reset the scheduler's rate; restore the element's too).
@@ -1806,6 +1829,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.liveMode = false;
     this.liveAtEdge = false;
     this.liveStallPolls = 0;
+    this.liveSourceGrowing = false;
     this.liveInFlight = [];
     this.liveEndEmitted = false;
     this.catchupActive = false;

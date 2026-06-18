@@ -1407,7 +1407,10 @@ async function handlePollLive(): Promise<void> {
   if (grew) liveLastSize = newSize;
   const atEdge = !grew && (liveReader ? liveReader.cursor >= newSize : true);
   if (workerDebug) console.log(`[live] poll: size ${newSize} grew=${grew} cursor=${liveReader?.cursor ?? '-'} atEdge=${atEdge} frontier=${liveOutputFrontier}`);
-  post({ type: 'liveUpdate', grew, atEdge, nextEditUnit: liveOutputFrontier });
+  // sourceGrowing carries the file-size delta distinctly from `grew` (which, on this poll reply, happens
+  // to equal it — but on FETCH replies `grew` means "frames produced", a different thing). The player
+  // keys live-end suppression off sourceGrowing, so only the poll's authoritative file-size signal sets it.
+  post({ type: 'liveUpdate', grew, atEdge, nextEditUnit: liveOutputFrontier, sourceGrowing: grew });
 }
 
 // Command dispatch: one handler per command type. Each handler's parameter is narrowed to the
