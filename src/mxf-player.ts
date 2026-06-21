@@ -1143,9 +1143,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     );
     this.pendingSeeks++;
 
-    // Stop audio scheduled for the old position and drop the anchor so the scheduler re-locks to the
-    // new playhead — otherwise audio keeps playing at the pre-seek offset.
-    this.audio.onSeek();
+    // Drop the residual look-ahead so video can't coast on a prior-playthrough buffer while audio
+    // refetches over the network (the post-seek "audio drops, picture keeps moving" silent-video
+    // dropout). Clearing the forward video buffer AND the audio PCM store makes both tracks refill
+    // in lockstep from the shared fetch frontier, so when the network can't keep up they starve and
+    // rebuffer TOGETHER via the native 'waiting' → maybeResumePlayback gate (which already requires
+    // both tracks). flush() also drops the anchor so the scheduler re-locks to the new playhead.
+    // The cheap in-buffer seek path keeps audio.onSeek() (store preserved) for an instant re-seek.
+    this.mseController?.clearForward(targetTime);
+    this.audio.flush();
 
     const cmd: WorkerCommand = { type: 'seek', targetFrame: this.seekTargetFrame };
     this.worker!.postMessage(cmd);

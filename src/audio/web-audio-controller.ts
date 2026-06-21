@@ -171,6 +171,16 @@ export class WebAudioController {
     this.unlock('seek');
   }
 
+  /** Discard the entire decoded-PCM store and unlock. Used on a real seek (not the cheap in-buffer
+   *  seek, which keeps the store via onSeek) so audio refills from the fetch frontier in lockstep
+   *  with the also-cleared video buffer — neither track can coast ahead of the other. No-op for
+   *  non-Web-Audio files (empty store, no context). */
+  flush(): void {
+    this.stopSources();
+    this.store = [];
+    this.unlock('seek');
+  }
+
   /** Total number of PCM channels in the loaded file (0 until audio starts arriving). */
   get channels(): number {
     return this.channelCount;

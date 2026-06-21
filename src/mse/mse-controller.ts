@@ -93,6 +93,24 @@ export class MseController extends EventEmitter<MseControllerEvents> {
   }
 
   /**
+   * Remove buffered media AHEAD of `fromTime` on every track, keeping the frame at `fromTime`
+   * painted so the seeked picture still jumps instantly. Called on a real seek so video can't coast
+   * on a residual look-ahead buffer (a prior playthrough) while the Web-Audio PCM store refetches —
+   * the "audio drops, picture keeps moving" post-seek dropout. With the forward residual gone, both
+   * tracks refill in lockstep from the shared fetch frontier and the resume/`waiting` gate rebuffers
+   * them together. The back buffer is left intact (it doesn't cause the drop and keeps instant
+   * backward re-seeks cheap).
+   */
+  clearForward(fromTime: number): void {
+    const keep = fromTime + 0.05; // keep the displayed seek frame; drop everything past it
+    for (const [type, sb] of this.sourceBuffers) {
+      if (sb.buffered.length === 0) continue;
+      const end = sb.buffered.end(sb.buffered.length - 1);
+      if (end > keep) this.evict(type, keep, end);
+    }
+  }
+
+  /**
    * Evict already-played media older than `BACK_BUFFER_SECONDS` behind `currentTime` on every track,
    * keeping the resident buffer bounded. Called as playback advances. No-op if there's nothing old
    * enough to remove.
