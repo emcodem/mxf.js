@@ -105,6 +105,8 @@
     .buf-seg { position: absolute; top: 0; bottom: 0; transition: width .2s linear, left .2s linear; }
     .buf-seg.mse { left: 0; background: #19c37d; }            /* playable (post-encode, in MSE) */
     .buf-seg.inflight { background: #c9852b; opacity: .85; }  /* requested / in pipeline (pre-MSE) */
+    .buf-seg.cache { left: 0; background: #4a90e2; }          /* raw source bytes held in the worker cache */
+    .buf-sublabel { margin-top: 10px; font-size: 11px; color: #777; }
     .buf-max { position: absolute; right: 5px; top: 2px; font-size: 10px; color: #777; pointer-events: none; }
     .stats-legend { display: flex; gap: 16px; margin-top: 6px; font-size: 11px; color: #777; }
     .stats-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
@@ -175,6 +177,18 @@
       <span><i style="background:#19c37d"></i>playable (in MSE) <b id="stMseS">0.0s</b></span>
       <span><i style="background:#c9852b"></i>in flight / transcoding <b id="stFlightS">0.0s</b></span>
     </div>
+
+    <div id="cacheRow" style="display:none">
+      <div class="buf-sublabel">Raw source cache (worker) — compressed bytes kept so backward seeks don't re-download</div>
+      <div class="buf-track" id="cacheTrack"
+           title="Raw (compressed) MXF source bytes held in the worker's LRU cache (maxSourceCacheBytes). Fills as the file is read; a full file that fits the budget makes re-seeks network-free. Distinct from the decoded video buffer above.">
+        <div class="buf-seg cache" id="cacheFill"></div>
+        <span class="buf-max" id="cacheMax">0 MB</span>
+      </div>
+      <div class="stats-legend">
+        <span><i style="background:#4a90e2"></i>raw source cached <b id="stCacheB">0 B</b> of <b id="stCacheMaxB">0 B</b></span>
+      </div>
+    </div>
   </div>
 
   <div id="audioChannels" style="display:none; margin:8px 0; font:13px/1.6 system-ui,sans-serif;">
@@ -243,6 +257,11 @@
       bufMax: document.getElementById('bufMax'),
       mseS: document.getElementById('stMseS'),
       flightS: document.getElementById('stFlightS'),
+      cacheRow: document.getElementById('cacheRow'),
+      cacheFill: document.getElementById('cacheFill'),
+      cacheMax: document.getElementById('cacheMax'),
+      cacheB: document.getElementById('stCacheB'),
+      cacheMaxB: document.getElementById('stCacheMaxB'),
     };
     let player = null;
     let seeking = false;
@@ -641,6 +660,20 @@
       st.bufMax.textContent = `max ${max}s`;
       st.mseS.textContent = `${s.mseBufferedSeconds.toFixed(1)}s`;
       st.flightS.textContent = `${flightSec.toFixed(1)}s`;
+
+      // Raw source cache fill (worker-side LRU of compressed bytes). Hidden when the cache is off or
+      // in live mode (sourceCacheMaxBytes === 0).
+      const cacheMax = s.sourceCacheMaxBytes || 0;
+      if (cacheMax > 0) {
+        st.cacheRow.style.display = '';
+        const cachePct = Math.max(0, Math.min(100, (s.sourceCacheBytes / cacheMax) * 100));
+        st.cacheFill.style.width = `${cachePct}%`;
+        st.cacheMax.textContent = fmtBytes(cacheMax);
+        st.cacheB.textContent = fmtBytes(s.sourceCacheBytes || 0);
+        st.cacheMaxB.textContent = fmtBytes(cacheMax);
+      } else {
+        st.cacheRow.style.display = 'none';
+      }
     }
     // Blank the panel back to idle (new load / teardown), reusing the demo's maxBufferSeconds (8s).
     function resetStats() {
@@ -648,6 +681,7 @@
         bytesTotal: 0, bandwidthBps: 0, requestsInFlight: 0, requestsTotal: 0,
         mseBufferedSeconds: 0, requestedAheadSeconds: 0, maxBufferSeconds: 8,
         encodeQueueSize: 0, transcoding: false,
+        sourceCacheBytes: 0, sourceCacheMaxBytes: 0,
       });
     }
     resetStats();

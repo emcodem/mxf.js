@@ -53,9 +53,12 @@ export type WorkerCommand =
       /** Live mode: start reading from the essence container START rather than near EOF. False (the
        *  default) for the FIRST file (jump to its live edge); true for a rotated NEXT file, which just
        *  began recording so its beginning IS the live point and is contiguous with the previous file. */
-      liveFromStart?: boolean }
+      liveFromStart?: boolean;
+      /** Max bytes of raw source to cache in the worker (0 = off; ignored in live mode). See
+       *  MxfConfig.maxSourceCacheBytes. */
+      cacheBytes?: number }
   | { type: 'initFile'; file: File; debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig };
-      live?: boolean; startEditUnit?: number; liveFromStart?: boolean }
+      live?: boolean; startEditUnit?: number; liveFromStart?: boolean; cacheBytes?: number }
   | {
       type: 'fetchSegment';
       startFrame: number;
@@ -264,5 +267,9 @@ export type WorkerEvent =
       /** True when an MPEG-2 / wasm transcode pipeline is active (decode+encode path); false for the
        *  H.264 remux path, where there is no decode/encode stage. */
       transcoding: boolean;
+      /** Raw source bytes currently held by the worker-side source cache (0 if the cache is off/live). */
+      sourceCacheBytes: number;
+      /** The source cache's byte budget (0 if the cache is off/live). See MxfConfig.maxSourceCacheBytes. */
+      sourceCacheMaxBytes: number;
     }
   | { type: 'error'; message: string; fatal: boolean };

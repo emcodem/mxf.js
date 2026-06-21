@@ -55,6 +55,15 @@ export interface MxfConfig {
    * thin/decode-bound source; larger = slower resume but smoother once playing. Default 0.75.
    */
   resumeBufferSeconds?: number;
+  /**
+   * Maximum RAM (in bytes) the worker may use to cache raw, compressed source bytes already fetched
+   * from the network / file, so backward seeks, loops and scrub-revisits don't re-download bytes we
+   * already had. This caches the SOURCE essence (small, compressed), independent of the decoded
+   * fMP4 held by MSE. A whole moderate file often fits, making re-seeks network-free. Set to 0 to
+   * disable. Has no effect in live mode (growing recordings are never cached). Default 256 MB.
+   * (Deliberately not named "...Buffer" — `SourceBuffer` is the MSE class, a different thing.)
+   */
+  maxSourceCacheBytes?: number;
   debug?: boolean;
   /**
    * Open files via loadLive() as growing live recordings: the index is ignored, playback starts near
@@ -127,6 +136,7 @@ const DEFAULT_CONFIG: Required<MxfConfig> = {
   pcmAudioMode: 'auto',
   seekMode: 'accurate',
   resumeBufferSeconds: RESUME_BUFFER_SECONDS,
+  maxSourceCacheBytes: 256 * 1024 * 1024,
   debug: false,
   live: false,
   liveCatchupStrategy: 'speed',
@@ -621,7 +631,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.setup();
     const plugins = this.config.plugins?.videoDecoder
       ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
-    const cmd: WorkerCommand = { type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins };
+    const cmd: WorkerCommand = { type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins, cacheBytes: this.config.maxSourceCacheBytes };
     this.worker!.postMessage(cmd);
   }
 
@@ -655,7 +665,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.setup();
     const plugins = this.config.plugins?.videoDecoder
       ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
-    const cmd: WorkerCommand = { type: 'initFile', file, debug: this.config.debug, videoMode: 'mse', plugins };
+    const cmd: WorkerCommand = { type: 'initFile', file, debug: this.config.debug, videoMode: 'mse', plugins, cacheBytes: this.config.maxSourceCacheBytes };
     this.worker!.postMessage(cmd);
   }
 
@@ -1232,6 +1242,8 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       maxBufferSeconds: this.config.maxBufferSeconds,
       encodeQueueSize: s.encodeQueueSize,
       transcoding: s.transcoding,
+      sourceCacheBytes: s.sourceCacheBytes,
+      sourceCacheMaxBytes: s.sourceCacheMaxBytes,
     });
   }
 

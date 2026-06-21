@@ -84,6 +84,15 @@ export interface PlayerStats {
   encodeQueueSize: number;
   /** True when video is being transcoded (MPEG-2 decode→encode); false for the H.264 remux path. */
   transcoding: boolean;
+  /**
+   * Raw (compressed) source bytes currently held by the worker-side source cache — see
+   * {@link MxfConfig.maxSourceCacheBytes}. This is the SOURCE essence already fetched and kept so
+   * backward seeks don't re-download; distinct from `mseBufferedSeconds` (decoded fMP4). `0` when the
+   * cache is disabled or in live mode.
+   */
+  sourceCacheBytes: number;
+  /** The source cache's byte budget (`maxSourceCacheBytes`); the cache bar's max. `0` when off/live. */
+  sourceCacheMaxBytes: number;
 }
 
 export interface MxfPlayerEvents {

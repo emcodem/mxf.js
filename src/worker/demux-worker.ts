@@ -1,6 +1,7 @@
 import { HttpLoader } from '../loader/http-loader.js';
 import { FileLoader } from '../loader/file-loader.js';
 import { ILoader } from '../loader/loader.js';
+import { wrapWithSourceCache, CachingLoader } from '../loader/caching-loader.js';
 import { MxfFile } from '../mxf-file.js';
 import type { MxfBootstrap } from '../mxf-file.js';
 import { EssenceExtractor, LiveSequentialReader } from '../essence/essence-extractor.js';
@@ -186,6 +187,7 @@ const STATS_INTERVAL_MS = 500;
 setInterval(() => {
   if (!loader) return;
   const s = loader.getStats?.() ?? { bytesTotal: 0, requestsInFlight: 0, requestsTotal: 0 };
+  const cache = loader instanceof CachingLoader ? loader.getCacheStats() : null;
   post({
     type: 'workerStats',
     bytesTotal: s.bytesTotal,
@@ -193,6 +195,8 @@ setInterval(() => {
     requestsTotal: s.requestsTotal,
     encodeQueueSize: transcodePipeline?.encodeQueueSize ?? 0,
     transcoding: transcodePipeline !== null,
+    sourceCacheBytes: cache?.cachedBytes ?? 0,
+    sourceCacheMaxBytes: cache?.maxBytes ?? 0,
   });
 }, STATS_INTERVAL_MS);
 
@@ -1442,12 +1446,14 @@ const commandHandlers: CommandHandlers = {
   initUrl: (cmd) => {
     videoMode = cmd.videoMode ?? 'mse';
     activePluginConfig = cmd.plugins?.videoDecoder ?? null;
-    handleInit(new HttpLoader(cmd.url), cmd.debug, cmd.live, cmd.startEditUnit, cmd.liveFromStart).catch(e => postError(String(e), true));
+    const loader = wrapWithSourceCache(new HttpLoader(cmd.url), cmd.cacheBytes ?? 0, !!cmd.live);
+    handleInit(loader, cmd.debug, cmd.live, cmd.startEditUnit, cmd.liveFromStart).catch(e => postError(String(e), true));
   },
   initFile: (cmd) => {
     videoMode = cmd.videoMode ?? 'mse';
     activePluginConfig = cmd.plugins?.videoDecoder ?? null;
-    handleInit(new FileLoader(cmd.file), cmd.debug, cmd.live, cmd.startEditUnit, cmd.liveFromStart).catch(e => postError(String(e), true));
+    const loader = wrapWithSourceCache(new FileLoader(cmd.file), cmd.cacheBytes ?? 0, !!cmd.live);
+    handleInit(loader, cmd.debug, cmd.live, cmd.startEditUnit, cmd.liveFromStart).catch(e => postError(String(e), true));
   },
   fetchSegment: (cmd) => {
     // Live mode streams forward via the persistent LiveSequentialReader (no index / seek). The player
