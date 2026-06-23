@@ -407,6 +407,7 @@ Verified against real broadcast files:
 - XDCAM MPEG-2 Long-GOP (open-GOP, 1080i50 4:2:2)
 - XAVC / AVC-Intra Class 100 (1080i50, H.264 High 4:2:2)
 - XAVC Class 300 (UHD, High 4:2:2)
+- XAVC-L Long-GOP (1080p50, H.264 High 4:2:2, B-frame reorder)
 - 16/24-bit PCM audio, multi-channel
 
 ---
