@@ -5,7 +5,7 @@
 - **`MxfConfig.seekMode: 'accurate' | 'keyframe'`** (default `'accurate'`).
 - **`beginScrub()` / `endScrub()`**: scrub forces keyframe mode; `endScrub()` issues one accurate seek to settle.
 - **`previewParked`**: blocks `fetchNextChunk` after a keyframe preview — decoder counter has advanced past the keyframe. Cleared by `play()`/`endScrub()`/any new seek.
-- **GOP keyframe flag**: `(flags & 0x80) === 0` — convention, unverified.
+- **GOP keyframe flag**: three-way auto-detection in `isKeyframeEntry` — (1) prediction bits `0x30` (ffmpeg), (2) SMPTE 377M RandomAccess `(flags & 0x80) !== 0` for XAVC-L/Atomos, (3) legacy `(flags & 0x80) === 0` fallback.
 
 ## XAVC / AVC-Intra: in-header-partition index + essence start (`mxf-file.ts`, `src/core/ul.ts`, `src/essence/avc-tools.ts`)
 

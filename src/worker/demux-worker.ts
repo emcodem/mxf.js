@@ -126,6 +126,8 @@ let activePluginConfig: WorkerPluginConfig | null = null;
 let longGop: {
   sps: SpsPocInfo;
   ppsFlagMap: Map<number, PpsPocInfo>;
+  /** True when the MXF index temporal offsets were found to disagree with H.264 POC at init time. */
+  usePoc: boolean;
 } | null = null;
 // True for the first long-GOP fetch after a seek/scrub-reset: enables open-GOP leading-B drop so the
 // keyframe (not an undecodable leading B) lands first. Set by handleSeek/handleScrubPreview/init.
@@ -627,25 +629,59 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       if (spsPocInfo && (bootstrap.indexMode === 'vbe' || bootstrap.indexMode === 'none') && videoMode !== 'webcodecs') {
         try {
           const probe = new EssenceExtractor(loader_, bootstrap);
-          let seen = 0;
+          // Collect up to 4 video frames for B-slice detection AND temporal-offset validation.
+          // 4 frames covers a complete IBBP sub-group, which is the minimum needed to compare Tier 1
+          // (temporal offsets) vs Tier 2 (H.264 POC) rankings reliably.
+          const probeFrames: Array<{avcc: Uint8Array; editUnit: bigint}> = [];
+          let hasBSlice = false;
           for await (const frame of probe.fetchFrames(0n, 30)) {
             if (frame.trackType !== 'video') continue;
-            seen++;
             const avcc = isAnnexB(frame.data) ? new Uint8Array(annexBtoAVCC(frame.data)) : new Uint8Array(frame.data);
-            if (accessUnitHasBSlice(avcc, spsPocInfo, ppsFlagMap)) {
-              longGop = { sps: spsPocInfo, ppsFlagMap };
-              break;
+            if (!hasBSlice && accessUnitHasBSlice(avcc, spsPocInfo, ppsFlagMap)) hasBSlice = true;
+            probeFrames.push({ avcc, editUnit: frame.editUnit });
+            if (hasBSlice && probeFrames.length >= 4) break;
+            if (!hasBSlice && probeFrames.length >= 30) break;
+          }
+
+          if (hasBSlice) {
+            let usePoc = false;
+            // For VBE index files, validate temporal offsets against H.264 POC. Some cameras
+            // (e.g. Atomos Shogun Max) write incorrect temporal offsets; the H.264 bitstream's
+            // POC is authoritative for display order.
+            if (bootstrap.indexMode === 'vbe' && probeFrames.length >= 4) {
+              const segs = bootstrap.indexSegments, vid = bootstrap.essenceBodySID;
+              const valInputs: ReorderInputFrame[] = probeFrames.map(f => ({
+                avcc: f.avcc,
+                editUnit: f.editUnit,
+                meta: resolveEntryMeta(segs, f.editUnit, vid),
+              }));
+              const hasOffsets = valInputs.some(f => f.meta && f.meta.temporalOffset !== 0);
+              if (hasOffsets) {
+                try {
+                  const tier1Pts = valInputs.map((f, i) => i + (f.meta?.temporalOffset ?? 0));
+                  const tier2 = resolveReorder(valInputs, {
+                    sps: spsPocInfo, ppsFlagMap,
+                    startStorageEU: 0n,
+                    isRunKeyframeBoundary: true,
+                    forcePoc: true,
+                  });
+                  if (tier2.length === valInputs.length) {
+                    const tier2Pts = tier2.map(s => Number(s.pts));
+                    usePoc = tier1Pts.some((t1, i) => t1 !== tier2Pts[i]);
+                  }
+                } catch { /* validation failed; keep usePoc=false */ }
+                if (workerDebug) console.log(`[longgop] temporal-offset validation: usePoc=${usePoc}`);
+              }
             }
-            if (seen >= 30) break;
+            longGop = { sps: spsPocInfo, ppsFlagMap, usePoc };
           }
           // Tier 3: a no-index long-GOP file needs the sparse keyframe map; the fetch/seek paths
           // populate it as they scan (the probe above is too short to seed it meaningfully).
           if (longGop && bootstrap.indexMode === 'none') sparseKf = new SparseKeyframeIndex();
-          if (workerDebug) console.log(`[longgop] detection: ${longGop ? `Long-GOP (B-frames present, ${bootstrap.indexMode} index)` : 'all-predictive/intra (no reorder)'}`);
         } catch (e) {
           if (workerDebug) console.log('[longgop] B-slice probe failed, treating as non-Long-GOP:', e);
         }
-        liveMark('H.264 Long-GOP B-slice probe (~30 frames from frame 0)');
+        liveMark('H.264 Long-GOP B-slice probe (~4 frames from frame 0)');
       }
     }
 
@@ -897,6 +933,7 @@ async function handleFetchSegment(
           ppsFlagMap: longGop.ppsFlagMap,
           startStorageEU: BigInt(fetchStart),
           isRunKeyframeBoundary: isBoundary,
+          forcePoc: longGop.usePoc,
         });
 
         // Attach the resolved PTS/DTS/isKeyframe to the source frames (decode order, kept frames).

@@ -40,6 +40,12 @@ export interface ReorderOptions {
   isRunKeyframeBoundary: boolean;
   /** AVCC NALU length-prefix size (default 4, matching the avcC lengthSizeMinusOne=3 we emit). */
   lengthSize?: number;
+  /**
+   * Force Tier 2 (H.264 POC-based) reordering even when temporal offsets are available. Used when
+   * the MXF index's temporal offsets have been found to disagree with the H.264 POC at init time
+   * (e.g. Shogun Max XAVC-L encodes wrong temporal offsets; the H.264 bitstream is authoritative).
+   */
+  forcePoc?: boolean;
 }
 
 export interface ResolvedSample {
@@ -151,7 +157,8 @@ export function resolveReorder(frames: ReorderInputFrame[], opts: ReorderOptions
 
   // Tier 1: trust the index's temporalOffset. Each frame's display edit unit (within the run) is its
   // storage index + temporalOffset; DTS is the contiguous decode index, PTS the display edit unit.
-  if (hasRealTemporalOffset(frames)) {
+  // Skipped when forcePoc=true (caller detected that the MXF index offsets disagree with H.264 POC).
+  if (!opts.forcePoc && hasRealTemporalOffset(frames)) {
     let kept = frames.map((f, i) => ({ f, i, displayEu: i + (f.meta?.temporalOffset ?? 0) }));
     // On the first run after a seek/scrub, drop the open-GOP leading B's — frames that display before
     // the GOP head (frames[0]); they reference the previous GOP we seeked away from. (No-op for a

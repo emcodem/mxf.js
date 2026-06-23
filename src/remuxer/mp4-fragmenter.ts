@@ -198,14 +198,16 @@ export class Mp4Fragmenter {
       }
 
       const payload = new Uint8Array(data);
+      const cts = Number(frame.pts - frame.dts) * config.frameDurationTicks;
       dataParts.push(payload);
       samples.push({
         duration: config.frameDurationTicks,
         size: payload.length,
         flags: frame.isKeyframe ? SAMPLE_FLAG_SYNC : SAMPLE_FLAG_NON_SYNC,
-        compositionTimeOffset: Number(frame.pts - frame.dts) * config.frameDurationTicks,
+        compositionTimeOffset: cts,
       });
     }
+
 
     const allData = concatU8(dataParts);
     const baseTime = frames[0].dts * BigInt(config.frameDurationTicks);
