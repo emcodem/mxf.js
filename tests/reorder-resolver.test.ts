@@ -83,6 +83,34 @@ describe('computeReorder (pure ranking core)', () => {
     expect(out.length).toBe(3);
   });
 
+  it('open-GOP non-boundary run: tiles leading B\'s without a gap and never presents below base', () => {
+    // Mirrors the XAVC-L open-GOP file: each GOP = I(head) + 2 leading B's (POC < head, displaying
+    // before it, referencing the previous GOP) + P,B,B. Mid-stream (dropLeadingB=false) the leading
+    // B's are KEPT. Regression for two coupled bugs: (1) per-segment ranking used to shift the head
+    // forward by L=2 and open a 2-frame PTS gap at the boundary; (2) shifting only PTS (not DTS) made
+    // the leading B's present below the fragment's baseMediaDecodeTime (= frames[0].dts), stalling MSE.
+    const gop = (base: number): ReorderItem[] => [
+      item(0, { isGopHead: true, isSync: true, sourceIndex: base + 0 }), // I (head)
+      item(-4, { sourceIndex: base + 1 }), item(-2, { sourceIndex: base + 2 }), // leading B's
+      item(6, { sourceIndex: base + 3 }), item(2, { sourceIndex: base + 4 }), item(4, { sourceIndex: base + 5 }),
+    ];
+    const out = computeReorder([...gop(0), ...gop(6)], 100n, false)!;
+
+    // DTS is contiguous in decode order (the fragmenter requires dtsⱼ = dts₀ + j).
+    const dts0 = Number(out[0].dts);
+    expect(out.map(s => Number(s.dts) - dts0)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    // PTS is a gapless permutation across the whole run — no boundary gap (bug 1).
+    expect(out.map(s => Number(s.pts)).sort((a, b) => a - b))
+      .toEqual(Array.from({ length: 12 }, (_, i) => 98 + i));
+    // No sample presents below the fragment base = frames[0].dts (bug 2): min PTS == base == min DTS.
+    const base = Number(out[0].dts);
+    expect(Math.min(...out.map(s => Number(s.pts)))).toBe(base);
+    expect(Math.min(...out.map(s => Number(s.dts)))).toBe(base);
+    // Each GOP head keeps its display slot at startStorageEU + 6·g (heads land on storage EU, no shift).
+    expect(Number(out[0].pts)).toBe(100);
+    expect(Number(out[6].pts)).toBe(106);
+  });
+
   it('returns null (→ fallback) when a field picture is present', () => {
     expect(computeReorder([item(0, { fieldPic: true })], 0n, false)).toBeNull();
   });

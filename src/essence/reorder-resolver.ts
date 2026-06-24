@@ -5,10 +5,13 @@
  * The fragmenter (`buildRawVideoSegment`) sets `baseTime = frames[0].dts` and gives every sample the
  * same duration, deriving each sample's display time as `dts₀ + i + (ptsᵢ − dtsᵢ)`. That lands on
  * the intended `ptsᵢ` **iff `dtsᵢ = dts₀ + i`** — contiguous decode-order numbering. So this resolver
- * always emits:
- *     dtsⱼ = startStorageEU + j          (j = kept-frame index in decode order)
- *     ptsⱼ = startStorageEU + rankⱼ      (rankⱼ = display position among kept frames)
- * giving `CTS = rankⱼ − j`, which is exactly what the fragmenter expects.
+ * always emits (L = number of open-GOP leading B's kept in the first segment, 0 at a seek boundary
+ * where they are dropped; see computeReorder):
+ *     dtsⱼ = startStorageEU + j      − L   (j = kept-frame index in decode order)
+ *     ptsⱼ = startStorageEU + rankⱼ  − L   (rankⱼ = display position among kept frames)
+ * giving `CTS = rankⱼ − j`, which is exactly what the fragmenter expects. The shared −L shift lands
+ * the head at startStorageEU in display while keeping the fragment's baseMediaDecodeTime equal to its
+ * minimum PTS (no sample presents below base) and adjacent fragments contiguous in both dts and pts.
  *
  * The input run MUST consist of whole GOPs starting at a keyframe (the worker aligns fetches to GOP
  * boundaries), so per-GOP POC ranking equals the global display order and adjacent segments tile.
@@ -100,6 +103,16 @@ export function computeReorder(
     segments[0] = first.filter((it, i) => i === 0 || it.poc >= headPoc);
   }
 
+  // L = open-GOP leading B's kept in the first segment: frames after the head with POC < the head's
+  // (they display before the head, referencing the previous GOP). They sort to ranks 0..L-1, so the
+  // head lands at rank L → PTS = startStorageEU + L, shifting the whole run forward by L and leaving an
+  // L-frame display gap against the previous fragment. Subtracting L from every sample (pts AND dts,
+  // below) cancels that shift so the head's PTS is exactly startStorageEU and fragments tile. After the
+  // drop pass L = 0 for a boundary run (the leading B's are gone), so this is a no-op there.
+  const leadingBOffset = segments.length > 0
+    ? BigInt(segments[0].filter((it, idx) => idx > 0 && it.poc < segments[0][0].poc).length)
+    : 0n;
+
   const out: ResolvedSample[] = [];
   let decodeIndex = 0;   // contiguous over kept frames, in decode order
   let displayBase = 0;   // running count of kept frames in prior segments
@@ -110,9 +123,17 @@ export function computeReorder(
     ranked.forEach((r, displayPos) => rankOf.set(r.i, displayBase + displayPos));
 
     seg.forEach((it, i) => {
+      // Subtract leadingBOffset from BOTH pts and dts. The pts subtraction lands the head at
+      // startStorageEU (tiling the previous segment, no display gap). Subtracting it from dts too
+      // shifts the fragment's baseMediaDecodeTime (= frames[0].dts) down to equal the minimum pts, so
+      // NO sample presents below the fragment base — MSE stalls a fragment that presents before its own
+      // tfdt base (the leading B's, at pts = startStorageEU-L, would otherwise sit below base). It also
+      // closes the inter-fragment decode gap the boundary drop leaves (that fragment dropped L frames,
+      // ending L short). CTS = rank − j is unchanged (both terms shift by L), so the fragmenter sees the
+      // same composition offsets and adjacent fragments stay contiguous in both dts and pts.
       out.push({
-        dts: startStorageEU + BigInt(decodeIndex),
-        pts: startStorageEU + BigInt(rankOf.get(i)!),
+        dts: startStorageEU + BigInt(decodeIndex) - leadingBOffset,
+        pts: startStorageEU + BigInt(rankOf.get(i)!) - leadingBOffset,
         isKeyframe: it.isSync,
         sourceIndex: it.sourceIndex,
       });

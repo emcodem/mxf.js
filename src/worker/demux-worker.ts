@@ -129,9 +129,14 @@ let longGop: {
   /** True when the MXF index temporal offsets were found to disagree with H.264 POC at init time. */
   usePoc: boolean;
 } | null = null;
-// True for the first long-GOP fetch after a seek/scrub-reset: enables open-GOP leading-B drop so the
-// keyframe (not an undecodable leading B) lands first. Set by handleSeek/handleScrubPreview/init.
-let longGopBoundaryPending = true;
+// Long-GOP open-GOP boundary tracking. A fetch is a "boundary" (drop the first GOP's leading B's, so
+// the keyframe — not an undecodable leading B that references the prior GOP — lands first) UNLESS it
+// continues exactly where the previous primary fetch ended: only then is the prior GOP guaranteed
+// resident in the decoder, so its leading B's decode. Tracking the contiguous frontier (rather than a
+// single consumable "pending" flag) is robust against throwaway scrub-preview / cache-only fetches that
+// would otherwise consume the flag before the real post-seek fetch. Reset to null (→ next fetch is a
+// boundary) on init/seek/scrub. `null` = no contiguous predecessor, so the next fetch is a boundary.
+let lgLastContiguousEnd: number | null = null;
 // Tier-3 (indexMode 'none') only: lazily-built keyframe map (edit unit → byte offset) populated as a
 // side effect of no-index scans, so a seek can resume near the target instead of rescanning from 0.
 let sparseKf: SparseKeyframeIndex | null = null;
@@ -310,7 +315,7 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
   mxfFile = new MxfFile(loader, debug);
   transcodePipeline = null;
   longGop = null;
-  longGopBoundaryPending = true;
+  lgLastContiguousEnd = null;
   sparseKf = null;
   abortSpeculation();
   scrubSegmentCache.clear();
@@ -662,14 +667,17 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
                   const tier2 = resolveReorder(valInputs, {
                     sps: spsPocInfo, ppsFlagMap,
                     startStorageEU: 0n,
-                    isRunKeyframeBoundary: true,
+                    isRunKeyframeBoundary: false,
                     forcePoc: true,
                   });
                   if (tier2.length === valInputs.length) {
                     const tier2Pts = tier2.map(s => Number(s.pts));
                     usePoc = tier1Pts.some((t1, i) => t1 !== tier2Pts[i]);
+                    if (workerDebug) console.log(`[longgop] validation: tier1Pts=${JSON.stringify(tier1Pts)} tier2Pts=${JSON.stringify(tier2Pts)} probeOffsets=${JSON.stringify(valInputs.map(f => f.meta?.temporalOffset ?? null))}`);
+                  } else if (workerDebug) {
+                    console.log(`[longgop] validation skipped: tier2.length=${tier2.length} !== valInputs.length=${valInputs.length}`);
                   }
-                } catch { /* validation failed; keep usePoc=false */ }
+                } catch (e) { if (workerDebug) console.log('[longgop] validation threw:', e); }
                 if (workerDebug) console.log(`[longgop] temporal-offset validation: usePoc=${usePoc}`);
               }
             }
@@ -920,8 +928,14 @@ async function handleFetchSegment(
       // -----------------------------------------------------------------------
       if (videoFrames.length > 0) {
         const segs = bootstrap.indexSegments, vid = bootstrap.essenceBodySID;
-        const isBoundary = longGopBoundaryPending;
-        longGopBoundaryPending = false;
+        // Throwaway fetches (scrub preview, speculative cache-fill) decode from a freshly-reset decoder
+        // positioned at the keyframe, so their first GOP's leading B's are always undecodable → boundary.
+        // A primary fetch is a boundary only if it does NOT continue the previous primary fetch's range.
+        const isBoundary = isScrubPreview || !!cacheOnly
+          || lgLastContiguousEnd === null || fetchStart !== lgLastContiguousEnd;
+        // Advance the contiguous frontier for primary fetches only; throwaway fetches must not move it
+        // (else the next real fetch would look contiguous with a preview and wrongly keep its leading B's).
+        if (!isScrubPreview && !cacheOnly) lgLastContiguousEnd = lgNextFrame;
 
         const inputs: ReorderInputFrame[] = videoFrames.map(f => ({
           avcc: isAnnexB(f.data) ? new Uint8Array(annexBtoAVCC(f.data)) : new Uint8Array(f.data),
@@ -943,9 +957,13 @@ async function handleFetchSegment(
           dts: s.dts,
           isKeyframe: s.isKeyframe,
         }));
+        if (workerDebug) {
+          const pts = resolved.map(s => Number(s.pts));
+          const ptMin = Math.min(...pts), ptMax = Math.max(...pts);
+          console.log(`[longgop] fetch ${fetchStart}..${lgNextFrame - 1}${isBoundary ? ' [boundary]' : ''} usePoc=${longGop.usePoc}: ${videoFrames.length} AUs → ${resolved.length} samples | pts=[${ptMin}..${ptMax}]`);
+        }
         const seg = fragmenter.buildVideoSegment(reordered);
         if (seg) {
-          if (workerDebug) console.log(`[longgop] fetch ${fetchStart}..${lgNextFrame - 1} (req ${startFrame}+${frameCount})${isBoundary ? ' [boundary, leading-B drop]' : ''}: ${videoFrames.length} AUs → ${resolved.length} samples`);
           if (isScrubPreview) scrubSegmentCache.set(startFrame, seg.slice());
           // System-item TC anchors: key by the source frame's STORAGE edit unit, NOT its presentation
           // pts. The System Item sits in the content package in storage (decode) order, so its TC value
@@ -1099,8 +1117,9 @@ function handleSeek(targetFrame: number): void {
   // order from there — so the post-seek playhead lands on the right picture even though Long-GOP
   // stores in decode order. No-op for the H.264 path (no pipeline; resolveReorder handles its reorder).
   transcodePipeline?.reset(nearestKeyframe);
-  // The next fetch is the first of a new GOP run: drop open-GOP leading B's so the keyframe lands first.
-  longGopBoundaryPending = true;
+  // Break the contiguous frontier: the next fetch starts a fresh GOP run after a discontinuity, so it
+  // must drop open-GOP leading B's (the prior GOP is no longer resident) and land the keyframe first.
+  lgLastContiguousEnd = null;
 
   post({ type: 'seeked', nearestKeyframeEditUnit: nearestKeyframe, gopFrameCount });
 }
@@ -1142,17 +1161,37 @@ function handleScrubPreview(targetFrame: number, seq: number): void {
   // path (MPEG-2/wasm, decode-bound, HD) keeps the short one so the per-preview decode stays small
   // (decoding a whole GOP+lookahead per preview saturated the worker so nothing painted). Constant
   // per keyframe (independent of target) so it stays cacheable.
+  //
+  // Long-GOP exception: handleFetchSegment snaps the fetch end to the next GOP boundary via
+  // findKeyframeCeil, so the 1.0 s remux lookahead (26 frames at 25 fps) expands to the 3rd
+  // following keyframe — 36 frames for 12-frame GOPs. That triples the fetch per preview and cuts
+  // the scrub update rate by ~3×. For indexed Long-GOP, use exactly 1 GOP so the snap lands on
+  // the very next keyframe. All-intra content falls back to the 1.0 s lookahead (gopSize === 1).
   const fps = storedEditRateNumerator / storedEditRateDenominator;
-  const lookaheadSeconds = transcodePipeline ? SCRUB_PREVIEW_LOOKAHEAD_SECONDS : SCRUB_PREVIEW_LOOKAHEAD_SECONDS_REMUX;
-  const runFrames = 1 + Math.max(SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES, Math.round(fps * lookaheadSeconds));
+  let runFrames: number;
+  if (!transcodePipeline && bootstrap.indexMode !== 'none') {
+    const nextKf = findKeyframeCeil(bootstrap.indexSegments, BigInt(keyframe + 1), bootstrap.essenceBodySID);
+    const gopSize = nextKf !== null ? Number(nextKf - BigInt(keyframe)) : 1;
+    if (gopSize > 1) {
+      // Long-GOP: 1 GOP is sufficient for an IDR to paint and avoids the 3× boundary expansion.
+      runFrames = gopSize;
+    } else {
+      // All-intra: the UHD 1.0 s lookahead is still required for Chrome to leave HAVE_METADATA.
+      runFrames = 1 + Math.max(SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES, Math.round(fps * SCRUB_PREVIEW_LOOKAHEAD_SECONDS_REMUX));
+    }
+  } else {
+    const lookaheadSeconds = transcodePipeline ? SCRUB_PREVIEW_LOOKAHEAD_SECONDS : SCRUB_PREVIEW_LOOKAHEAD_SECONDS_REMUX;
+    runFrames = 1 + Math.max(SCRUB_PREVIEW_MIN_LOOKAHEAD_FRAMES, Math.round(fps * lookaheadSeconds));
+  }
 
   // Seek part (mirrors handleSeek): supersede in-flight work and reset the decoder to the keyframe.
   // Storage-base labelling (useDisplayBase=false): a scrub preview is throwaway and only needs the
   // chunks + previewDone to share one base; the accurate settle on release lands the exact frame.
   fetchQ.supersede();
   transcodePipeline?.reset(keyframe, false);
-  // This preview run starts a fresh GOP: drop open-GOP leading B's so the keyframe paints first.
-  longGopBoundaryPending = true;
+  // This preview run starts a fresh GOP from a reset decoder: break the contiguous frontier so the
+  // preview (and the real fetch that follows on release) drops open-GOP leading B's and paints the key.
+  lgLastContiguousEnd = null;
 
   // Enqueue the primary throwaway decode (serialized via the queue so it can't race a normal fetch).
   // stretchToFrames stays 0 — these are real consecutive frames, so the segment is naturally
