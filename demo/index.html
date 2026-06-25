@@ -258,6 +258,8 @@
   </details>
 
   <div id="meta"></div>
+  <div id="decodeInfo" style="font-family:monospace; font-size:12px; margin:-4px 0 12px; min-height:18px; cursor:help;"
+       title="What this line is &#10;&#10;decodingInfo is a PREDICTIVE capability query from navigator.mediaCapabilities.decodingInfo() — NOT a property of the &lt;video&gt; element. You hand it a hypothetical config (codec profile + resolution + bitrate + framerate) and it answers whether that config WOULD decode well on this machine. It does not observe the actual playing stream, which is why the codec string is rebuilt from the manifest (resolvedVideoCodec, the precise avc1.PPCCLL derived from the stream's SPS) rather than read off the video element. &#10;&#10;The three verdicts &#10;• supported    — the browser can decode this profile at all &#10;• smooth       — it can keep up at this resolution/framerate/bitrate &#10;• powerEfficient — it would use HARDWARE (fixed-function GPU) decode. FALSE means software decode on the CPU — the case that burns CPU. This is the closest thing to a GPU-vs-CPU signal; there is NO API that literally reports 'GPU'. &#10;&#10;Machine-dependent: the SAME file can be powerEfficient on one machine and not another. E.g. High 4:2:2 H.264 (avc1.7A…) is hardware-decoded on Intel Quick Sync but software on many discrete GPUs. &#10;&#10;The &lt;video&gt; element itself has NO powerEfficient / 'am I on the GPU' property — the spec doesn't expose the decode path. Its runtime counterpart is video.getVideoPlaybackQuality() → { totalVideoFrames, droppedVideoFrames, … }: predictive vs. live. A high dropped/total ratio is the ground-truth 'decoder is actually struggling' signal, complementary to powerEfficient's prediction. &#10;&#10;bitrate shown is an ESTIMATE (we don't carry the true bitrate). It mainly affects 'smooth'; the powerEfficient verdict tracks codec+resolution capability, so the hardware verdict is reliable regardless."></div>
   <div id="videoWrap" style="position:relative; max-width:960px;">
     <video id="video" autoplay muted></video>
     <div id="bufferingOverlay">
@@ -350,6 +352,7 @@
     const video    = document.getElementById('video');
     const logEl    = document.getElementById('log');
     const metaEl   = document.getElementById('meta');
+    const decodeInfoEl = document.getElementById('decodeInfo');
     const playback = document.getElementById('playback');
     const playBtn  = document.getElementById('playBtn');
     const seekBar  = document.getElementById('seekBar');
@@ -862,6 +865,64 @@
       playBtn.textContent = player.paused ? '▶' : '⏸';
     }
 
+    // ── Decode capability probe ───────────────────────────────────────────────────────────────
+    // Ask the browser whether THIS stream's exact codec profile decodes power-efficiently (i.e. in
+    // hardware) on THIS machine, via navigator.mediaCapabilities.decodingInfo(). The verdict is
+    // machine-dependent: High 4:2:2 H.264 (avc1.7A…) is hardware on Intel Quick Sync but software on
+    // many discrete GPUs — and software H.264 decode is what burns CPU. `powerEfficient: false` is
+    // the browser's "not hardware-accelerated" signal. decodingInfo requires a bitrate + framerate;
+    // we don't carry the true bitrate, so we pass a per-codec-class ESTIMATE (labelled below) — it
+    // barely affects the powerEfficient verdict (that tracks codec+resolution capability) though it
+    // can flip `smooth`. The contentType uses data.resolvedVideoCodec, the precise avc1.PPCCLL string
+    // the player actually feeds MSE (derived from the stream's SPS), so the probe matches reality.
+    function videoContentType(codec) {
+      if (!codec || codec === 'unknown') return null;
+      if (codec.startsWith('avc1.')) return `video/mp4; codecs="${codec}"`;
+      if (codec === 'h264') return 'video/mp4; codecs="avc1.640033"';   // generic High@5.1 fallback
+      if (codec === 'mpeg2' || codec.startsWith('mp4v')) return 'video/mp4; codecs="mp4v.20.2"';
+      return null;
+    }
+    async function queryDecodingInfo(data) {
+      const mc = navigator.mediaCapabilities;
+      const codec = data.resolvedVideoCodec;
+      const contentType = videoContentType(codec);
+      const w = data.displayWidth, h = data.displayHeight;
+      const rate = data.editRateNumerator / data.editRateDenominator;
+      if (!mc?.decodingInfo || !contentType || !w || !h || !(rate > 0)) {
+        decodeInfoEl.textContent = mc?.decodingInfo
+          ? `decodingInfo: codec="${codec ?? '?'}" — can't build a query (missing dims/rate)`
+          : 'decodingInfo: navigator.mediaCapabilities not supported in this browser';
+        decodeInfoEl.style.color = '#777';
+        return;
+      }
+      // Rough bitrate estimate (bits/s) by codec class — all-intra (AVC-Intra/XAVC-I) ≈ 2 bits/px,
+      // Long-GOP (XAVC-L) ≈ 0.5 bits/px. Clearly labelled as an estimate in the readout.
+      const bpp = data.longGop ? 0.5 : 2.0;
+      const bitrate = Math.round(w * h * rate * bpp);
+      const config = { type: 'media-source', video: { contentType, width: w, height: h, bitrate, framerate: rate } };
+      decodeInfoEl.textContent = 'decodingInfo: querying…';
+      decodeInfoEl.style.color = '#777';
+      try {
+        const info = await mc.decodingInfo(config);
+        const yn = (b) => b ? 'yes' : 'NO';
+        const efficient = info.powerEfficient;
+        // The headline: powerEfficient false ⇒ likely software decode ⇒ the CPU-heavy case.
+        decodeInfoEl.innerHTML =
+          `decodingInfo (${contentType.replace(/^video\/mp4; codecs="|"$/g, '')} ${w}×${h} @${rate.toFixed(2)}): ` +
+          `<b style="color:${info.supported ? '#9c9' : '#f88'}">supported ${yn(info.supported)}</b> · ` +
+          `<b style="color:${info.smooth ? '#9c9' : '#fa8'}">smooth ${yn(info.smooth)}</b> · ` +
+          `<b style="color:${efficient ? '#9c9' : '#f66'}">powerEfficient ${yn(efficient)}</b>` +
+          (efficient ? '' : ' ⚠ likely SOFTWARE decode (CPU-heavy)') +
+          ` <span style="color:#666">· bitrate ~${(bitrate / 1e6).toFixed(0)} Mbit/s (est.)</span>`;
+        decodeInfoEl.style.color = '#aaa';
+        log(`decodingInfo: supported=${info.supported} smooth=${info.smooth} powerEfficient=${efficient} (${codec})`,
+            efficient ? 'info' : 'warn');
+      } catch (err) {
+        decodeInfoEl.textContent = `decodingInfo query failed: ${err?.message ?? err}`;
+        decodeInfoEl.style.color = '#f88';
+      }
+    }
+
     function initPlayer() {
       resetSpeed();
       player?.destroy();
@@ -877,6 +938,7 @@
       timeDur.textContent = '0:00';
       tcEl.textContent = '--:--:--:--';
       tcEl.title = '';
+      decodeInfoEl.textContent = '';
 
       // All config comes from the Player options panel (getPlayerOpts). Pre-filled values there are
       // this demo's effective defaults (smaller buffers for snappy first paint; source cache off).
@@ -919,6 +981,7 @@
           `Index: ${data.indexMode}${gop}${liveTag} | ` +
           `Tracks: ${vN}V ${aN}A`;
         log(`Manifest loaded: ${data.duration.toFixed(2)}s, ${data.tracks.length} tracks`);
+        queryDecodingInfo(data);   // ask the browser whether this profile decodes in hardware here
         seekBar.max = data.duration;
         // Frame-granular slider: one native step (incl. a click-then-arrow on the focused thumb) =
         // exactly one frame, so dragging/stepping lands on frame boundaries instead of 0.1 s (2.5

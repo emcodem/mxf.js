@@ -920,6 +920,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       indexMode: event.indexMode,
       longGop: event.longGop,
       timecodes: event.timecodes ?? [],
+      resolvedVideoCodec: event.resolvedVideoCodec ?? pd?.codec ?? 'unknown',
       live: this.liveMode,
     };
 

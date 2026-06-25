@@ -42,6 +42,14 @@ export interface ManifestData {
   indexMode: IndexMode;
   /** True for H.264 Long-GOP (XAVC-L) streams (B-frame reorder applied on fetch). */
   longGop: boolean;
+  /**
+   * The codec string the browser actually decodes — a precise `avc1.PPCCLL` (profile/constraints/
+   * level, derived from the stream's SPS) for H.264 remux, or the transcoded H.264 string for MPEG-2.
+   * Use it to build a `video/mp4; codecs="…"` contentType for `navigator.mediaCapabilities` so the
+   * caller can ask whether THIS profile decodes power-efficiently (hardware) on the current machine —
+   * e.g. High 4:2:2 (`avc1.7A…`) is hardware on Intel Quick Sync but software on many other GPUs.
+   */
+  resolvedVideoCodec: string;
   /** Computed start timecodes from the Material / File / Source package timecode tracks. */
   timecodes: ManifestTimecode[];
   /**
