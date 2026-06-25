@@ -123,6 +123,35 @@ describe('MxfFile.findPackageStartAtOrAfter', () => {
   });
 });
 
+describe('MxfFile.findPackageStartAtOrAfter with a keyframe predicate (MPEG-2 / Long-GOP none seek)', () => {
+  // A keyframe picture element carries 0x4b ('K') as its first value byte; non-keyframe pictures 0xaa.
+  const kfPic = () => klv(UL_GC_PICTURE_ITEM_PREFIX, new Uint8Array(40).fill(0x4b));
+  const isKeyframe = (v: Uint8Array) => v[0] === 0x4b;
+
+  // Packages: [P-only][P-only][KEY][P-only] — the predicate must skip the first two and land on #3.
+  const parts = [sysKLV(), picKLV(), audKLV(), sysKLV(), picKLV(), audKLV(), sysKLV(), kfPic(), audKLV(), sysKLV(), picKLV(), audKLV()];
+  const { buf, offsets } = layout(parts);
+  const keyPkgOff = offsets[6]; // the System Item that opens the keyframe package
+  const end = buf.length;
+  const mk = () => new MxfFile(new MemLoader(buf));
+
+  it('skips non-keyframe packages and lands on the first keyframe package', async () => {
+    expect(await mk().findPackageStartAtOrAfter(0, end, undefined, isKeyframe)).toBe(keyPkgOff);
+  });
+
+  it('returns the keyframe package even when starting mid-stream before it', async () => {
+    const midPic0 = offsets[1] + 5; // inside package 0's (non-key) picture element
+    expect(await mk().findPackageStartAtOrAfter(midPic0, end, undefined, isKeyframe)).toBe(keyPkgOff);
+  });
+
+  it('falls back to the first picture package when the window holds no keyframe', async () => {
+    const noKey = layout([sysKLV(), picKLV(), audKLV(), sysKLV(), picKLV(), audKLV()]);
+    const f = new MxfFile(new MemLoader(noKey.buf));
+    // No 0x4b picture anywhere → fall back to the earliest package start (the first System Item).
+    expect(await f.findPackageStartAtOrAfter(0, noKey.buf.length, undefined, isKeyframe)).toBe(noKey.offsets[0]);
+  });
+});
+
 /**
  * End-to-end regression on a REAL all-intra file forced to indexMode 'none' — drives the exact calls
  * the worker's noIndexIntra branch makes (LiveSequentialReader forward + byte-% reposition via
@@ -187,5 +216,87 @@ describe('no-index intra byte-% path on a real file (forced none)', () => {
     const seeked = await firstVideo(seekReader, 2, fileSize);
     expect(Number(seeked[0].editUnit)).toBe(target);          // labeled as the seek target frame
     expect(fingerprint(seeked[0].data)).not.toBe(frame0);            // NOT the looped opening second
+  });
+});
+
+/**
+ * Inter-coded ('none' forced) byte-% reposition: the worker's MPEG-2 / Long-GOP seek path jumps to
+ * the approximate target byte, then digs forward to the next GOP HEAD (sequence/GOP start code for
+ * MPEG-2; an IDR access unit for H.264) so the decoder resumes cleanly. These regressions prove the
+ * landing the worker hands its reader/decoder is genuinely a random-access point — the fix for
+ * "XDCAM plays only the first second" and "XAVC-L forced-none seek hangs / never displays".
+ */
+// MPEG-2 GOP head: a sequence (B3) or GOP (B8) start code in the picture element (mirrors the worker).
+function isMpeg2GopHead(data: ArrayBuffer): boolean {
+  const v = new Uint8Array(data);
+  const lim = Math.min(v.length - 4, 4096);
+  for (let i = 0; i <= lim; i++) {
+    if (v[i] === 0x00 && v[i + 1] === 0x00 && v[i + 2] === 0x01 && (v[i + 3] === 0xB3 || v[i + 3] === 0xB8)) return true;
+  }
+  return false;
+}
+
+const XDCAM = process.env.TEST_NONE_XDCAM_FILE ?? 'C:/Temp/mxf.js/1080i25_ARDZDF_HDF01a_XDCAM-HD422.mxf';
+
+describe('no-index MPEG-2 (XDCAM) byte-% reposition lands on a GOP head (forced none)', () => {
+  const exists = fs.existsSync(XDCAM);
+  (exists ? it : it.skip)('a mid-file byte-% seek digs forward to an MPEG-2 sequence/GOP header', async () => {
+    const loader = new FsLoader(XDCAM);
+    const fileSize = await loader.fileSize;
+    const boot = await new MxfFile(loader).open();
+    const essStart = Number(boot.essenceStart);
+    const essEnd = essenceEndByte(boot.ripEntries, essStart, fileSize);
+    const total = Number(boot.metadata.duration);
+    expect(total).toBeGreaterThan(50);
+
+    const target = Math.floor(total / 2);
+    const approx = approxEssenceByte(target, total, essStart, essEnd);
+    // WITHOUT the GOP-head predicate the landing is some arbitrary package (likely a P/B picture).
+    const anyPkg = await new MxfFile(loader).findPackageStartAtOrAfter(approx, essEnd);
+    // WITH it, the landing's picture element must carry an MPEG-2 sequence/GOP start code.
+    const kfPkg = await new MxfFile(loader).findPackageStartAtOrAfter(approx, essEnd, undefined, isMpeg2GopHead);
+    expect(kfPkg).toBeGreaterThanOrEqual(anyPkg);
+
+    const reader = new LiveSequentialReader(loader, BigInt(kfPkg), BigInt(target), 25);
+    const vid = await firstVideo(reader, 1, fileSize);
+    expect(vid.length).toBe(1);
+    expect(isMpeg2GopHead(vid[0].data)).toBe(true);     // genuine random-access point
+    expect(Number(vid[0].editUnit)).toBe(target);       // labelled as the (approximate) seek target
+  });
+});
+
+const XAVCL = process.env.TEST_NONE_XAVCL_FILE ?? 'C:/Temp/mxf.js/xavc_l_1080p50.mxf';
+
+describe('no-index XAVC-L byte-% reposition lands on an IDR (forced none)', () => {
+  const exists = fs.existsSync(XAVCL);
+  (exists ? it : it.skip)('a mid-file byte-% seek digs forward to an H.264 I-frame (open-GOP recovery point)', async () => {
+    const { isIFrameAccessUnit, isIdrAccessUnit } = await import('../src/essence/h264-poc.js');
+    const { isAnnexB, annexBtoAVCC } = await import('../src/essence/avc-tools.js');
+    const toAvcc = (data: ArrayBuffer) => isAnnexB(data) ? new Uint8Array(annexBtoAVCC(data)) : new Uint8Array(data);
+    const isIFrame = (data: ArrayBuffer): boolean => isIFrameAccessUnit(toAvcc(data));
+
+    const loader = new FsLoader(XAVCL);
+    const fileSize = await loader.fileSize;
+    const boot = await new MxfFile(loader).open();
+    const essStart = Number(boot.essenceStart);
+    const essEnd = essenceEndByte(boot.ripEntries, essStart, fileSize);
+    const total = Number(boot.metadata.duration);
+    expect(total).toBeGreaterThan(50);
+    const fps = boot.metadata.editRateNumerator / boot.metadata.editRateDenominator;
+
+    const target = Math.floor(total / 2);
+    const approx = approxEssenceByte(target, total, essStart, essEnd);
+    // The dig-forward must use the I-FRAME predicate, not IDR-only: Sony XAVC-L emits an IDR only for
+    // the file's first picture, so an IDR-only scan would find nothing mid-file and land arbitrarily.
+    const kfPkg = await new MxfFile(loader).findPackageStartAtOrAfter(approx, essEnd, undefined, isIFrame);
+    expect(kfPkg).toBeGreaterThan(essStart);
+
+    const reader = new LiveSequentialReader(loader, BigInt(kfPkg), BigInt(target), Math.round(fps));
+    const vid = await firstVideo(reader, 1, fileSize);
+    expect(vid.length).toBe(1);
+    expect(isIFrame(vid[0].data)).toBe(true);   // an intra GOP head — clean resume after dropping leading B's
+    // Whether that GOP head is a true IDR or a non-IDR recovery-point I-frame is encoder-dependent
+    // (closed- vs open-GOP); either way isIdrAccessUnit alone is NOT sufficient to find it everywhere.
+    void isIdrAccessUnit;
   });
 });

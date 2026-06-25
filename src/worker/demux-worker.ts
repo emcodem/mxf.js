@@ -11,7 +11,7 @@ import {
   resolveLongGopKeyframe, findKeyframeFloor, findKeyframeCeil, longGopGopLength, resolveEntryMeta,
 } from '../parser/index-table.js';
 import { isAnnexB, annexBtoAVCC, extractSPSPPS, buildAVCDecoderConfigRecord } from '../essence/avc-tools.js';
-import { parseSpsPocInfo, buildPpsPocMap } from '../essence/h264-poc.js';
+import { parseSpsPocInfo, buildPpsPocMap, isIFrameAccessUnit } from '../essence/h264-poc.js';
 import type { SpsPocInfo, PpsPocInfo } from '../essence/h264-poc.js';
 import { resolveReorder, accessUnitHasBSlice, accessUnitHasInterSlice } from '../essence/reorder-resolver.js';
 import type { ReorderInputFrame } from '../essence/reorder-resolver.js';
@@ -807,17 +807,42 @@ async function handleFetchSegment(
     // enclosing GOP run, and record discovered keyframes. Memory-safe (scanned-past frames are
     // discarded), so even a cold seek that rescans from the start doesn't buffer the whole file.
     const noIndexLongGop = !!longGop && !transcodePipeline && bootstrap.indexMode === 'none';
+    // No-index VOD MPEG-2 / transcode: a persistent decoder fed contiguous GOPs. Forward play streams
+    // through a persistent reader (no re-read loop); a seek repositions by byte percentage, digging
+    // forward to the next GOP head (sequence/GOP start code) so the decoder resumes cleanly, then
+    // resets the pipeline to label output from the (approximate) target frame.
+    const noIndexTranscode = !!transcodePipeline && bootstrap.indexMode === 'none';
     // All-intra no-index VOD: every content package is independently decodable. Forward play streams
     // through a persistent reader (gapless, no re-read loop); a seek / discontinuity repositions it by
     // byte percentage and digs forward to the next content package. PTS comes purely from the frame
     // number (reader seeded with startFrame), never the System Item. See the 'none' fix plan.
     const noIndexIntra = intraOnlyNoIndex && !longGop && !transcodePipeline && bootstrap.indexMode === 'none';
     if (noIndexLongGop) {
-      // Resume the scan at the nearest known keyframe (else the essence start), reading enough to
-      // cover the window plus a lookahead to reach the next IDR (GOP boundary).
+      // Resume the scan at the nearest known keyframe, reading enough to cover the window plus a
+      // lookahead to reach the next IDR (GOP boundary). For a far seek with no discovered keyframe
+      // near the target, scanning from the last-known keyframe (or essence start) would read the whole
+      // span up to the target — O(distance), the "deep seek hangs on buffering" bug. Instead jump by
+      // byte percentage to an IDR near the target and anchor the scan there (approximate label).
       const floor = sparseKf?.floor(BigInt(startFrame)) ?? null;
-      const scanEU = floor ? Number(floor.editUnit) : 0;
-      const fromByteOffset = floor ? floor.byteOffset : bootstrap.essenceStart;
+      const floorClose = floor !== null && (startFrame - Number(floor.editUnit)) <= NOINDEX_GOP_LOOKAHEAD;
+      let scanEU: number;
+      let fromByteOffset: bigint;
+      if (floorClose) {
+        scanEU = Number(floor!.editUnit);
+        fromByteOffset = floor!.byteOffset;
+      } else {
+        const fileSize = await loader.fileSize;
+        if (gen !== fetchQ.currentGeneration) return;
+        const essStart = Number(bootstrap.essenceStart);
+        const essEnd = essenceEndByte(bootstrap.ripEntries, essStart, fileSize);
+        const total = Number(bootstrap.metadata.duration) || 0;
+        const approxByte = approxEssenceByte(startFrame, total, essStart, essEnd);
+        const idrByte = await mxfFile.findPackageStartAtOrAfter(approxByte, essEnd, signal, noIndexGopHeadDetector());
+        if (gen !== fetchQ.currentGeneration) return;
+        scanEU = startFrame;            // the landing IS (approximately) the target frame's GOP head
+        fromByteOffset = BigInt(idrByte);
+        if (workerDebug) console.log(`[noindex-longgop] byte-% reposition: frame ${startFrame} → byte ${idrByte} (approx ${approxByte})`);
+      }
       const scanBound = (startFrame + frameCount - scanEU) + NOINDEX_GOP_LOOKAHEAD;
       const run = await selectNoIndexLongGopRun(
         extractor.fetchFrames(BigInt(scanEU), scanBound, false, fromByteOffset),
@@ -828,6 +853,36 @@ async function handleFetchSegment(
       audioFrames = run.audio;
       fetchStart = run.startStorageEU;
       lgNextFrame = run.nextFrame;
+    } else if (noIndexTranscode) {
+      const fileSize = await loader.fileSize;
+      if (gen !== fetchQ.currentGeneration) return;
+      // Reuse the persistent reader only when this fetch continues exactly where the last ended
+      // (contiguous forward play). Otherwise (first fetch / seek / discontinuity) reposition by byte
+      // percentage to the next GOP head and reset the decoder to label output from the target frame.
+      const expectedNext = vodReader ? Number(vodReader.nextEditUnit) : -1;
+      if (!vodReader || startFrame !== expectedNext) {
+        const essStart = Number(bootstrap.essenceStart);
+        const essEnd = essenceEndByte(bootstrap.ripEntries, essStart, fileSize);
+        const total = Number(bootstrap.metadata.duration) || 0;
+        const approxByte = approxEssenceByte(startFrame, total, essStart, essEnd);
+        const pkgByte = await mxfFile.findPackageStartAtOrAfter(approxByte, essEnd, signal, noIndexGopHeadDetector());
+        if (gen !== fetchQ.currentGeneration) return;
+        const tcBase = storedEditRateDenominator > 0 ? Math.round(storedEditRateNumerator / storedEditRateDenominator) : 0;
+        vodReader = new LiveSequentialReader(loader, BigInt(pkgByte), BigInt(startFrame), tcBase);
+        // Drop the decoder's references and label output (display order) from the target frame. The
+        // landing is a GOP head, so the first emitted picture is its random-access I.
+        transcodePipeline!.reset(startFrame, false);
+        if (workerDebug) console.log(`[noindex-transcode] reposition: frame ${startFrame} → byte ${pkgByte} (approx ${approxByte})`);
+      }
+      const reader = vodReader;
+      const vid: EssenceFrame[] = [];
+      const aud: EssenceFrame[] = [];
+      for await (const f of reader.readForward(frameCount, fileSize, signal)) {
+        if (f.trackType === 'video') vid.push(f); else aud.push(f);
+      }
+      if (gen !== fetchQ.currentGeneration) return; // seek superseded us mid-read; reader is discarded
+      videoFrames = vid;
+      audioFrames = aud;
     } else if (noIndexIntra) {
       const fileSize = await loader.fileSize;
       if (gen !== fetchQ.currentGeneration) return;
@@ -995,17 +1050,23 @@ async function handleFetchSegment(
         // (else the next real fetch would look contiguous with a preview and wrongly keep its leading B's).
         if (!isScrubPreview && !cacheOnly) lgLastContiguousEnd = lgNextFrame;
 
+        // In 'none' mode the index must be ignored: a forced-none file still carries real index
+        // segments, but our byte-% landing labels frames only approximately, so the per-frame
+        // temporal offsets (Tier 1, keyed by exact edit unit) no longer correspond. Pass no meta and
+        // force POC-based reorder (Tier 2) — the H.264 bitstream's own picture order is authoritative
+        // and self-consistent regardless of the approximate edit-unit labels.
+        const noneReorder = bootstrap.indexMode === 'none';
         const inputs: ReorderInputFrame[] = videoFrames.map(f => ({
           avcc: isAnnexB(f.data) ? new Uint8Array(annexBtoAVCC(f.data)) : new Uint8Array(f.data),
           editUnit: f.editUnit,
-          meta: resolveEntryMeta(segs, f.editUnit, vid),
+          meta: noneReorder ? undefined : resolveEntryMeta(segs, f.editUnit, vid),
         }));
         const resolved = resolveReorder(inputs, {
           sps: longGop.sps,
           ppsFlagMap: longGop.ppsFlagMap,
           startStorageEU: BigInt(fetchStart),
           isRunKeyframeBoundary: isBoundary,
-          forcePoc: longGop.usePoc,
+          forcePoc: noneReorder || longGop.usePoc,
         });
 
         // Attach the resolved PTS/DTS/isKeyframe to the source frames (decode order, kept frames).
@@ -1160,12 +1221,20 @@ function handleSeek(targetFrame: number): void {
   // ffmpeg-VBE frame as a keyframe); other codecs keep the original resolution.
   let nearestKeyframe: number;
   let gopFrameCount: number;
-  if (longGop && bootstrap.indexMode === 'none') {
-    // Tier 3: snap to the nearest discovered keyframe (the fetch path refines it by scanning for the
-    // enclosing IDR). GOP length is unknown without an index, and fast scrub is disabled for 'none',
-    // so report 1.
-    const fl = sparseKf?.floor(BigInt(targetFrame)) ?? null;
-    nearestKeyframe = fl ? Number(fl.editUnit) : targetFrame;
+  if (bootstrap.indexMode === 'none') {
+    // No usable index (genuine or forced): there is no edit-unit→byte map and the index segments (if
+    // any) must be ignored — resolveKeyframeFor would consult them and snap to a real GOP head, which
+    // the byte-% fetch path can't honour. The fetch path repositions APPROXIMATELY to the target frame
+    // (intra: any package; MPEG-2/Long-GOP: the next GOP head), so just target the requested frame.
+    // For Long-GOP, prefer a nearby discovered keyframe (cheap exact scan) when one is known. Fast
+    // scrub is disabled for 'none', so GOP length is reported as 1.
+    if (longGop) {
+      const fl = sparseKf?.floor(BigInt(targetFrame)) ?? null;
+      const flClose = fl !== null && (targetFrame - Number(fl.editUnit)) <= NOINDEX_GOP_LOOKAHEAD;
+      nearestKeyframe = flClose ? Number(fl!.editUnit) : targetFrame;
+    } else {
+      nearestKeyframe = targetFrame;
+    }
     gopFrameCount = 1;
   } else {
     nearestKeyframe = resolveKeyframeFor(bootstrap, targetFrame);
@@ -1179,7 +1248,9 @@ function handleSeek(targetFrame: number): void {
   // PRESENTATION edit unit (storage + the I's temporal_reference, read at decode) and counts display
   // order from there — so the post-seek playhead lands on the right picture even though Long-GOP
   // stores in decode order. No-op for the H.264 path (no pipeline; resolveReorder handles its reorder).
-  transcodePipeline?.reset(nearestKeyframe);
+  // In 'none' mode the fetch reposition re-resets the pipeline (useDisplayBase=false) at the byte-%
+  // landing — temporal_reference relabelling would assume a real GOP head we don't have — so pass false.
+  transcodePipeline?.reset(nearestKeyframe, bootstrap.indexMode !== 'none');
   // Break the contiguous frontier: the next fetch starts a fresh GOP run after a discontinuity, so it
   // must drop open-GOP leading B's (the prior GOP is no longer resident) and land the keyframe first.
   lgLastContiguousEnd = null;
@@ -1310,6 +1381,31 @@ function liveKeyframeDetector(): ((value: Uint8Array) => boolean) | undefined {
     };
   }
   return undefined; // any frame is a fine start (all-intra), or codec without a cheap marker
+}
+
+/**
+ * GOP-head predicate over a picture element's value bytes for the no-index ('none') byte-percentage
+ * SEEK reposition (MxfFile.findPackageStartAtOrAfter). After a byte-% jump the decoder must resume on
+ * a random-access point, so the walk skips packages until this returns true:
+ *   - MPEG-2: a sequence (B3) / GOP (B8) start code (reuses {@link liveKeyframeDetector}).
+ *   - H.264 inter-coded (XAVC-L Long-GOP): an I-frame access unit — an IDR OR a non-IDR
+ *     recovery-point I-frame, since open-GOP cameras (Sony XAVC-L) emit a true IDR only for the very
+ *     first picture and mark every later GOP head as a non-IDR I-frame. Matching IDR-only would dig
+ *     past the whole file (no IDR found) and land arbitrarily → empty run → stall.
+ *   - all-intra / unknown: undefined ⇒ every package is a valid landing (caller takes the first).
+ * Distinct from liveKeyframeDetector ONLY for H.264: live accepts any picture near the edge (a short
+ * sync gap is tolerable live), but a VOD seek should land cleanly on a GOP head.
+ */
+function noIndexGopHeadDetector(): ((value: Uint8Array) => boolean) | undefined {
+  const codec = mxfFile?.getBootstrap()?.metadata.pictureDescriptor?.codec;
+  if (codec === 'h264' && longGop) {
+    return (v: Uint8Array) => {
+      const ab = v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength) as ArrayBuffer;
+      const avcc = isAnnexB(ab) ? new Uint8Array(annexBtoAVCC(ab)) : v;
+      return isIFrameAccessUnit(avcc);
+    };
+  }
+  return liveKeyframeDetector(); // MPEG-2 start-code scan, or undefined for all-intra
 }
 
 /**

@@ -17,10 +17,10 @@
  */
 import type { EssenceFrame } from '../essence/essence-extractor.js';
 import { isAnnexB, annexBtoAVCC } from '../essence/avc-tools.js';
-import { isIdrAccessUnit } from '../essence/h264-poc.js';
+import { isIFrameAccessUnit } from '../essence/h264-poc.js';
 import type { SparseKeyframeIndex } from '../essence/sparse-keyframe-index.js';
 
-/** Over-scan past the requested window to reach the next IDR. XAVC-L GOPs are small (≤ ~30). */
+/** Over-scan past the requested window to reach the next GOP head. XAVC-L GOPs are small (≤ ~30). */
 export const NOINDEX_GOP_LOOKAHEAD = 60;
 
 export interface NoIndexRun {
@@ -67,11 +67,14 @@ export async function selectNoIndexLongGopRun(
     videoSeen++;
     const eu = Number(f.editUnit);
     const avcc = isAnnexB(f.data) ? new Uint8Array(annexBtoAVCC(f.data)) : new Uint8Array(f.data);
-    const idr = isIdrAccessUnit(avcc);
-    if (idr && f.byteOffset !== undefined) sparseKf?.record(f.editUnit, f.byteOffset);
+    // A GOP head is any I-frame, not only an IDR: open-GOP cameras (Sony XAVC-L) emit a true IDR only
+    // for the first picture and mark every later GOP head as a non-IDR recovery-point I-frame. Treating
+    // only IDRs as keyframes would never anchor a mid-file run → empty run → stall.
+    const key = isIFrameAccessUnit(avcc);
+    if (key && f.byteOffset !== undefined) sparseKf?.record(f.editUnit, f.byteOffset);
 
-    if (idr && eu <= startFrame) {
-      // (Re)anchor at the closest IDR ≤ the requested start; drop any earlier-scanned GOP.
+    if (key && eu <= startFrame) {
+      // (Re)anchor at the closest GOP head ≤ the requested start; drop any earlier-scanned GOP.
       headEU = eu;
       video.length = 0; audio.length = 0;
       lastInteriorEU = -1; lastInteriorIdx = -1;
@@ -79,8 +82,8 @@ export async function selectNoIndexLongGopRun(
       continue;
     }
     if (headEU === null) continue;                          // still before the enclosing keyframe
-    if (idr && eu >= windowEnd) { nextFrame = eu; break; }  // GOP boundary past the window → run end
-    if (idr) { lastInteriorEU = eu; lastInteriorIdx = video.length; }
+    if (key && eu >= windowEnd) { nextFrame = eu; break; }  // GOP boundary past the window → run end
+    if (key) { lastInteriorEU = eu; lastInteriorIdx = video.length; }
     video.push(f);
   }
 

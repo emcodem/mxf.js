@@ -209,9 +209,13 @@ export function resolveReorder(frames: ReorderInputFrame[], opts: ReorderOptions
     if (sh.fieldPicFlag) return decodeOrderFallback(frames, startStorageEU, lengthSize);
 
     const pocVal = poc.computeFrame(sh, sps);
-    // A GOP head is an IDR (or an index-flagged keyframe). Sync samples (random-access) are IDRs;
-    // the index keyframe flag is honoured too when present.
-    const isKeyframe = sh.isIdr || !!frames[i].meta?.isKeyframe;
+    // A GOP head / sync sample is any intra-coded picture: an IDR, an index-flagged keyframe, OR a
+    // non-IDR I-slice (slice_type 2/7). The last case is essential for open-GOP cameras (Sony XAVC-L):
+    // only the file's first picture is a true IDR and every later GOP head is a recovery-point I-frame,
+    // so without the I-slice test a no-index segment would carry NO sync sample and MSE would refuse to
+    // start decoding it (the picture never appears — a post-seek stall). An I-slice is intra-coded, so
+    // once the boundary's undecodable leading B's are dropped it is a valid random-access point.
+    const isKeyframe = sh.isIdr || sh.sliceType === 2 || !!frames[i].meta?.isKeyframe;
     items.push({
       poc: pocVal,
       isGopHead: isKeyframe,

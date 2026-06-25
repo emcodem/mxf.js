@@ -812,10 +812,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
         // Accurate: decode keyframe→target (plus a couple frames) so the seeked picture appears
         // quickly instead of transcoding a full 2 s chunk; forward playback then resumes with
         // normal-size chunks from nextFetchFrame.
-        const seekChunk = Math.min(
-          this.framesPerChunk,
-          Math.max(1, this.seekTargetFrame - keyframe + 3),
-        );
+        //
+        // 'none' mode has no keyframe→byte map: the worker repositions APPROXIMATELY to the target by
+        // byte percentage (keyframe == targetFrame here), so a keyframe→target sub-decode is meaningless
+        // and a tiny chunk would underfeed a reorder-holding transcode decoder (MPEG-2/Long-GOP emit
+        // nothing until they have a GOP), stalling the first post-seek paint. Fetch a full chunk so the
+        // landing GOP decodes and emits.
+        const seekChunk = this.indexMode === 'none'
+          ? this.framesPerChunk
+          : Math.min(this.framesPerChunk, Math.max(1, this.seekTargetFrame - keyframe + 3));
         this.fetchNextChunk(seekChunk);
         break;
       }

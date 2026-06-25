@@ -337,12 +337,23 @@ export class MxfFile {
    * forward to the System Item that precedes a picture element (the package start), else the picture
    * element itself. Falls back to `approxByte` if no picture element is found in the window.
    *
-   * Intended for ALL-INTRA streams only: every content package is a random-access point, so any
-   * package start is a valid resume point. The caller seeds its sequential reader's edit-unit counter
-   * from the (approximate) target frame — the System Item timecode is deliberately NOT consulted (it
-   * can roll over at 24 h or be discontinuous).
+   * For ALL-INTRA streams (no `isKeyframeData`) every content package is a random-access point, so the
+   * FIRST package start is returned. For inter-coded streams (MPEG-2 Long-GOP, XAVC-L) pass
+   * `isKeyframeData` — a predicate over the picture element's value bytes that returns true only for a
+   * GOP head (MPEG-2 sequence/GOP start code, or an H.264 IDR): the walk then SKIPS non-keyframe
+   * packages and returns the first keyframe package, so the decoder resumes cleanly. If the window
+   * holds no keyframe (rare — GOPs are far smaller than the scan window), it falls back to the first
+   * picture package (a short decoder-sync gap), then to `start`.
+   *
+   * The caller seeds its sequential reader's edit-unit counter from the (approximate) target frame —
+   * the System Item timecode is deliberately NOT consulted (it can roll over at 24 h or be discontinuous).
    */
-  async findPackageStartAtOrAfter(approxByte: number, endByte: number, signal?: AbortSignal): Promise<number> {
+  async findPackageStartAtOrAfter(
+    approxByte: number,
+    endByte: number,
+    signal?: AbortSignal,
+    isKeyframeData?: (value: Uint8Array) => boolean,
+  ): Promise<number> {
     const start = Math.max(0, Math.min(approxByte, endByte - 1));
     const end = Math.min(endByte, start + LIVE_START_SCAN_WINDOW) - 1;
     if (end < start) return start;
@@ -350,11 +361,13 @@ export class MxfFile {
     let buf: ArrayBuffer;
     try { buf = await this.loader.fetchRange(start, end, 'none-mode byte-% seek: locate content package', signal); }
     catch { return start; }
+    const u8 = new Uint8Array(buf);
 
     const iter = new KLVIterator(buf, 0);
     if (!this.bufferStartsWithKey(buf, 0) && !iter.resync()) return start;
 
     let pendingSystemOff = -1;
+    let firstVideoPkgOff = -1;   // earliest picture package (fallback when no keyframe is found)
     while (iter.hasMore()) {
       const off = iter.offset;
       const pkt = iter.next();
@@ -362,11 +375,19 @@ export class MxfFile {
       const k = pkt.key;
       if (isPartitionPack(k) || isFill(k)) { pendingSystemOff = -1; continue; }
       if (isSystemItem(k)) { pendingSystemOff = off; continue; }
-      // First picture element: its package starts at the preceding System Item if one was seen, else here.
-      if (isPictureEssence(k)) return start + (pendingSystemOff >= 0 ? pendingSystemOff : off);
+      if (isPictureEssence(k)) {
+        // The package starts at the preceding System Item if one was seen, else at this picture element.
+        const pkgOff = pendingSystemOff >= 0 ? pendingSystemOff : off;
+        if (firstVideoPkgOff < 0) firstVideoPkgOff = pkgOff;
+        if (!isKeyframeData || isKeyframeData(u8.subarray(pkt.valueOffset, pkt.valueOffset + pkt.valueLength))) {
+          return start + pkgOff;
+        }
+        pendingSystemOff = -1; // this package wasn't a keyframe; keep scanning for the next
+      }
       // Other generic-container elements (audio/data tail of the previous package): keep scanning.
     }
-    return start;
+    // No keyframe package in the window: accept the first picture package (short sync gap), else `start`.
+    return start + (firstVideoPkgOff >= 0 ? firstVideoPkgOff : 0);
   }
 
   /** True when `buf` at `offset` begins with the MXF UL key prefix (06 0E 2B 34). */

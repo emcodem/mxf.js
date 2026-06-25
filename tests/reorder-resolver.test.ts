@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { computeReorder, resolveReorder, accessUnitHasBSlice, accessUnitHasInterSlice } from '../src/essence/reorder-resolver.js';
 import type { ReorderItem, ReorderInputFrame } from '../src/essence/reorder-resolver.js';
-import { parseSpsPocInfo, buildPpsPocMap } from '../src/essence/h264-poc.js';
+import { parseSpsPocInfo, buildPpsPocMap, isIFrameAccessUnit, isIdrAccessUnit } from '../src/essence/h264-poc.js';
 import { buildSps, buildPps, buildSliceNal, toAvcc } from './helpers/h264-bitstream.js';
 
 const fixture = JSON.parse(
@@ -212,5 +212,24 @@ describe('accessUnitHasInterSlice (intra-only confirmation)', () => {
   });
   it('reports true for a B-slice access unit', () => {
     expect(accessUnitHasInterSlice(bAu, sps, ppsFlagMap)).toBe(true);
+  });
+});
+
+describe('isIFrameAccessUnit (open-GOP GOP-head detection)', () => {
+  const idrAu = toAvcc([buildSps(), buildPps(), buildSliceNal({ sliceType: 2, idr: true, frameNum: 0, picOrderCntLsb: 0 })]);
+  const iAu   = toAvcc([buildSps(), buildPps(), buildSliceNal({ sliceType: 2, idr: false, frameNum: 0, picOrderCntLsb: 0 })]);
+  const pAu   = toAvcc([buildSliceNal({ sliceType: 0, frameNum: 1, picOrderCntLsb: 2 })]);
+  const bAu   = toAvcc([buildSliceNal({ sliceType: 1, frameNum: 1, picOrderCntLsb: 2 })]);
+
+  it('accepts an IDR access unit', () => {
+    expect(isIFrameAccessUnit(idrAu)).toBe(true);
+  });
+  it('accepts a NON-IDR I-frame — the Sony XAVC-L open-GOP head that IDR-only detection misses', () => {
+    expect(isIFrameAccessUnit(iAu)).toBe(true);
+    expect(isIdrAccessUnit(iAu)).toBe(false); // why isIFrameAccessUnit is needed: this is not an IDR
+  });
+  it('rejects P- and B-slice access units (not random-access points)', () => {
+    expect(isIFrameAccessUnit(pAu)).toBe(false);
+    expect(isIFrameAccessUnit(bAu)).toBe(false);
   });
 });

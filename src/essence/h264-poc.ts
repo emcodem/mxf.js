@@ -106,6 +106,28 @@ export function isIdrAccessUnit(avcc: Uint8Array, lengthSize = 4): boolean {
   return s !== null && s.type === NAL_SLICE_IDR;
 }
 
+/**
+ * True if the access unit's first coded slice is an I-slice — i.e. the picture is intra-coded and a
+ * GOP head / random-access point. Covers BOTH an IDR (always I) and a NON-IDR recovery-point I-frame,
+ * which is how open-GOP cameras (notably Sony XAVC-L) mark every GOP head AFTER the first: only the
+ * file's first picture is a true IDR (NAL type 5); subsequent GOP heads are NAL type 1 with an I-slice
+ * plus a recovery-point SEI. {@link isIdrAccessUnit} alone misses those, so a no-index seek scanning
+ * for keyframes never anchors and the run comes back empty (→ stall). slice_type % 5 === 2 is I
+ * (values 2 and 7); reading first_mb_in_slice then slice_type needs no SPS/PPS context.
+ */
+export function isIFrameAccessUnit(avcc: Uint8Array, lengthSize = 4): boolean {
+  const s = firstSliceNal(avcc, lengthSize);
+  if (s === null) return false;
+  if (s.type === NAL_SLICE_IDR) return true;
+  try {
+    const r = new BitReader(stripEmulationPrevention(s.nal));
+    r.ue();                          // first_mb_in_slice
+    return r.ue() % 5 === 2;         // slice_type: 2 (and 7) == I
+  } catch {
+    return false;
+  }
+}
+
 /** Skip a scaling list of `size` coefficients (used inside the high-profile SPS prologue). */
 function skipScalingList(r: BitReader, size: number): void {
   let lastScale = 8, nextScale = 8;
