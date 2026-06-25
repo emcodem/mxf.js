@@ -1,4 +1,5 @@
 import { EventEmitter, MxfPlayerEvents, ManifestData, TimecodeBundle, TimecodeSource } from './events.js';
+import type { IndexMode } from './mxf-file.js';
 import { MseController } from './mse/mse-controller.js';
 import { WebAudioController } from './audio/web-audio-controller.js';
 import { ScrubController } from './scrub-controller.js';
@@ -116,6 +117,14 @@ export interface MxfConfig {
   plugins?: {
     videoDecoder?: VideoDecoderPluginConfig;
   };
+  /**
+   * Override the detected index mode for testing/debugging. When set, the worker discards the
+   * index mode derived from the file and uses this value instead. Ignored in live mode.
+   * - `'none'`: forces the no-index byte-percentage seek path even on indexed files.
+   * - `'cbg'` / `'vbe'`: forces a specific index strategy; only useful if the file has the
+   *   corresponding index segments.
+   */
+  forceIndexMode?: IndexMode;
 }
 
 /** Built-in FFmpeg-codec-name → pd.codec mapping for common cases. */
@@ -147,6 +156,7 @@ const DEFAULT_CONFIG: Required<MxfConfig> = {
   livePollMs: 1000,
   liveReuseHeader: false,
   plugins: {},
+  forceIndexMode: undefined as unknown as IndexMode,
 };
 
 
@@ -631,7 +641,8 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.setup();
     const plugins = this.config.plugins?.videoDecoder
       ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
-    const cmd: WorkerCommand = { type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins, cacheBytes: this.config.maxSourceCacheBytes };
+    const cmd: WorkerCommand = { type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins, cacheBytes: this.config.maxSourceCacheBytes,
+      ...(this.config.forceIndexMode ? { forceIndexMode: this.config.forceIndexMode } : {}) };
     this.worker!.postMessage(cmd);
   }
 
@@ -665,7 +676,8 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.setup();
     const plugins = this.config.plugins?.videoDecoder
       ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
-    const cmd: WorkerCommand = { type: 'initFile', file, debug: this.config.debug, videoMode: 'mse', plugins, cacheBytes: this.config.maxSourceCacheBytes };
+    const cmd: WorkerCommand = { type: 'initFile', file, debug: this.config.debug, videoMode: 'mse', plugins, cacheBytes: this.config.maxSourceCacheBytes,
+      ...(this.config.forceIndexMode ? { forceIndexMode: this.config.forceIndexMode } : {}) };
     this.worker!.postMessage(cmd);
   }
 

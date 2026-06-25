@@ -3,7 +3,7 @@ import { FileLoader } from '../loader/file-loader.js';
 import { ILoader } from '../loader/loader.js';
 import { wrapWithSourceCache, CachingLoader } from '../loader/caching-loader.js';
 import { MxfFile } from '../mxf-file.js';
-import type { MxfBootstrap } from '../mxf-file.js';
+import type { MxfBootstrap, IndexMode } from '../mxf-file.js';
 import { EssenceExtractor, LiveSequentialReader } from '../essence/essence-extractor.js';
 import { Mp4Fragmenter } from '../remuxer/mp4-fragmenter.js';
 import {
@@ -13,10 +13,11 @@ import {
 import { isAnnexB, annexBtoAVCC, extractSPSPPS, buildAVCDecoderConfigRecord } from '../essence/avc-tools.js';
 import { parseSpsPocInfo, buildPpsPocMap } from '../essence/h264-poc.js';
 import type { SpsPocInfo, PpsPocInfo } from '../essence/h264-poc.js';
-import { resolveReorder, accessUnitHasBSlice } from '../essence/reorder-resolver.js';
+import { resolveReorder, accessUnitHasBSlice, accessUnitHasInterSlice } from '../essence/reorder-resolver.js';
 import type { ReorderInputFrame } from '../essence/reorder-resolver.js';
 import { SparseKeyframeIndex } from '../essence/sparse-keyframe-index.js';
 import { selectNoIndexLongGopRun, NOINDEX_GOP_LOOKAHEAD } from './longgop-noindex.js';
+import { essenceEndByte, approxEssenceByte } from './noindex-intra.js';
 import { decodePcmElements } from '../audio/pcm.js';
 import { WorkerCommand, WorkerEvent, TimecodeAnchor, WorkerPluginConfig } from './worker-messages.js';
 import type { EssenceFrame } from '../essence/essence-extractor.js';
@@ -120,6 +121,8 @@ function _diagAvccParamSets(buf: ArrayBuffer): { sps: boolean; pps: boolean; idr
 }
 // Config for the wasm plugin, carried from the init command so handleInit can use it.
 let activePluginConfig: WorkerPluginConfig | null = null;
+// Forced index mode override (testing/debugging only). Set from the init command; null = use detected.
+let pendingForceIndexMode: IndexMode | null = null;
 
 // H.264 Long-GOP (XAVC-L) reorder state: set during handleInit when B-frames are detected. The
 // fetch path then reconstructs PTS/DTS via the index temporalOffset (Tier 1) or parsed POC (Tier 2).
@@ -140,6 +143,16 @@ let lgLastContiguousEnd: number | null = null;
 // Tier-3 (indexMode 'none') only: lazily-built keyframe map (edit unit → byte offset) populated as a
 // side effect of no-index scans, so a seek can resume near the target instead of rescanning from 0.
 let sparseKf: SparseKeyframeIndex | null = null;
+
+// All-intra no-index ('none') VOD: the init probe confirmed every probed access unit is intra (no P/B
+// slice), so any content package is independently decodable and the byte-percentage seek path is safe.
+// (longGop / IPPP streams must NOT take that path — they need a keyframe + reference frames.)
+let intraOnlyNoIndex = false;
+// Persistent forward reader for the intra 'none' path: holds a byte cursor + carry + a continuous
+// edit-unit counter, so contiguous forward fetches stream gaplessly instead of re-reading from the
+// essence start (the "first second loops forever" bug). Repositioned by byte-percentage on a seek /
+// discontinuity (handleSeek nulls it). Null until the first fetch creates it.
+let vodReader: LiveSequentialReader | null = null;
 
 // Speculative read-ahead (MPEG-2 forward-play only): the byte-fetch of the NEXT contiguous chunk is
 // kicked off right before the current chunk's (event-loop-blocking) decode, so its download runs on
@@ -317,6 +330,8 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
   longGop = null;
   lgLastContiguousEnd = null;
   sparseKf = null;
+  intraOnlyNoIndex = false;
+  vodReader = null;
   abortSpeculation();
   scrubSegmentCache.clear();
   liveMode = live;
@@ -332,6 +347,10 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
 
   try {
     const bootstrap = live ? await mxfFile.openLive() : await mxfFile.open();
+    if (pendingForceIndexMode && !live) {
+      if (workerDebug) console.log(`[mxf.js] forceIndexMode: ${bootstrap.indexMode} → ${pendingForceIndexMode}`);
+      bootstrap.indexMode = pendingForceIndexMode;
+    }
     liveMark('bootstrap done (header PP + metadata + locateEssence)');
     const { metadata } = bootstrap;
     // Surfaced in the manifest so the player can cache them and drive a header-skip continuation
@@ -639,14 +658,21 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
           // (temporal offsets) vs Tier 2 (H.264 POC) rankings reliably.
           const probeFrames: Array<{avcc: Uint8Array; editUnit: bigint}> = [];
           let hasBSlice = false;
+          let hasInterSlice = false; // any P or B slice ⇒ NOT intra-only
           for await (const frame of probe.fetchFrames(0n, 30)) {
             if (frame.trackType !== 'video') continue;
             const avcc = isAnnexB(frame.data) ? new Uint8Array(annexBtoAVCC(frame.data)) : new Uint8Array(frame.data);
             if (!hasBSlice && accessUnitHasBSlice(avcc, spsPocInfo, ppsFlagMap)) hasBSlice = true;
+            if (!hasInterSlice && accessUnitHasInterSlice(avcc, spsPocInfo, ppsFlagMap)) hasInterSlice = true;
             probeFrames.push({ avcc, editUnit: frame.editUnit });
             if (hasBSlice && probeFrames.length >= 4) break;
             if (!hasBSlice && probeFrames.length >= 30) break;
           }
+
+          // Intra-only confirmation for the no-index byte-percentage seek path: every probed AU was
+          // intra (no P/B). Only meaningful for 'none' VOD; a B-slice (→ longGop) or any inter slice
+          // (IPPP) rules it out. MXF essence coding mode is fixed per file, so the probe generalizes.
+          intraOnlyNoIndex = bootstrap.indexMode === 'none' && probeFrames.length > 0 && !hasInterSlice;
 
           if (hasBSlice) {
             let usePoc = false;
@@ -781,6 +807,11 @@ async function handleFetchSegment(
     // enclosing GOP run, and record discovered keyframes. Memory-safe (scanned-past frames are
     // discarded), so even a cold seek that rescans from the start doesn't buffer the whole file.
     const noIndexLongGop = !!longGop && !transcodePipeline && bootstrap.indexMode === 'none';
+    // All-intra no-index VOD: every content package is independently decodable. Forward play streams
+    // through a persistent reader (gapless, no re-read loop); a seek / discontinuity repositions it by
+    // byte percentage and digs forward to the next content package. PTS comes purely from the frame
+    // number (reader seeded with startFrame), never the System Item. See the 'none' fix plan.
+    const noIndexIntra = intraOnlyNoIndex && !longGop && !transcodePipeline && bootstrap.indexMode === 'none';
     if (noIndexLongGop) {
       // Resume the scan at the nearest known keyframe (else the essence start), reading enough to
       // cover the window plus a lookahead to reach the next IDR (GOP boundary).
@@ -797,6 +828,33 @@ async function handleFetchSegment(
       audioFrames = run.audio;
       fetchStart = run.startStorageEU;
       lgNextFrame = run.nextFrame;
+    } else if (noIndexIntra) {
+      const fileSize = await loader.fileSize;
+      if (gen !== fetchQ.currentGeneration) return;
+      // Reuse the persistent reader only when this fetch continues exactly where the last one ended
+      // (contiguous forward play). Otherwise (first fetch, seek, or any discontinuity) reposition by
+      // byte percentage: target frame → byte offset → dig forward to the next content package.
+      const expectedNext = vodReader ? Number(vodReader.nextEditUnit) : -1;
+      if (!vodReader || startFrame !== expectedNext) {
+        const essStart = Number(bootstrap.essenceStart);
+        const essEnd = essenceEndByte(bootstrap.ripEntries, essStart, fileSize);
+        const total = Number(bootstrap.metadata.duration) || 0;
+        const approxByte = approxEssenceByte(startFrame, total, essStart, essEnd);
+        const pkgByte = await mxfFile.findPackageStartAtOrAfter(approxByte, essEnd, signal);
+        if (gen !== fetchQ.currentGeneration) return;
+        const tcBase = storedEditRateDenominator > 0 ? Math.round(storedEditRateNumerator / storedEditRateDenominator) : 0;
+        vodReader = new LiveSequentialReader(loader, BigInt(pkgByte), BigInt(startFrame), tcBase);
+        if (workerDebug) console.log(`[noindex-intra] reposition: frame ${startFrame} → byte ${pkgByte} (approx ${approxByte})`);
+      }
+      const reader = vodReader;
+      const vid: EssenceFrame[] = [];
+      const aud: EssenceFrame[] = [];
+      for await (const f of reader.readForward(frameCount, fileSize, signal)) {
+        if (f.trackType === 'video') vid.push(f); else aud.push(f);
+      }
+      if (gen !== fetchQ.currentGeneration) return; // seek superseded us mid-read; reader is discarded
+      videoFrames = vid;
+      audioFrames = aud;
     } else {
       if (longGop && !transcodePipeline) {
         const segs = bootstrap.indexSegments, vid = bootstrap.essenceBodySID;
@@ -1092,6 +1150,11 @@ function handleSeek(targetFrame: number): void {
   // Supersede any queued/in-flight fetch from the old position (see FetchQueue.supersede): an
   // in-flight fetch checks the generation after its awaits and discards its now-stale frames.
   fetchQ.supersede();
+
+  // Invalidate the intra no-index forward reader: the next fetch is a discontinuity and will
+  // reposition it by byte percentage. Nulling here (after supersede) means any in-flight fetch still
+  // advancing the now-orphaned reader can't corrupt the post-seek fetch, which builds a fresh one.
+  vodReader = null;
 
   // Long-GOP uses the auto-detecting keyframe predicate (the legacy 0x80 test mis-detects every
   // ffmpeg-VBE frame as a keyframe); other codecs keep the original resolution.
@@ -1522,12 +1585,14 @@ const commandHandlers: CommandHandlers = {
   initUrl: (cmd) => {
     videoMode = cmd.videoMode ?? 'mse';
     activePluginConfig = cmd.plugins?.videoDecoder ?? null;
+    pendingForceIndexMode = cmd.forceIndexMode ?? null;
     const loader = wrapWithSourceCache(new HttpLoader(cmd.url), cmd.cacheBytes ?? 0, !!cmd.live);
     handleInit(loader, cmd.debug, cmd.live, cmd.startEditUnit, cmd.liveFromStart).catch(e => postError(String(e), true));
   },
   initFile: (cmd) => {
     videoMode = cmd.videoMode ?? 'mse';
     activePluginConfig = cmd.plugins?.videoDecoder ?? null;
+    pendingForceIndexMode = cmd.forceIndexMode ?? null;
     const loader = wrapWithSourceCache(new FileLoader(cmd.file), cmd.cacheBytes ?? 0, !!cmd.live);
     handleInit(loader, cmd.debug, cmd.live, cmd.startEditUnit, cmd.liveFromStart).catch(e => postError(String(e), true));
   },

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { computeReorder, resolveReorder, accessUnitHasBSlice } from '../src/essence/reorder-resolver.js';
+import { computeReorder, resolveReorder, accessUnitHasBSlice, accessUnitHasInterSlice } from '../src/essence/reorder-resolver.js';
 import type { ReorderItem, ReorderInputFrame } from '../src/essence/reorder-resolver.js';
 import { parseSpsPocInfo, buildPpsPocMap } from '../src/essence/h264-poc.js';
 import { buildSps, buildPps, buildSliceNal, toAvcc } from './helpers/h264-bitstream.js';
@@ -195,5 +195,22 @@ describe('accessUnitHasBSlice (Long-GOP detection)', () => {
     const iAu = toAvcc([buildSps(), buildPps(), buildSliceNal({ sliceType: 2, idr: true, frameNum: 0, picOrderCntLsb: 0 })]);
     expect(accessUnitHasBSlice(bAu, sps, ppsFlagMap)).toBe(true);
     expect(accessUnitHasBSlice(iAu, sps, ppsFlagMap)).toBe(false);
+  });
+});
+
+describe('accessUnitHasInterSlice (intra-only confirmation)', () => {
+  const iAu = toAvcc([buildSps(), buildPps(), buildSliceNal({ sliceType: 2, idr: true, frameNum: 0, picOrderCntLsb: 0 })]);
+  const pAu = toAvcc([buildSliceNal({ sliceType: 0, frameNum: 1, picOrderCntLsb: 2 })]);
+  const bAu = toAvcc([buildSliceNal({ sliceType: 1, frameNum: 1, picOrderCntLsb: 2 })]);
+
+  it('reports false for an all-intra (I/IDR) access unit', () => {
+    expect(accessUnitHasInterSlice(iAu, sps, ppsFlagMap)).toBe(false);
+  });
+  it('reports true for a P-slice access unit (stricter than the B test — IPPP is not intra-only)', () => {
+    expect(accessUnitHasInterSlice(pAu, sps, ppsFlagMap)).toBe(true);
+    expect(accessUnitHasBSlice(pAu, sps, ppsFlagMap)).toBe(false); // the B test misses P → why we need this
+  });
+  it('reports true for a B-slice access unit', () => {
+    expect(accessUnitHasInterSlice(bAu, sps, ppsFlagMap)).toBe(true);
   });
 });

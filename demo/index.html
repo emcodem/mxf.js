@@ -112,6 +112,37 @@
     .stats-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
                       margin-right: 5px; vertical-align: -1px; }
     /* ─── END STATS PANEL ─────────────────────────────────────────────────────────────────────── */
+
+    /* ─── PLAYER OPTIONS ──────────────────────────────────────────────────────────────────────────
+       Collapsed-by-default panel exposing the MxfConfig knobs the player is constructed with, so
+       specific API settings (forced index mode, seek mode, buffering, source cache, audio path) can
+       be exercised from the demo without editing code. The inputs ARE the source of truth: initPlayer
+       reads them via getPlayerOpts() — so the pre-filled values below are this demo's effective
+       config, which intentionally differs from the library defaults for some knobs (smaller buffers
+       for faster first paint on the latency simulator; source cache off as a diagnostic). The per-row
+       help text states what each does, typical values, and the LIBRARY default. Options apply on the
+       NEXT load — the Reload button re-opens the current source with the current settings. */
+    #playerOptsPanel { max-width: 960px; margin-bottom: 16px; }
+    #playerOptsPanel > summary { cursor: pointer; color: #888; font-size: 13px; user-select: none; padding: 4px 0; }
+    #playerOptsPanel > summary:hover { color: #aaa; }
+    #playerOptsActive { color: #fa8; margin-left: 8px; font-size: 12px; }
+    .opts-grid { margin-top: 10px; padding: 12px 14px; background: #0d0d0d; border: 1px solid #2a2a2a;
+                 border-radius: 6px; display: grid; grid-template-columns: 150px 1fr; gap: 14px 16px; align-items: start; }
+    .opts-grid > .opt-label { font-size: 13px; color: #ddd; padding-top: 6px; }
+    .opts-grid > .opt-ctrl { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+    .opts-grid select, .opts-grid input[type="number"] {
+      padding: 5px 8px; border-radius: 5px; border: 1px solid #444; background: #1a1a1a; color: #eee;
+      font-size: 13px; width: max-content; }
+    .opts-grid input[type="number"] { width: 96px; }
+    .opt-ctrl > label { display: inline-flex; align-items: center; gap: 6px; color: #ccc; font-size: 13px; }
+    .opt-help { font-size: 11.5px; color: #777; line-height: 1.45; margin: 0; }
+    .opt-help b { color: #9a9; font-weight: 600; }
+    .opt-help code { color: #8af; font-size: 11px; }
+    .opts-actions { grid-column: 1 / -1; display: flex; gap: 10px; align-items: center;
+                    margin-top: 2px; padding-top: 10px; border-top: 1px solid #1e1e1e; }
+    .opts-actions button { padding: 6px 14px; font-size: 12px; }
+    .opts-actions .opts-note { color: #666; font-size: 11.5px; }
+    /* ─── END PLAYER OPTIONS ──────────────────────────────────────────────────────────────────── */
   </style>
 </head>
 <body>
@@ -132,11 +163,99 @@
       <input type="number" id="simRate" value="0" min="0" step="1" placeholder="0 = ∞"
              title="Megabits per second. 0 = unlimited. e.g. 10 = 10 Mbit/s ≈ 1.25 MB/s" style="width:64px;"> Mbit/s</label>
   </div>
-  <div style="color:#666; font-size:12px; margin:-8px 0 16px;">
+  <div style="color:#666; font-size:12px; margin:-8px 0 12px;">
     latency &amp; bandwidth only work against the built-in <code>/media/…</code> simulator, which is the
     Vite dev server itself — i.e. only when this demo is served via <code>npm run dev</code>. They have no
     effect on local files (file picker) or on <code>.mxf</code> URLs served by any other server.
   </div>
+
+  <details id="playerOptsPanel">
+    <summary>Player options <span id="playerOptsActive"></span></summary>
+    <div class="opts-grid">
+
+      <div class="opt-label">index mode</div>
+      <div class="opt-ctrl">
+        <select id="optForceIndexMode">
+          <option value="">auto (detected)</option>
+          <option value="cbg">cbg — constant byte (AVC-Intra, DV)</option>
+          <option value="vbe">vbe — per-frame table (Long-GOP)</option>
+          <option value="none">none — no index, seek by byte %</option>
+        </select>
+        <p class="opt-help">Forces the seek/index strategy instead of using what the file declares.
+          <code>cbg</code> = every frame a fixed byte size; <code>vbe</code> = per-frame entry table;
+          <code>none</code> = no map, jump by byte percentage then dig to the next packet. Use it to
+          exercise fallback paths (e.g. force <code>none</code> on an indexed file). <b>Default: auto.</b></p>
+      </div>
+
+      <div class="opt-label">seek mode</div>
+      <div class="opt-ctrl">
+        <select id="optSeekMode">
+          <option value="accurate">accurate</option>
+          <option value="keyframe">keyframe</option>
+        </select>
+        <p class="opt-help">How a seek resolves the displayed picture. <code>accurate</code> decodes from
+          the preceding keyframe up to the exact target frame. <code>keyframe</code> shows only the GOP-head
+          I-frame for the whole GOP — near-instant, but lands on a random-access point, not the exact frame.
+          (Scrubbing always uses keyframe previews regardless.) <b>Default: accurate.</b></p>
+      </div>
+
+      <div class="opt-label">start buffer</div>
+      <div class="opt-ctrl">
+        <label><input type="number" id="optStartBuffer" value="3" min="0" step="1"> seconds</label>
+        <p class="opt-help">Forward-buffer low-water mark — the player fetches more whenever buffered-ahead
+          drops below this. Higher rides out bandwidth dips; lower starts playing sooner. Typical
+          <b>2–10&nbsp;s</b>. <b>Library default 10&nbsp;s</b> (this demo pre-fills 3 for faster first paint).</p>
+      </div>
+
+      <div class="opt-label">max buffer</div>
+      <div class="opt-ctrl">
+        <label><input type="number" id="optMaxBuffer" value="8" min="1" step="1"> seconds</label>
+        <p class="opt-help">Upper bound on how far ahead to prefetch — caps memory and the bytes wasted when
+          you seek away. Typical <b>8–30&nbsp;s</b>. <b>Library default 30&nbsp;s</b> (demo pre-fills 8).</p>
+      </div>
+
+      <div class="opt-label">resume buffer</div>
+      <div class="opt-ctrl">
+        <label><input type="number" id="optResumeBuffer" value="1.5" min="0" step="0.25"> seconds</label>
+        <p class="opt-help">After a cold start, seek, or stall, playback holds on the first decoded picture
+          until this much is buffered ahead, then plays once. Lower = snappier resume but more re-buffering
+          on a thin/decode-bound source. Typical <b>0.5–2&nbsp;s</b>. <b>Default 1.5&nbsp;s.</b></p>
+      </div>
+
+      <div class="opt-label">source cache</div>
+      <div class="opt-ctrl">
+        <label><input type="number" id="optSourceCache" value="0" min="0" step="16"> MB</label>
+        <p class="opt-help">RAM budget for caching raw (compressed) source bytes already fetched, so backward
+          seeks, loops and scrub-revisits don't re-download. <code>0</code> disables it. A whole moderate file
+          often fits, making re-seeks network-free. Typical <b>0–512&nbsp;MB</b>. <b>Library default 256&nbsp;MB</b>
+          (demo pre-fills 0 as a diagnostic).</p>
+      </div>
+
+      <div class="opt-label">PCM audio</div>
+      <div class="opt-ctrl">
+        <select id="optPcmAudioMode">
+          <option value="auto">auto</option>
+          <option value="webaudio">webaudio</option>
+          <option value="mse">mse</option>
+        </select>
+        <p class="opt-help">How uncompressed PCM audio is played. <code>auto</code> picks by browser support;
+          <code>webaudio</code> forces Web Audio scheduling alongside the muted video; <code>mse</code> tries
+          PCM through MSE (rarely supported). <b>Default: auto.</b></p>
+      </div>
+
+      <div class="opt-label">debug</div>
+      <div class="opt-ctrl">
+        <label><input type="checkbox" id="optDebug" checked> verbose console logging</label>
+        <p class="opt-help">Emit detailed worker + player logs to the browser console. The on-page debug
+          timeline below works regardless. <b>Library default: off</b> (demo pre-fills on).</p>
+      </div>
+
+      <div class="opts-actions">
+        <button id="optReload">Reload with these options</button>
+        <span class="opts-note">Options apply on the next load. Reload re-opens the current source.</span>
+      </div>
+    </div>
+  </details>
 
   <div id="meta"></div>
   <div id="videoWrap" style="position:relative; max-width:960px;">
@@ -266,6 +385,9 @@
     let player = null;
     let seeking = false;
     let fps = 25;   // updated from the manifest; used for frame-step (arrow) keys
+    // Last loaded source ({ kind:'file', file } | { kind:'url', url }), so the Player-options Reload
+    // button can re-open it with the current settings (config only takes effect on a fresh load).
+    let lastLoad = null;
 
     // ── Debug timeline ────────────────────────────────────────────────────────────────────────
     // Captures, on one correlated timeline: raw USER input (keys/clicks/drags), the player CMD it
@@ -469,6 +591,45 @@
     // latency/perf tests can drive the player directly and timestamp manifest/timeupdate/buffering
     // events. Completely inert (no globals set) during normal use.
     const E2E = new URLSearchParams(location.search).has('e2e');
+
+    // ── Player options panel ─────────────────────────────────────────────────────────────────
+    // The panel inputs are the single source of truth for the MxfConfig initPlayer() constructs —
+    // see getPlayerOpts(). The pre-filled values (in the HTML) are this demo's effective config, which
+    // intentionally differs from the library defaults for a few knobs (smaller buffers, source cache
+    // off). The badge in the summary surfaces the settings that visibly change a code path.
+    const playerOptsActiveEl = document.getElementById('playerOptsActive');
+    const playerOptsPanel = document.getElementById('playerOptsPanel');
+    function getPlayerOpts() {
+      const num = (id, fallback) => {
+        const v = parseFloat(document.getElementById(id).value);
+        return Number.isFinite(v) ? v : fallback;
+      };
+      return {
+        // Omit forceIndexMode entirely when 'auto' so the worker uses the detected mode.
+        forceIndexMode: document.getElementById('optForceIndexMode').value || undefined,
+        seekMode: document.getElementById('optSeekMode').value,
+        pcmAudioMode: document.getElementById('optPcmAudioMode').value,
+        startBufferSeconds: num('optStartBuffer', 3),
+        maxBufferSeconds: num('optMaxBuffer', 8),
+        resumeBufferSeconds: num('optResumeBuffer', 1.5),
+        maxSourceCacheBytes: Math.round(num('optSourceCache', 0) * 1024 * 1024),
+        debug: document.getElementById('optDebug').checked,
+      };
+    }
+    function syncPlayerOptsBadge() {
+      const o = getPlayerOpts();
+      const notable = [];
+      if (o.forceIndexMode) notable.push(`index=${o.forceIndexMode}`);
+      if (o.seekMode !== 'accurate') notable.push(`seek=${o.seekMode}`);
+      if (o.pcmAudioMode !== 'auto') notable.push(`pcm=${o.pcmAudioMode}`);
+      if (!o.debug) notable.push('debug off');
+      playerOptsActiveEl.textContent = notable.length ? `· ${notable.join(', ')}` : '';
+    }
+    // Delegated: any select/number/checkbox change inside the panel refreshes the badge.
+    playerOptsPanel.addEventListener('change', syncPlayerOptsBadge);
+    syncPlayerOptsBadge();
+    // Reload the current source with the live option values (options only take effect on a fresh load).
+    document.getElementById('optReload').addEventListener('click', () => reloadCurrent());
 
     // ─── VU METER ───────────────────────────────────────────────────────────────────────────────
     // Per-channel audio level meters drawn above the channel checkboxes. Levels come from the
@@ -717,7 +878,14 @@
       tcEl.textContent = '--:--:--:--';
       tcEl.title = '';
 
-      player = new MxfPlayer(video, { debug: true, startBufferSeconds: 3, maxBufferSeconds: 8, seekMode: 'accurate' });
+      // All config comes from the Player options panel (getPlayerOpts). Pre-filled values there are
+      // this demo's effective defaults (smaller buffers for snappy first paint; source cache off).
+      const opts = getPlayerOpts();
+      dbgLog('MSG', 'player options',
+        `index=${opts.forceIndexMode ?? 'auto'} seek=${opts.seekMode} ` +
+        `startBuf=${opts.startBufferSeconds}s maxBuf=${opts.maxBufferSeconds}s resumeBuf=${opts.resumeBufferSeconds}s ` +
+        `cache=${Math.round(opts.maxSourceCacheBytes / 1048576)}MB pcm=${opts.pcmAudioMode} debug=${opts.debug}`);
+      player = new MxfPlayer(video, opts);
       window.player = player;     // expose for console: player.markAudioGlitch() to dump audio diag
       instrumentPlayer(player);   // wrap API + attach event listeners onto the debug timeline
       applyVolume();              // carry the current volume-lever level onto the new player
@@ -1016,6 +1184,7 @@
       if (!file) return;
       dbgLog('USER', 'pick file', file.name);
       log(`Loading file: ${file.name} (${(file.size / 1e6).toFixed(1)} MB)`);
+      lastLoad = { kind: 'file', file };
       initPlayer();
       player.loadFile(file);
     });
@@ -1045,9 +1214,28 @@
       if (!url) return;
       dbgLog('USER', 'click: Load URL', url);
       log(`Loading URL: ${url}`);
+      lastLoad = { kind: 'url', url };
       initPlayer();
       player.loadUrl(url);
     });
+
+    // Re-open the last-loaded source with the current Player-options values. Config is read in
+    // initPlayer() at construction, so a reload is the way to apply a changed option to a file that's
+    // already playing. Hoisted (function declaration) so the panel's Reload handler can reference it.
+    async function reloadCurrent() {
+      if (!lastLoad) { log('No source loaded yet — pick a file or load a URL first.', 'warn'); return; }
+      dbgLog('USER', 'click: Reload with options');
+      if (lastLoad.kind === 'file') {
+        log(`Reloading ${lastLoad.file.name} with current options`);
+        initPlayer();
+        player.loadFile(lastLoad.file);
+      } else {
+        await applyNetSim();
+        log(`Reloading ${lastLoad.url} with current options`);
+        initPlayer();
+        player.loadUrl(lastLoad.url);
+      }
+    }
   </script>
 </body>
 </html>

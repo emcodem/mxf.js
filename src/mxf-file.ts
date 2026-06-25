@@ -330,6 +330,45 @@ export class MxfFile {
     return BigInt(winStart + rel);
   }
 
+  /**
+   * Find the byte offset of the first complete content-package start at or after `approxByte`
+   * (bounded by `endByte`), for byte-percentage seeking on index-less ('none') VOD files. Reads a
+   * window, aligns to the first valid KLV (the window almost certainly begins mid-KLV), then walks
+   * forward to the System Item that precedes a picture element (the package start), else the picture
+   * element itself. Falls back to `approxByte` if no picture element is found in the window.
+   *
+   * Intended for ALL-INTRA streams only: every content package is a random-access point, so any
+   * package start is a valid resume point. The caller seeds its sequential reader's edit-unit counter
+   * from the (approximate) target frame — the System Item timecode is deliberately NOT consulted (it
+   * can roll over at 24 h or be discontinuous).
+   */
+  async findPackageStartAtOrAfter(approxByte: number, endByte: number, signal?: AbortSignal): Promise<number> {
+    const start = Math.max(0, Math.min(approxByte, endByte - 1));
+    const end = Math.min(endByte, start + LIVE_START_SCAN_WINDOW) - 1;
+    if (end < start) return start;
+
+    let buf: ArrayBuffer;
+    try { buf = await this.loader.fetchRange(start, end, 'none-mode byte-% seek: locate content package', signal); }
+    catch { return start; }
+
+    const iter = new KLVIterator(buf, 0);
+    if (!this.bufferStartsWithKey(buf, 0) && !iter.resync()) return start;
+
+    let pendingSystemOff = -1;
+    while (iter.hasMore()) {
+      const off = iter.offset;
+      const pkt = iter.next();
+      if (!pkt) { if (iter.resync()) continue; break; }
+      const k = pkt.key;
+      if (isPartitionPack(k) || isFill(k)) { pendingSystemOff = -1; continue; }
+      if (isSystemItem(k)) { pendingSystemOff = off; continue; }
+      // First picture element: its package starts at the preceding System Item if one was seen, else here.
+      if (isPictureEssence(k)) return start + (pendingSystemOff >= 0 ? pendingSystemOff : off);
+      // Other generic-container elements (audio/data tail of the previous package): keep scanning.
+    }
+    return start;
+  }
+
   /** True when `buf` at `offset` begins with the MXF UL key prefix (06 0E 2B 34). */
   private bufferStartsWithKey(buf: ArrayBuffer, offset: number): boolean {
     const u8 = new Uint8Array(buf);

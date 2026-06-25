@@ -56,9 +56,13 @@ export type WorkerCommand =
       liveFromStart?: boolean;
       /** Max bytes of raw source to cache in the worker (0 = off; ignored in live mode). See
        *  MxfConfig.maxSourceCacheBytes. */
-      cacheBytes?: number }
+      cacheBytes?: number;
+      /** Override the detected index mode (for testing/debugging). Ignored in live mode. */
+      forceIndexMode?: IndexMode }
   | { type: 'initFile'; file: File; debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig };
-      live?: boolean; startEditUnit?: number; liveFromStart?: boolean; cacheBytes?: number }
+      live?: boolean; startEditUnit?: number; liveFromStart?: boolean; cacheBytes?: number;
+      /** Override the detected index mode (for testing/debugging). Ignored in live mode. */
+      forceIndexMode?: IndexMode }
   | {
       type: 'fetchSegment';
       startFrame: number;

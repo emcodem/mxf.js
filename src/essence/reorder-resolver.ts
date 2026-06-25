@@ -240,3 +240,24 @@ export function accessUnitHasBSlice(
   }
   return false;
 }
+
+/**
+ * Whether an AVCC access unit contains any inter-predicted (P or B) slice. Used to positively confirm
+ * a stream is INTRA-ONLY at init: every coded slice intra ⇒ every content package is independently
+ * decodable, so the no-index ('none') byte-percentage seek path may start at any package. This is
+ * stricter than {@link accessUnitHasBSlice} (which only rules out B): an IPPP stream has no B but is
+ * NOT intra — decoding a P slice without its reference would corrupt, so it must not take that path.
+ */
+export function accessUnitHasInterSlice(
+  avcc: Uint8Array,
+  sps: SpsPocInfo,
+  ppsFlagMap: Map<number, PpsPocInfo>,
+  lengthSize = 4,
+): boolean {
+  for (const n of iterNals(avcc, lengthSize)) {
+    if (n.type !== 1 && n.type !== 5) continue;
+    const sh = parseSliceHeaderPoc(n, sps, ppsFlagMap);
+    if (sh && (sh.sliceType === 0 || sh.sliceType === 1)) return true; // 0 == P, 1 == B
+  }
+  return false;
+}
