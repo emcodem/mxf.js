@@ -896,11 +896,28 @@
         const sd = data.soundDescriptor;
         // Display dims (real frame, not the per-field StoredHeight) + DAR from the manifest.
         const ar = data.aspectRatio ? ` (${data.aspectRatio.num}:${data.aspectRatio.den})` : '';
+        // indexMode is the seek/index strategy the file actually resolved to (cbg = constant-byte
+        // CBG, vbe = per-frame entry table, none = no map / byte-% seeking). longGop distinguishes a
+        // Long-GOP H.264 stream (B-frame reorder) from all-intra; live marks a growing recording.
+        const gop = data.longGop ? ' (Long-GOP)' : '';
+        const liveTag = data.live ? ' · LIVE' : '';
+        // data.tracks is every track of EVERY package flattened together (Material + File/Source),
+        // plus timecode/data tracks — so a 1-video/16-audio file reports ~36 raw entries (each
+        // essence stream is mirrored once per package). Count the actual essence STREAMS instead:
+        // dedupe picture/sound tracks by their Generic-Container trackNumber (the GC element key).
+        // Material-package tracks carry trackNumber 0 (they reference clips, not GC elements), so the
+        // distinct non-zero numbers per kind = the real stream count: 1 video, 16 audio here.
+        const streamCount = (kind) => new Set(
+          data.tracks.filter(t => t.essence === kind && t.trackNumber).map(t => t.trackNumber)
+        ).size;
+        const vN = streamCount('picture'), aN = streamCount('sound');
         metaEl.textContent =
           `Duration: ${data.duration.toFixed(2)}s | ` +
           `FPS: ${fps.toFixed(2)} | ` +
           `Video: ${pd?.codec ?? 'unknown'} ${data.displayWidth}×${data.displayHeight}${ar} | ` +
-          `Audio: ${sd?.codec ?? 'unknown'} ${sd?.sampleRate}Hz ${sd?.channelCount}ch`;
+          `Audio: ${sd?.codec ?? 'unknown'} ${sd?.sampleRate}Hz ${sd?.channelCount}ch | ` +
+          `Index: ${data.indexMode}${gop}${liveTag} | ` +
+          `Tracks: ${vN}V ${aN}A`;
         log(`Manifest loaded: ${data.duration.toFixed(2)}s, ${data.tracks.length} tracks`);
         seekBar.max = data.duration;
         // Frame-granular slider: one native step (incl. a click-then-arrow on the focused thumb) =
