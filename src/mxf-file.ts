@@ -108,6 +108,26 @@ export class MxfFile {
     // partition metadata rather than (or in addition to) the footer partition.
     // Scan the already-fetched header buffer first, then check the footer.
     const headerIndexSegments = this.scanBufferForIndexSegments(metaBuf, 0);
+    // A CBG (and some VBE) index segment commonly lives in the HEADER partition's own INDEX region,
+    // which begins at `afterPP + headerByteCount` and spans `indexByteCount` bytes. When headerByteCount
+    // is exact (e.g. AVC-Intra OP1a: hdrBC = 2 000 000, idxBC = 192, indexSID = 2), the metadata read
+    // above ends PRECISELY at that region's start, so it never covers the index — and if a RIP body
+    // entry points locateEssence straight at the body partition, that walk starts past the index too.
+    // Both misses leave indexSegments empty → classifyIndexMode 'none' → forward fetches re-read from
+    // the essence start while stamping advancing timestamps, so the file loops its first second. Read
+    // the declared region explicitly when it isn't already inside metaBuf.
+    const hdrIdxLen = Number(headerPartition.indexByteCount);
+    if (metaSize > 0 && hdrIdxLen > 0) {
+      const idxStart = afterPP + metaSize;
+      const metaEnd = afterPP + readSize; // exclusive end of the metadata buffer already read
+      if (idxStart < fileSize && idxStart + hdrIdxLen > metaEnd) {
+        const idxEnd = Math.min(fileSize, idxStart + Math.min(hdrIdxLen, FOOTER_INDEX_MAX)) - 1;
+        try {
+          const idxBuf = await this.loader.fetchRange(idxStart, idxEnd, 'bootstrap: header partition index region');
+          this.mergeIndexSegments(headerIndexSegments, this.scanBufferForIndexSegments(idxBuf, 0));
+        } catch { /* best effort — footer / in-partition scan may still surface an index */ }
+      }
+    }
     const footerOffset = this.findFooterOffset(ripEntries, headerPartition);
     const footerStart = Number(footerOffset);
     // If the footer lies within the tail buffer already fetched, reuse it — this avoids a second
