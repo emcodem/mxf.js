@@ -136,10 +136,21 @@ export class Mpeg2Pipeline {
     const fps = editRateNumerator / editRateDenominator;
     const frameDurUs = Math.round(editRateDenominator * 1_000_000 / editRateNumerator);
 
+    // Only ask for the hardware encoder if one really exists for this geometry:
+    // 'prefer-hardware' is a hard requirement, so requesting it blindly breaks the encoder
+    // outright on machines with no VAAPI encoder (WSL, headless Linux, VMs).
+    const accel = await Mpeg2Transcoder.preferredAcceleration(
+      probe.codedWidth, probe.codedHeight,
+      probe.width, probe.height,
+      fps,
+    );
+
     let transcoder = new Mpeg2Transcoder(
       probe.codedWidth, probe.codedHeight,
       probe.width, probe.height,
       fps,
+      1.0,
+      accel,
     );
 
     // Encode the first frame to force the encoder to emit SPS/PPS, then discard the chunk.

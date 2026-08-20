@@ -14,6 +14,47 @@ export interface SpsppsPair {
   pps: Uint8Array;
 }
 
+/** Acceleration preference accepted by the encoder. See {@link Mpeg2Transcoder.preferredAcceleration}. */
+export type HwPreference = 'prefer-hardware' | 'no-preference';
+
+interface EncoderParams {
+  ew: number; eh: number; edw: number; edh: number;
+  levelHex: string; targetBitrate: number;
+}
+
+/**
+ * Encoder dimensions (MB-aligned), H.264 level and target bitrate for a source geometry.
+ * Shared by the constructor and preferredAcceleration() so the capability probe tests exactly
+ * the config that configure() will later receive: hardware support is resolution-dependent,
+ * so a probe at a different geometry can report support the real config does not have.
+ */
+function computeEncoderParams(
+  codedWidth: number, codedHeight: number,
+  displayWidth: number, displayHeight: number,
+  frameRate: number, scaleFactor: number,
+): EncoderParams {
+  // Scale encoder dimensions (MB-align after scaling).
+  const MB = 16;
+  const ew  = Math.ceil(codedWidth   * scaleFactor / MB) * MB;
+  const eh  = Math.ceil(codedHeight  * scaleFactor / MB) * MB;
+  const edw = Math.round(displayWidth  * scaleFactor);
+  const edh = Math.round(displayHeight * scaleFactor);
+
+  // H.264 level is constrained by MaxFS (macroblocks per frame) AND MaxMBPS
+  // (macroblocks per second). Pixel-rate alone is misleading for non-standard
+  // resolutions like 1920×544 (4080 MBs/frame > Level 3.1's limit of 3600).
+  const mbPerFrame = Math.ceil(ew / MB) * Math.ceil(eh / MB);
+  const mbPerSec   = mbPerFrame * frameRate;
+  let levelHex: string;
+  if      (mbPerFrame <= 3600 && mbPerSec <= 108_000)  levelHex = '1f'; // Level 3.1: ≤1280×720
+  else if (mbPerFrame <= 8192 && mbPerSec <= 245_760)  levelHex = '28'; // Level 4.0: ≤1920×1088
+  else if (mbPerFrame <= 8704 && mbPerSec <= 522_240)  levelHex = '2a'; // Level 4.2
+  else                                                  levelHex = '33'; // Level 5.1
+
+  const targetBitrate = Math.min(50_000_000, Math.round(ew * eh * frameRate * 0.15));
+  return { ew, eh, edw, edh, levelHex, targetBitrate };
+}
+
 /**
  * Wraps WebCodecs VideoEncoder to transcode YUV frames (from Mpeg2Decoder) to H.264 AVCC.
  * VideoEncoder is available in dedicated workers (Chrome 94+).
@@ -47,6 +88,66 @@ export class Mpeg2Transcoder {
   private cb420: Uint8ClampedArray | null = null;
   private cr420: Uint8ClampedArray | null = null;
 
+  private static readonly _accelCache = new Map<string, Promise<HwPreference>>();
+
+  /**
+   * Resolve the acceleration mode to hand the constructor.
+   *
+   * `hardwareAcceleration: 'prefer-hardware'` is NOT a hint. In Chrome it is a hard requirement:
+   * when no hardware H.264 encoder is available, configure() rejects the config and the encoder
+   * never starts. That is the normal case under WSL, headless Linux and VMs — Chrome only reaches
+   * hardware encode on Linux through VAAPI (it has no NVENC path at all), so a machine with a
+   * perfectly good GPU still has no usable encoder if there is no VAAPI device.
+   *
+   * Probe first and fall back to 'no-preference', which lets Chrome use hardware where it has it
+   * and openh264 otherwise.
+   *
+   * Memoised per encoder geometry: the answer is machine- AND resolution-dependent, and the probe
+   * costs a round-trip to the GPU process.
+   */
+  static async preferredAcceleration(
+    codedWidth: number,
+    codedHeight: number,
+    displayWidth: number,
+    displayHeight: number,
+    frameRate: number,
+    scaleFactor: number = 1.0,
+  ): Promise<HwPreference> {
+    const p = computeEncoderParams(
+      codedWidth, codedHeight, displayWidth, displayHeight, frameRate, scaleFactor,
+    );
+    const key = `${p.ew}x${p.eh}@${frameRate}/${p.levelHex}`;
+    const cached = Mpeg2Transcoder._accelCache.get(key);
+    if (cached) return cached;
+
+    const resolved = (async (): Promise<HwPreference> => {
+      // Safari 16.x ships VideoEncoder without isConfigSupported.
+      if (typeof VideoEncoder === 'undefined' ||
+          typeof VideoEncoder.isConfigSupported !== 'function') return 'no-preference';
+      try {
+        const support = await VideoEncoder.isConfigSupported({
+          codec: `avc1.4d00${p.levelHex}`,
+          width: p.ew,
+          height: p.eh,
+          displayWidth: p.edw,
+          displayHeight: p.edh,
+          bitrate: p.targetBitrate,
+          framerate: frameRate,
+          bitrateMode: 'variable',
+          latencyMode: 'realtime',
+          hardwareAcceleration: 'prefer-hardware',
+          avc: { format: 'avc' },
+        });
+        return support.supported ? 'prefer-hardware' : 'no-preference';
+      } catch {
+        return 'no-preference';
+      }
+    })();
+
+    Mpeg2Transcoder._accelCache.set(key, resolved);
+    return resolved;
+  }
+
   constructor(
     codedWidth: number,
     codedHeight: number,
@@ -54,34 +155,19 @@ export class Mpeg2Transcoder {
     displayHeight: number,
     frameRate: number,
     scaleFactor: number = 1.0,
+    hardwareAcceleration: HwPreference = 'no-preference',
   ) {
     this._scale = scaleFactor;
 
-    // Scale encoder dimensions (MB-align after scaling).
-    const MB = 16;
-    const ew  = Math.ceil(codedWidth   * scaleFactor / MB) * MB;
-    const eh  = Math.ceil(codedHeight  * scaleFactor / MB) * MB;
-    const edw = Math.round(displayWidth  * scaleFactor);
-    const edh = Math.round(displayHeight * scaleFactor);
+    const { ew, eh, edw, edh, levelHex, targetBitrate } = computeEncoderParams(
+      codedWidth, codedHeight, displayWidth, displayHeight, frameRate, scaleFactor,
+    );
 
     this.codedWidth    = ew;
     this.codedHeight   = eh;
     this.displayWidth  = edw;
     this.displayHeight = edh;
     this.frameDurUs    = Math.round(1_000_000 / frameRate);
-
-    // H.264 level is constrained by MaxFS (macroblocks per frame) AND MaxMBPS
-    // (macroblocks per second). Pixel-rate alone is misleading for non-standard
-    // resolutions like 1920×544 (4080 MBs/frame > Level 3.1's limit of 3600).
-    const mbPerFrame = Math.ceil(ew / MB) * Math.ceil(eh / MB);
-    const mbPerSec   = mbPerFrame * frameRate;
-    let levelHex: string;
-    if      (mbPerFrame <= 3600 && mbPerSec <= 108_000)  levelHex = '1f'; // Level 3.1: ≤1280×720
-    else if (mbPerFrame <= 8192 && mbPerSec <= 245_760)  levelHex = '28'; // Level 4.0: ≤1920×1088
-    else if (mbPerFrame <= 8704 && mbPerSec <= 522_240)  levelHex = '2a'; // Level 4.2
-    else                                                  levelHex = '33'; // Level 5.1
-
-    const targetBitrate = Math.min(50_000_000, Math.round(ew * eh * frameRate * 0.15));
 
     this.encoder = new VideoEncoder({
       output: (chunk, metadata) => {
@@ -152,11 +238,12 @@ export class Mpeg2Transcoder {
         // of having to reconstruct a PTS/DTS reorder map (which the previous positional
         // editUnit assignment got wrong, scrambling playback after the first GOP).
         latencyMode: 'realtime',
-        // Prefer the GPU H.264 encoder — typically several times faster than the software
-        // (openh264) encoder Chrome falls back to under 'no-preference'. It's a hint: if no
-        // hardware encoder is available Chrome silently uses software. We sanitize SPS[2]
-        // regardless, so either encoder's parameter sets are accepted by MSE.
-        hardwareAcceleration: 'prefer-hardware',
+        // Resolved by preferredAcceleration(): the GPU encoder where one actually exists
+        // (typically several times faster than the software openh264 encoder), otherwise
+        // 'no-preference'. This is NOT a hint — Chrome fails configure() outright when it
+        // cannot honour 'prefer-hardware'. We sanitize SPS[2] regardless, so either encoder's
+        // parameter sets are accepted by MSE.
+        hardwareAcceleration,
         avc: { format: 'avc' },           // AVCC output; SPS/PPS via decoderConfig.description
       });
     } else {

@@ -97,7 +97,10 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
     const fps = editRateNumerator / editRateDenominator;
     const frameDurUs = Math.round(editRateDenominator * 1_000_000 / editRateNumerator);
 
-    let transcoder = new Mpeg2Transcoder(cw, ch, dw, dh, fps);
+    // See Mpeg2Transcoder.preferredAcceleration(): requesting hardware unconditionally fails
+    // configure() on machines without a VAAPI encoder (WSL, headless Linux, VMs).
+    const accel = await Mpeg2Transcoder.preferredAcceleration(cw, ch, dw, dh, fps);
+    let transcoder = new Mpeg2Transcoder(cw, ch, dw, dh, fps, 1.0, accel);
     transcoder.encodeRgbaFrame(first.data, srcW, srcH, 0, true);
     await transcoder.flush();
 
