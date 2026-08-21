@@ -30,6 +30,7 @@ HTTP Range / File API ──► Web Worker ──► demux ──► remux / tra
 |-------|------|-------|
 | **H.264 / AVC-Intra (XAVC)** | Remux to fMP4 | Played natively by Chrome (High 4:2:2 / profile 122 via its software decoder). SPS-derived `avc1` dimensions for interlaced 1080i MBAFF. - Firefox support missing yet (that requires WASM)|
 | **MPEG-2** (D-10 / IMX, XDCAM Long-GOP) | Decode in JS → re-encode to H.264 via WebCodecs `VideoEncoder` → fMP4 | Full javascript MPEG-2 decoder (derived and extended from https://github.com/phoboslab/jsmpeg) and extended for interlaced 1080i 4:2:2 Long-GOP. I/P/B frames, open-GOP scrub handling, field-DCT, 4:2:0 and 4:2:2. **Bit-exact** with ffmpeg's `-idct simple` decoder — see [Decoder accuracy](#decoder-accuracy). |
+| **Apple ProRes** (Proxy/LT/422/422 HQ/4444/4444 XQ) | Decode via optional WASM plugin → re-encode to H.264 → fMP4 | All-intra (no reorder/open-GOP handling needed) — every frame is a keyframe. Requires a `plugins.videoDecoder` configured with a `prores`-capable FFmpeg WASM module (built from a `prores-decoder` manifest — see the sibling `ffmpeg_wasm` build system) and `packetMode: 'frame'` (ProRes has no bitstream parser — one MXF edit unit is one complete packet, unlike MPEG-2's stream-oriented `packetMode: 'stream'` default). Without a plugin configured the file loads with audio only and the player emits `codec-unsupported`. 10-bit sources are truncated to 8-bit 4:2:0 for the H.264 re-encode (WebCodecs' H.264 encoder is 8-bit 4:2:0 only); 4444 alpha is dropped. |
 
 All video flows through the single `<video>` element, so seeking and scrubbing work identically for every source.
 
@@ -409,6 +410,19 @@ Verified against real broadcast files:
 - XAVC Class 300 (UHD, High 4:2:2)
 - XAVC-L Long-GOP (1080p50, H.264 High 4:2:2, B-frame reorder)
 - 16/24-bit PCM audio, multi-channel
+
+ProRes support (coding-UL identification, CDCI descriptor parsing, VBE index, WASM-plugin decode
+→ `dec_get_i420` → H.264 transcode → MSE playback, and the audio-only `codec-unsupported` fallback
+when no plugin is configured) is verified end-to-end against files from FFmpeg's `prores_ks`
+encoder + `mxf` muxer — 422/422 HQ/4444 (alpha dropped)/Proxy, progressive and interlaced,
+1080p/1080i/2160p, mono/stereo/multi-track PCM. Colour verified correct (SMPTE bars decode to the
+right hues, no channel swap) via the `dec_get_i420` path. Single-instance decode+transcode throughput:
+~24 ms/frame at 1080p HQ (comfortably under the 40 ms/frame realtime budget at 25 fps) but ~79 ms/frame
+at 2160p — roughly 2× too slow for realtime 2160p25 on one instance. ProRes is all-intra, so frames
+are independent: sustaining 4K realtime would mean running several single-threaded decoder instances
+across workers rather than FFmpeg's own pthreads (which need `SharedArrayBuffer`, gated behind
+cross-origin isolation headers a library embedded in someone else's page generally can't require).
+Not built in this pass since a single instance already handles 1080p and below.
 
 ---
 

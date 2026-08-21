@@ -39,11 +39,13 @@ export interface WorkerPluginConfig {
    * Resolved from a built-in map on the main thread before the command is posted.
    */
   mxfCodec: string;
+  /** See {@link VideoDecoderPluginConfig.packetMode} (mxf-player.ts). */
+  packetMode: 'stream' | 'frame';
 }
 
 // Commands sent from main thread to worker
 export type WorkerCommand =
-  | { type: 'initUrl';  url: string;  debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig };
+  | { type: 'initUrl';  url: string;  debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig[] };
       /** Live mode: open as a growing recording — ignore the index, start at the file's end, stream
        *  forward. See MxfFile.openLive. */
       live?: boolean;
@@ -59,7 +61,7 @@ export type WorkerCommand =
       cacheBytes?: number;
       /** Override the detected index mode (for testing/debugging). Ignored in live mode. */
       forceIndexMode?: IndexMode }
-  | { type: 'initFile'; file: File; debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig };
+  | { type: 'initFile'; file: File; debug?: boolean; videoMode?: 'webcodecs' | 'mse'; plugins?: { videoDecoder?: WorkerPluginConfig[] };
       live?: boolean; startEditUnit?: number; liveFromStart?: boolean; cacheBytes?: number;
       /** Override the detected index mode (for testing/debugging). Ignored in live mode. */
       forceIndexMode?: IndexMode }

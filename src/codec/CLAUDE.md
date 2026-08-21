@@ -1,5 +1,11 @@
 # src/codec/ — MPEG-2 decoder + transcoder traps
 
+## WASM decoder plugin (`wasm-ffmpeg-decoder.ts`, ProRes/`Mpeg2Transcoder.encodeI420Frame`)
+
+See `src/worker/CLAUDE.md` ("WASM decoder plugin" / "`dec_get_i420`") for `packetMode`, the
+feature-detected `dec_get_i420` path and why frames are copied out of wasm memory rather than
+viewed, and why the Safari half-scale retry always uses `encodeRgbaFrame` regardless of format.
+
 ## Chrome VideoEncoder SPS constraint flags (`mpeg2-transcoder.ts`)
 
 Chrome's `VideoEncoder` sets `constraint_set4_flag` and `constraint_set5_flag` (bits 3–2 of `SPS[2]`) even for Main Profile — both wrong for a predictive stream, causing MSE to reject the init segment. Fix: `sps[2] = sps[2] & 0xc0` after `parseSPSPPSFromAvcC`.

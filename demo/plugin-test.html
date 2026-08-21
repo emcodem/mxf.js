@@ -90,27 +90,31 @@
 <body>
   <h1>mxf.js — Wasm Decoder Plugin Test</h1>
   <p class="subtitle">
-    Tests the <code>VideoDecoderPlugin</code> mechanism using
-    <code>mpeg2-decoder.wasm</code> (emscripten ffmpeg) as a drop-in replacement
-    for the built-in JS MPEG-2 decoder. Use an MPEG-2 MXF to exercise the plugin.
+    Tests the <code>VideoDecoderPlugin</code> mechanism using emscripten-ffmpeg WASM modules
+    as a drop-in replacement for the built-in JS decoder. Enable whichever modules you have built —
+    the player auto-selects the one matching each loaded file's codec, no manual choice needed.
   </p>
 
   <!-- Plugin toggle + status -->
   <div id="pluginBar">
     <label>
       <input type="checkbox" id="usePlugin" checked>
-      Use wasm decoder plugin
+      Use wasm decoder plugin(s)
     </label>
     <span style="color:#555">│</span>
-    <span>module: <code id="pluginModuleUrl">/mpeg2-decoder.js</code></span>
-    <span>codec: <code>mpeg2video</code> → <code>mxfCodec: mpeg2</code></span>
+    <span>available:</span>
+    <label title="Experimental — not the recommended path. mxf.js's own JS decoder is still the trusted, tested way to play MPEG-2; this wasm plugin exists for comparison/Firefox-support experiments only.">
+      <input type="checkbox" class="pluginAvail" value="mpeg2video"> <code>mpeg2video</code> <span style="color:#a84">(experimental)</span>
+    </label>
+    <label><input type="checkbox" class="pluginAvail" value="prores" checked> <code>prores</code></label>
+    <span style="color:#555">— the player auto-picks whichever matches the loaded file's codec</span>
     <span id="pluginStatus" class="inactive">no file loaded</span>
   </div>
 
   <div class="controls">
     <input type="file" id="fileInput" accept=".mxf,.MXF">
     <span style="color:#666">or</span>
-    <input type="text" id="urlInput" placeholder="https://example.com/clip.mxf" value="../media/xdcamhd_1920_25i_16tracks.mxf">
+    <input type="text" id="urlInput" placeholder="https://example.com/clip.mxf" value="/media/prores/prores422hq_1080p25_10s.mxf">
     <button id="loadUrl">Load URL</button>
   </div>
 
@@ -166,8 +170,24 @@
     import { MxfPlayer } from '../dist/mxf.esm.js';
 
     // ── Config ──────────────────────────────────────────────────────────────────────────────────
-    const PLUGIN_MODULE_URL = '/wasm-plugin/mpeg2-decoder.js';
-    const PLUGIN_FFMPEG_CODEC = 'mpeg2video';
+    // FFmpeg codec name -> [wasm module filename, mxfCodec, packetMode]. mxfCodec matches the
+    // built-in FFMPEG_TO_MXF_CODEC map in mxf-player.ts (kept explicit here for clarity).
+    const PLUGIN_TARGETS = {
+      mpeg2video: { file: 'mpeg2-decoder.js', mxfCodec: 'mpeg2',  packetMode: 'stream' },
+      prores:     { file: 'prores-decoder.js', mxfCodec: 'prores', packetMode: 'frame' },
+    };
+    // One VideoDecoderPluginConfig per checked "available" box. The player is handed the whole
+    // list and auto-picks whichever entry's mxfCodec matches the loaded file — no manual per-file
+    // codec selection needed.
+    function availablePlugins() {
+      return [...document.querySelectorAll('.pluginAvail:checked')].map(cb => {
+        const t = PLUGIN_TARGETS[cb.value];
+        return { ffmpegCodec: cb.value, moduleUrl: `/wasm-plugin/${t.file}`, mxfCodec: t.mxfCodec, packetMode: t.packetMode };
+      });
+    }
+    document.querySelectorAll('.pluginAvail').forEach(cb => {
+      cb.addEventListener('change', () => setPluginStatus('inactive', 'reload a file to apply'));
+    });
 
     // ── DOM refs ────────────────────────────────────────────────────────────────────────────────
     const video    = document.getElementById('video');
@@ -185,8 +205,6 @@
     const bufferingOverlay = document.getElementById('bufferingOverlay');
     const usePluginCb = document.getElementById('usePlugin');
     const pluginStatus = document.getElementById('pluginStatus');
-    const pluginModuleUrlEl = document.getElementById('pluginModuleUrl');
-    pluginModuleUrlEl.textContent = PLUGIN_MODULE_URL;
 
     let player = null;
     let seeking = false;
@@ -412,19 +430,14 @@
       setPluginStatus('inactive', 'loading…');
 
       const usingPlugin = usePluginCb.checked;
-      const pluginCfg = usingPlugin ? {
-        videoDecoder: {
-          moduleUrl: PLUGIN_MODULE_URL,
-          ffmpegCodec: PLUGIN_FFMPEG_CODEC,
-          // mxfCodec defaults to 'mpeg2' via the built-in map
-        }
-      } : undefined;
+      const plugins = availablePlugins();
+      const pluginCfg = usingPlugin && plugins.length ? { videoDecoder: plugins } : undefined;
 
-      const mode = usingPlugin
-        ? `wasm plugin (${PLUGIN_FFMPEG_CODEC})`
+      const mode = pluginCfg
+        ? `wasm plugin — auto-select among [${plugins.map(p => p.ffmpegCodec).join(', ')}]`
         : 'built-in JS decoder';
       log(`Initialising player — decoder: ${mode}`);
-      dbgLog('MSG', `decoder mode: ${mode}`, usingPlugin ? PLUGIN_MODULE_URL : '');
+      dbgLog('MSG', `decoder mode: ${mode}`, pluginCfg ? plugins.map(p => p.moduleUrl).join(', ') : '');
 
       player = new MxfPlayer(video, {
         debug: true,
@@ -452,12 +465,14 @@
         playBtn.disabled = false;
         syncPlayBtn();
 
-        // Update the plugin status badge based on whether the plugin was expected to fire.
-        if (usingPlugin && pd?.codec === 'mpeg2') {
-          setPluginStatus('active', `⬤ wasm plugin active — ${PLUGIN_FFMPEG_CODEC} → H.264`);
-          log(`Wasm plugin should be active for this MPEG-2 file. Check worker console for "[worker] wasm plugin init OK".`);
-        } else if (usingPlugin && pd?.codec !== 'mpeg2') {
-          setPluginStatus('inactive', `plugin skipped — codec is ${pd?.codec ?? 'unknown'} (not mpeg2)`);
+        // Update the plugin status badge based on whether an available plugin matched this file's
+        // codec — the player auto-selects, so this is just reporting its choice after the fact.
+        const matched = plugins.find(p => p.mxfCodec === pd?.codec);
+        if (pluginCfg && matched) {
+          setPluginStatus('active', `⬤ wasm plugin active — ${matched.ffmpegCodec} → H.264`);
+          log(`Wasm plugin auto-selected for codec '${pd?.codec}' (${matched.ffmpegCodec}). Check worker console for "[worker] wasm plugin init OK".`);
+        } else if (pluginCfg && pd) {
+          setPluginStatus('inactive', `no available plugin decodes '${pd.codec}' — built-in path (or unsupported) used instead`);
         } else {
           setPluginStatus('inactive', 'built-in JS decoder');
         }

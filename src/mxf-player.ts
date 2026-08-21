@@ -30,6 +30,17 @@ export interface VideoDecoderPluginConfig {
    * Only set this when the automatic mapping is wrong.
    */
   mxfCodec?: string;
+  /**
+   * How MXF edit units map to decoder packets:
+   * - `'stream'` (default): feed bytes through the decoder's own stream parser, which buffers and
+   *   frames them internally (needed for codecs like MPEG-2 whose parser only emits a picture once
+   *   it sees the next one's start code — see the probe/flush `nudgeParser()` handling).
+   * - `'frame'`: one edit unit IS one complete packet — feed it whole and expect a frame back
+   *   immediately. For frame-wrapped, parser-less codecs (e.g. ProRes, which FFmpeg has no
+   *   bitstream parser for). Never nudges the decoder to force a flush; a missing frame is a real
+   *   error, not a buffering artifact.
+   */
+  packetMode?: 'stream' | 'frame';
 }
 
 export interface MxfConfig {
@@ -112,10 +123,16 @@ export interface MxfConfig {
    *  key compare and falling back to a full parse on mismatch. Off (default) uses the standby-worker
    *  gapless path. Only changes the gapless rotation path; the catch-up/jump re-anchor is unchanged. */
   liveReuseHeader?: boolean;
-  /** Optional decoder plugin. When the MXF codec matches, this wasm decoder is used instead
-   *  of the built-in JS decoder, enabling new codecs and Firefox-compatible paths. */
+  /**
+   * Optional decoder plugin(s). Whichever entry's resolved `mxfCodec` matches the file's detected
+   * picture codec is used instead of the built-in JS/native decoder, enabling new codecs and
+   * Firefox-compatible paths. Pass an array to let the player pick automatically per file (e.g.
+   * one config for `'mpeg2video'`, another for `'prores'`) — a single object is still accepted for
+   * a one-codec setup. No entry matching → falls through to the built-in path (or, for a codec
+   * with no built-in path either, `codec-unsupported` + audio-only playback).
+   */
   plugins?: {
-    videoDecoder?: VideoDecoderPluginConfig;
+    videoDecoder?: VideoDecoderPluginConfig | VideoDecoderPluginConfig[];
   };
   /**
    * Override the detected index mode for testing/debugging. When set, the worker discards the
@@ -132,11 +149,22 @@ const FFMPEG_TO_MXF_CODEC: Record<string, string> = {
   'mpeg2video': 'mpeg2',
   'h264':       'h264',
   'libx264':    'h264',
+  'prores':     'prores',
 };
 
 function resolveWorkerPlugin(p: VideoDecoderPluginConfig): WorkerPluginConfig {
   const mxfCodec = p.mxfCodec ?? FFMPEG_TO_MXF_CODEC[p.ffmpegCodec] ?? p.ffmpegCodec;
-  return { moduleUrl: p.moduleUrl, ffmpegCodec: p.ffmpegCodec, mxfCodec };
+  return { moduleUrl: p.moduleUrl, ffmpegCodec: p.ffmpegCodec, mxfCodec, packetMode: p.packetMode ?? 'stream' };
+}
+
+/** Normalizes `MxfConfig.plugins` (single config or array) into the `plugins` field every
+ *  WorkerCommand init variant carries — the worker always sees a list, picked from at runtime by
+ *  matching `mxfCodec` against the file's detected codec (see demux-worker.ts). */
+function resolvePluginsCommand(plugins: MxfConfig['plugins']): { videoDecoder: WorkerPluginConfig[] } | undefined {
+  const cfg = plugins?.videoDecoder;
+  if (!cfg) return undefined;
+  const list = Array.isArray(cfg) ? cfg : [cfg];
+  return { videoDecoder: list.map(resolveWorkerPlugin) };
 }
 
 const DEFAULT_CONFIG: Required<MxfConfig> = {
@@ -639,8 +667,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
   loadUrl(url: string): void {
     this.setup();
-    const plugins = this.config.plugins?.videoDecoder
-      ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
+    const plugins = resolvePluginsCommand(this.config.plugins);
     const cmd: WorkerCommand = { type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins, cacheBytes: this.config.maxSourceCacheBytes,
       ...(this.config.forceIndexMode ? { forceIndexMode: this.config.forceIndexMode } : {}) };
     this.worker!.postMessage(cmd);
@@ -665,8 +692,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // gapless standby switch — clobbering the bootstrap and desyncing the consumer's currentLiveFile
     // bookkeeping, which strands playback after the first segment (acute with short ~1 s rotation).
     this.liveMode = true;
-    const plugins = this.config.plugins?.videoDecoder
-      ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
+    const plugins = resolvePluginsCommand(this.config.plugins);
     // First live file: jump to its edge (liveFromStart=false), number frames from 0.
     const cmd: WorkerCommand = { type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins, live: true, startEditUnit: 0, liveFromStart: false };
     this.worker!.postMessage(cmd);
@@ -674,8 +700,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
 
   loadFile(file: File): void {
     this.setup();
-    const plugins = this.config.plugins?.videoDecoder
-      ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
+    const plugins = resolvePluginsCommand(this.config.plugins);
     const cmd: WorkerCommand = { type: 'initFile', file, debug: this.config.debug, videoMode: 'mse', plugins, cacheBytes: this.config.maxSourceCacheBytes,
       ...(this.config.forceIndexMode ? { forceIndexMode: this.config.forceIndexMode } : {}) };
     this.worker!.postMessage(cmd);
@@ -1580,8 +1605,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       }
     };
     w.addEventListener('message', this.standbyListener);
-    const plugins = this.config.plugins?.videoDecoder
-      ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
+    const plugins = resolvePluginsCommand(this.config.plugins);
     w.postMessage({
       type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins,
       live: true, startEditUnit: this.nextFetchFrame, liveFromStart: true,
@@ -1844,8 +1868,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
       }
     };
     w.addEventListener('message', this.standbyListener);
-    const plugins = this.config.plugins?.videoDecoder
-      ? { videoDecoder: resolveWorkerPlugin(this.config.plugins.videoDecoder) } : undefined;
+    const plugins = resolvePluginsCommand(this.config.plugins);
     w.postMessage({ type: 'initUrl', url, debug: this.config.debug, videoMode: 'mse', plugins,
       live: true, startEditUnit: 0, liveFromStart: false } as WorkerCommand);
     this.armStandbyWatchdog();

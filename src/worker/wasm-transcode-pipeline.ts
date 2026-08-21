@@ -1,4 +1,4 @@
-import { WasmFfmpegDecoder, RgbaFrame } from '../codec/wasm-ffmpeg-decoder.js';
+import { WasmFfmpegDecoder, DecodedFrame } from '../codec/wasm-ffmpeg-decoder.js';
 import { Mpeg2Transcoder, TranscodedChunk } from '../codec/mpeg2-transcoder.js';
 import type { ITranscodePipeline, DecodeSegmentResult } from './mpeg2-pipeline.js';
 
@@ -16,7 +16,8 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
   private firstFrameOfSegment = true;
   // After reset() (seek/scrub), suppress output until the first I-frame. Open-GOP leading
   // P-frames reference unavailable prior content and render as corruption, same issue the
-  // native JS decoder solves with its suppressUntilKeyframe flag.
+  // native JS decoder solves with its suppressUntilKeyframe flag. All-intra codecs (e.g. ProRes)
+  // never trip this: every frame is pictType 1, so the very first frame clears it immediately.
   private suppressUntilKey = true;
 
   readonly frameDurUs: number;
@@ -30,6 +31,11 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
   private constructor(
     private readonly decoder: WasmFfmpegDecoder,
     private readonly transcoder: Mpeg2Transcoder,
+    private readonly packetMode: 'stream' | 'frame',
+    // Only valid when the transcoder is at scaleFactor 1.0 — encodeI420Frame doesn't implement the
+    // Safari half-scale path (see Mpeg2Transcoder.encodeI420Frame). Decided once at create() from
+    // whether the decoder emitted 'i420' for the probe frame AND no half-scale retry was needed.
+    private readonly useI420: boolean,
     sps: Uint8Array,
     pps: Uint8Array,
     frameDurUs: number,
@@ -55,29 +61,36 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
     editRateDenominator: number,
     displayWidth: number,
     displayHeight: number,
+    packetMode: 'stream' | 'frame' = 'stream',
   ): Promise<WasmTranscodePipeline> {
-    // Feed the first frame in 64 KB chunks. The mpegvideo parser emits a picture only when it
-    // sees the next picture's start code; the sequence_end_code nudge forces it to flush.
-    const PROBE_CHUNK = 65536;
     const probeBytes = new Uint8Array(firstFrameData);
     const firstHex = Array.from(probeBytes.subarray(0, 8)).map(b => b.toString(16).padStart(2, '0')).join(' ');
-    const probeFrames: RgbaFrame[] = [];
-    for (let off = 0; off < probeBytes.length; off += PROBE_CHUNK) {
-      probeFrames.push(...decoder.decode(probeBytes.subarray(off, Math.min(off + PROBE_CHUNK, probeBytes.length))));
-      if (probeFrames.length) break;
+    const probeFrames: DecodedFrame[] = [];
+    if (packetMode === 'frame') {
+      // One edit unit IS one complete packet for a frame-wrapped, parser-less codec (e.g. ProRes)
+      // — feed it whole and expect a frame back immediately. No parser to nudge.
+      probeFrames.push(...decoder.decode(probeBytes));
+    } else {
+      // Feed the first frame in 64 KB chunks. The mpegvideo parser emits a picture only when it
+      // sees the next picture's start code; the sequence_end_code nudge forces it to flush.
+      const PROBE_CHUNK = 65536;
+      for (let off = 0; off < probeBytes.length; off += PROBE_CHUNK) {
+        probeFrames.push(...decoder.decode(probeBytes.subarray(off, Math.min(off + PROBE_CHUNK, probeBytes.length))));
+        if (probeFrames.length) break;
+      }
+      if (!probeFrames.length) probeFrames.push(...decoder.nudgeParser());
     }
-    if (!probeFrames.length) probeFrames.push(...decoder.nudgeParser());
     if (!probeFrames.length) probeFrames.push(...decoder.flush());
 
     // Reset so the persistent pipeline starts clean at frame 0.
     decoder.reset();
 
     if (!probeFrames.length) {
+      const hint = decoder.ffmpegCodec === 'mpeg2video' ? ' Expected 00 00 01 b3 (MPEG-2 sequence header).' : '';
       throw new Error(
-        `wasm decoder produced no frames from first video edit unit. ` +
-        `Input: ${probeBytes.length} bytes, first 8: [${firstHex}]. ` +
-        `Expected 00 00 01 b3 (MPEG-2 sequence header). ` +
-        `Check ffmpegCodec name and that the MXF carries raw MPEG-2 ES.`
+        `wasm decoder ('${decoder.ffmpegCodec}', packetMode='${packetMode}') produced no frames from ` +
+        `first video edit unit. Input: ${probeBytes.length} bytes, first 8: [${firstHex}].${hint} ` +
+        `Check ffmpegCodec name and that the MXF carries raw '${decoder.ffmpegCodec}' elementary-stream packets.`
       );
     }
 
@@ -101,7 +114,12 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
     // configure() on machines without a VAAPI encoder (WSL, headless Linux, VMs).
     const accel = await Mpeg2Transcoder.preferredAcceleration(cw, ch, dw, dh, fps);
     let transcoder = new Mpeg2Transcoder(cw, ch, dw, dh, fps, 1.0, accel);
-    transcoder.encodeRgbaFrame(first.data, srcW, srcH, 0, true);
+    let usedHalfScaleRetry = false;
+    if (first.format === 'i420') {
+      transcoder.encodeI420Frame(first.data, srcW, srcH, 0, true);
+    } else {
+      transcoder.encodeRgbaFrame(first.data, srcW, srcH, 0, true);
+    }
     await transcoder.flush();
 
     if (!transcoder.spspps) {
@@ -109,15 +127,25 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
       transcoder.close();
       console.warn(`[mxf.js] VideoEncoder silent failure at ${cw}×${ch} — retrying at ½ scale (Safari 16.x workaround)`);
       transcoder = new Mpeg2Transcoder(cw, ch, dw, dh, fps, 0.5);
-      transcoder.encodeRgbaFrame(first.data, srcW, srcH, 0, true);
+      usedHalfScaleRetry = true;
+      // This probe encode's output is never captured (flush()'s return value is discarded below) —
+      // only its dimensions matter, to make the encoder configure and emit SPS/PPS. So pixel content
+      // is irrelevant: encodeRgbaFrame's scaled (2×2-average) path is already implemented, while
+      // encodeI420Frame's is not — always go through encodeRgbaFrame here, synthesizing a neutral
+      // buffer when the decoder runs in i420 mode (no rgba bytes available for `first`).
+      const rgbaProbe = first.format === 'rgba' ? first.data : new Uint8ClampedArray(srcW * srcH * 4).fill(128);
+      transcoder.encodeRgbaFrame(rgbaProbe, srcW, srcH, 0, true);
       await transcoder.flush();
     }
 
     const spspps = transcoder.spspps;
     if (!spspps) { transcoder.close(); throw new Error(`VideoEncoder did not produce SPS/PPS (coded=${cw}×${ch})`); }
 
+    // encodeI420Frame doesn't implement the half-scale path, so the retry always falls back to RGBA.
+    const useI420 = first.format === 'i420' && !usedHalfScaleRetry;
+
     return new WasmTranscodePipeline(
-      decoder, transcoder, spspps.sps, spspps.pps, frameDurUs,
+      decoder, transcoder, packetMode, useI420, spspps.sps, spspps.pps, frameDurUs,
       transcoder.encoderCodW, transcoder.encoderCodH,
       transcoder.encoderDisplayW, transcoder.encoderDisplayH,
     );
@@ -142,6 +170,14 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
     this.decoder.reset();
   }
 
+  private encodeDecodedFrame(f: DecodedFrame, tsUs: number): void {
+    if (this.useI420) {
+      this.transcoder.encodeI420Frame(f.data, f.width, f.height, tsUs, this.firstFrameOfSegment);
+    } else {
+      this.transcoder.encodeRgbaFrame(f.data, f.width, f.height, tsUs, this.firstFrameOfSegment);
+    }
+  }
+
   async decodeSegment(
     videoFrames: { data: ArrayBuffer }[],
     flushDecoder: boolean,
@@ -160,26 +196,30 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
       const decoded = this.decoder.decode(new Uint8Array(videoFrames[i].data));
       for (const f of decoded) {
         // Drop leading non-keyframes from open GOPs — they reference unavailable prior content.
+        // All-intra codecs (pictType always 1) never hit this branch.
         if (this.suppressUntilKey) {
           if (f.pictType !== 1) continue;  // 1 = I-frame
           this.suppressUntilKey = false;
         }
         const tsUs = Number(this.editUnitCounter) * this.frameDurUs;
-        this.transcoder.encodeRgbaFrame(f.data, f.width, f.height, tsUs, this.firstFrameOfSegment);
+        this.encodeDecodedFrame(f, tsUs);
         this.firstFrameOfSegment = false;
         this.editUnitCounter++;
       }
     }
     if (flushDecoder) {
-      // nudgeParser forces the mpegvideo parser to release its last buffered picture;
-      // flush drains the decoder's reorder buffer.
-      for (const f of [...this.decoder.nudgeParser(), ...this.decoder.flush()]) {
+      // nudgeParser forces the mpegvideo parser to release its last buffered picture — only
+      // meaningful for a stream-oriented parser; a frame-mode packetless codec (e.g. ProRes) has
+      // already emitted every frame from the main loop above, so skip it. flush() still drains any
+      // decoder-side buffering either way.
+      const flushed = this.packetMode === 'frame' ? this.decoder.flush() : [...this.decoder.nudgeParser(), ...this.decoder.flush()];
+      for (const f of flushed) {
         if (this.suppressUntilKey) {
           if (f.pictType !== 1) continue;
           this.suppressUntilKey = false;
         }
         const tsUs = Number(this.editUnitCounter) * this.frameDurUs;
-        this.transcoder.encodeRgbaFrame(f.data, f.width, f.height, tsUs, this.firstFrameOfSegment);
+        this.encodeDecodedFrame(f, tsUs);
         this.firstFrameOfSegment = false;
         this.editUnitCounter++;
       }

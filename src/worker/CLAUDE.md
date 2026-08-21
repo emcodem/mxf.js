@@ -8,6 +8,51 @@
 
 **`mpeg2EditUnitCounter`**: module-level `bigint`, resets to `BigInt(targetFrame)` on seek.
 
+## WASM decoder plugin (`demux-worker.ts`, `wasm-transcode-pipeline.ts`)
+
+`activePluginConfig && pd?.codec === activePluginConfig.mxfCodec` (checked before the MPEG-2/H.264
+branches) hands the file to `WasmTranscodePipeline` instead — same manifest/init-segment shape,
+codec-agnostic. ProRes is the first real user of this path (MPEG-2's production path is the native
+JS decoder above, not this one).
+
+**`packetMode: 'stream' | 'frame'`** (`WorkerPluginConfig.packetMode`, set from
+`VideoDecoderPluginConfig.packetMode`, default `'stream'`): whether one MXF edit unit is one
+complete decoder packet.
+- `'stream'` (MPEG-2): FFmpeg's mpegvideo parser buffers internally and only emits a picture once
+  it sees the *next* one's start code, so the probe chunks the first frame and `nudgeParser()`
+  (feeds `00 00 01 b7`, the sequence-end code) forces the last buffered picture out — both at probe
+  time and in `decodeSegment`'s flush branch.
+- `'frame'` (ProRes — no FFmpeg bitstream parser exists for it): feed the whole edit unit as one
+  packet, expect a frame back immediately. **Never call `nudgeParser()`** in this mode — a
+  sequence-end code is a garbage packet to a parser-less decoder. `decodeSegment`'s flush branch
+  checks `this.packetMode` and only calls `decoder.flush()`.
+
+**`useI420`** (`WasmTranscodePipeline`): decided once in `create()` from whether the *first probe
+frame* came back as `DecodedFrame.format === 'i420'` (feature-detected per decoder instance — see
+`dec_get_i420` below) AND the Safari half-scale retry wasn't needed. `encodeI420Frame` doesn't
+implement that retry's 2×2 RGBA-domain averaging, so the retry always uses `encodeRgbaFrame`
+(content is irrelevant there — `transcoder.flush()`'s return value on the probe encode is
+discarded; only getting the encoder to emit SPS/PPS matters).
+
+## `dec_get_i420` (`wasm-ffmpeg-decoder.ts`, `ffmpeg_wasm/src/common/frame_io.c`)
+
+Optional C export: one `sws_scale` straight to planar 4:2:0, replacing the older
+`dec_get_rgba` → JS BT.601 pixel loop → I420 round-trip (2 conversions, wrong matrix for HD, the
+expensive one in JS) with one correct-matrix conversion in C. Feature-detected once at
+`WasmFfmpegDecoder` construction via `typeof mod._dec_get_i420 === 'function'` — checking the raw
+export name, not `cwrap()`ing speculatively, so modules built before this export existed (already-
+built `mpeg2-decoder`/`h264-decoder` binaries) still load and fall back to `dec_get_rgba` cleanly.
+
+**Frames are copied, not viewed, out of wasm memory** (`.slice()`, same as the RGBA path) even
+though that costs a memcpy: one `_drain()` call can return *multiple* frames (B-frame reorder
+release), each reusing the same `_i420Ptr`/`_rgbaPtr` scratch buffer — a raw view would have every
+frame in the batch alias the last one's pixels.
+
+`Mpeg2Transcoder.encodeI420Frame` hands the wasm-decoder's bytes to `VideoFrame` with at most one
+more copy (into `interleaveBuf`, only when `srcWidth/Height` differ from the MB-aligned coded dims
+— e.g. 1080 vs 1088 — to place active rows over the pre-filled black/neutral padding; an exact-size
+match skips even that, since `VideoFrame`'s constructor already copies internally).
+
 ## Index modes
 
 `indexMode: 'cbg' | 'vbe' | 'none'`. Surfaced on `ManifestData.indexMode`.

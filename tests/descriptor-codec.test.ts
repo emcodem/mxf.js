@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { identifyVideoCodec } from '../src/parser/descriptor.js';
+import { identifyVideoCodec, proresProfileFromUL } from '../src/parser/descriptor.js';
 
 const ul = (...bytes: number[]) => Uint8Array.from(bytes);
 
@@ -33,5 +33,25 @@ describe('identifyVideoCodec (picture essence coding UL → codec)', () => {
 
   it('returns unknown for an unrelated label', () => {
     expect(identifyVideoCodec(ul(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x0a,0x04,0x01,0x02,0x02,0x71,0x00,0x00,0x00))).toBe('unknown');
+  });
+
+  // Bytes confirmed against real files: prores-decoder samples generated with ffmpeg's prores_ks
+  // encoder + mxf muxer (byte-7 designator 0x0d in every case), and the profile-byte table read
+  // directly from FFmpeg's libavformat/mxfenc.c (mxf_prores_codec_uls).
+  it('recognizes Apple ProRes (byte-12 = 0x03, byte-13 = 0x06), any designator byte', () => {
+    expect(identifyVideoCodec(ul(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x0d,0x04,0x01,0x02,0x02,0x03,0x06,0x04,0x00))).toBe('prores');
+    expect(identifyVideoCodec(ul(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x09,0x04,0x01,0x02,0x02,0x03,0x06,0x01,0x00))).toBe('prores');
+  });
+
+  it('reads the ProRes profile byte (14): 1=Proxy 2=LT 3=422 4=422HQ 5=4444 6=4444XQ', () => {
+    const proresUL = (profile: number) =>
+      ul(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x0d,0x04,0x01,0x02,0x02,0x03,0x06,profile,0x00);
+    expect(proresProfileFromUL(proresUL(0x01))).toBe(1);
+    expect(proresProfileFromUL(proresUL(0x04))).toBe(4);
+    expect(proresProfileFromUL(proresUL(0x06))).toBe(6);
+  });
+
+  it('proresProfileFromUL returns 0 for a non-ProRes UL', () => {
+    expect(proresProfileFromUL(ul(0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x03,0x04,0x01,0x02,0x02,0x01,0x01,0x01,0x00))).toBe(0);
   });
 });

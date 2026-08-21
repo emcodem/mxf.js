@@ -1,6 +1,6 @@
 import { ulMatchEssenceCodingPrefix } from '../core/ul.js';
 
-export type VideoCodec = 'h264' | 'mpeg2' | 'unknown';
+export type VideoCodec = 'h264' | 'mpeg2' | 'prores' | 'unknown';
 export type AudioCodec = 'pcm' | 'aac' | 'unknown';
 
 export interface PictureDescriptor {
@@ -24,6 +24,11 @@ export interface PictureDescriptor {
   ppsNALU: Uint8Array | null;
   /** Raw picture essence coding UL */
   pictureEssenceCodingUL: Uint8Array | null;
+  /**
+   * ProRes profile byte (coding UL byte 14): 1=Proxy, 2=LT, 3=422, 4=422 HQ, 5=4444, 6=4444 XQ.
+   * 0 when `codec !== 'prores'` or the profile byte is unrecognized.
+   */
+  proresProfile: number;
 }
 
 export interface SoundDescriptor {
@@ -48,9 +53,18 @@ const AVC_CODING_PREFIXES: Uint8Array[] = [
 ];
 // MPEG-2: byte-13 = 0x00–0x09.  byte-13 = 0x10 is MPEG-1 (not supported → 'unknown').
 const MPEG2_BASE_PREFIX = new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x7f,0x04,0x01,0x02,0x02,0x01]);
+// Apple ProRes (FFmpeg's mxfenc.c mxf_prores_codec_uls): byte-12 = 0x03 (vs 0x01 for MPEG/AVC),
+// byte-13 = 0x06. Byte 14 carries the profile: 01=Proxy 02=LT 03=422 04=422HQ 05=4444 06=4444XQ.
+const PRORES_CODING_PREFIX = new Uint8Array([0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x7f,0x04,0x01,0x02,0x02,0x03,0x06]);
 
 export function identifyVideoCodec(codingUL: Uint8Array): VideoCodec {
   if (AVC_CODING_PREFIXES.some(p => ulMatchEssenceCodingPrefix(codingUL, p))) return 'h264';
   if (ulMatchEssenceCodingPrefix(codingUL, MPEG2_BASE_PREFIX) && codingUL[13] <= 0x09) return 'mpeg2';
+  if (ulMatchEssenceCodingPrefix(codingUL, PRORES_CODING_PREFIX)) return 'prores';
   return 'unknown';
+}
+
+/** ProRes profile byte (coding UL byte 14), or 0 if not a ProRes UL. See {@link PictureDescriptor.proresProfile}. */
+export function proresProfileFromUL(codingUL: Uint8Array): number {
+  return ulMatchEssenceCodingPrefix(codingUL, PRORES_CODING_PREFIX) ? (codingUL[14] ?? 0) : 0;
 }

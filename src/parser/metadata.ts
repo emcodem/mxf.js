@@ -1,7 +1,7 @@
 import { DataViewReader, u32BE, i32BE, i64BE } from '../core/data-view-reader.js';
 import { KLVIterator } from '../core/klv.js';
 import { PrimerPack } from './primer.js';
-import { PictureDescriptor, SoundDescriptor, identifyVideoCodec } from './descriptor.js';
+import { PictureDescriptor, SoundDescriptor, identifyVideoCodec, proresProfileFromUL } from './descriptor.js';
 import { ulMatchClass, formatUL, bytesEqual, isPartitionPack, isIndexTableSegment, isGenericContainerElement } from '../core/ul.js';
 
 export type EssenceKind = 'picture' | 'sound' | 'data' | 'timecode';
@@ -322,6 +322,7 @@ function parsePictureDescriptorFromSet(set: RawSet): PictureDescriptor {
     spsNALU: null,
     ppsNALU: null,
     pictureEssenceCodingUL: pec ?? null,
+    proresProfile: pec && pec.length >= 16 ? proresProfileFromUL(pec) : 0,
   };
 }
 

@@ -449,6 +449,70 @@ export class Mpeg2Transcoder {
     videoFrame.close();
   }
 
+  /**
+   * Encode a planar 4:2:0 frame decoded directly to I420 by `dec_get_i420` — no RGBA round-trip
+   * and no JS colour-matrix math (swscale already produced correct-matrix 4:2:0; compare
+   * {@link encodeRgbaFrame}'s BT.601 conversion loop). `i420` is Y (srcWidth×srcHeight) then U
+   * then V (each ⌈srcWidth/2⌉×⌈srcHeight/2⌉), contiguous, at the frame's own decoded dimensions —
+   * the caller does not scale before calling this.
+   *
+   * Only valid when this transcoder's scaleFactor is 1.0: the Safari half-scale workaround's 2×2
+   * averaging is implemented for RGBA input only (see `_downscale420`/`encodeRgbaFrame`'s scaled
+   * path) — callers must use `encodeRgbaFrame` instead when `_scale !== 1`.
+   */
+  encodeI420Frame(i420: Uint8ClampedArray, srcWidth: number, srcHeight: number, timestampUs: number, forceKeyframe: boolean): void {
+    if (this.encoderError) throw this.encoderError;
+    if (this._scale !== 1) {
+      throw new Error('Mpeg2Transcoder.encodeI420Frame: only supported at scaleFactor 1.0 — use encodeRgbaFrame for the scaled (Safari workaround) path');
+    }
+
+    const cw = this.codedWidth, ch = this.codedHeight;
+    const ySize = cw * ch, uvW = cw >> 1, uvH = ch >> 1, uvSize = uvW * uvH;
+    const bufLen = ySize + uvSize * 2;
+
+    if (srcWidth === cw && srcHeight === ch) {
+      // Exact match (already at MB-aligned coded dims) — VideoFrame copies internally at
+      // construction, so no extra copy needed here.
+      this._emitI420(i420, timestampUs, forceKeyframe);
+      return;
+    }
+
+    // MB-padding case (e.g. 1080 vs coded 1088): copy active rows into interleaveBuf, which is
+    // pre-filled black/neutral for the padding rows — a plane memcpy instead of a per-pixel
+    // colour conversion, same padding pattern as encodeRgbaFrame's full-resolution path.
+    if (this.interleaveBuf === null || this.interleaveBuf.length !== bufLen) {
+      this.interleaveBuf = new Uint8Array(bufLen);
+      this.interleaveBuf.fill(16,  0,    ySize);
+      this.interleaveBuf.fill(128, ySize);
+    }
+    const buf = this.interleaveBuf;
+    const srcUvW = (srcWidth + 1) >> 1, srcUvH = (srcHeight + 1) >> 1;
+    const srcUOff = srcWidth * srcHeight, srcVOff = srcUOff + srcUvW * srcUvH;
+
+    for (let r = 0; r < srcHeight; r++) {
+      buf.set(i420.subarray(r * srcWidth, r * srcWidth + srcWidth), r * cw);
+    }
+    for (let r = 0; r < srcUvH; r++) {
+      buf.set(i420.subarray(srcUOff + r * srcUvW, srcUOff + r * srcUvW + srcUvW), ySize + r * uvW);
+      buf.set(i420.subarray(srcVOff + r * srcUvW, srcVOff + r * srcUvW + srcUvW), ySize + uvSize + r * uvW);
+    }
+    this._emitI420(buf, timestampUs, forceKeyframe);
+  }
+
+  private _emitI420(buf: Uint8Array | Uint8ClampedArray, timestampUs: number, forceKeyframe: boolean): void {
+    const videoFrame = new VideoFrame(buf, {
+      format:        'I420',
+      codedWidth:    this.codedWidth,
+      codedHeight:   this.codedHeight,
+      displayWidth:  this.displayWidth,
+      displayHeight: this.displayHeight,
+      timestamp:     timestampUs,
+      duration:      this.frameDurUs,
+    });
+    this.encoder.encode(videoFrame, { keyFrame: forceKeyframe });
+    videoFrame.close();
+  }
+
   /** Flush the encoder and return all accumulated encoded chunks. */
   async flush(): Promise<TranscodedChunk[]> {
     if (this.encoderError) throw this.encoderError;

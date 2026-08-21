@@ -250,6 +250,19 @@
           timeline below works regardless. <b>Library default: off</b> (demo pre-fills on).</p>
       </div>
 
+      <div class="opt-label">wasm decoder plugins</div>
+      <div class="opt-ctrl">
+        <label><input type="checkbox" id="optPluginProres" checked> <code>prores</code></label>
+        <label title="Experimental — the JS decoder above remains the trusted, tested path for MPEG-2. This wasm path exists for comparison/Firefox-support experiments only.">
+          <input type="checkbox" id="optPluginMpeg2"> <code>mpeg2video</code> <span style="color:#a84">(experimental)</span>
+        </label>
+        <p class="opt-help">When a checked codec matches the loaded file, an emscripten-ffmpeg WASM module
+          decodes it instead of (for ProRes) reporting <code>codec-unsupported</code>, or (for MPEG-2) the
+          built-in JS decoder. Modules load from <code>/wasm-plugin/&lt;name&gt;-decoder.js</code> — see
+          <code>demo/plugin-test.html</code> for a dedicated single-file sandbox with per-segment transcode
+          timing. <b>Library default: none configured.</b></p>
+      </div>
+
       <div class="opts-actions">
         <button id="optReload">Reload with these options</button>
         <span class="opts-note">Options apply on the next load. Reload re-opens the current source.</span>
@@ -602,11 +615,27 @@
     // off). The badge in the summary surfaces the settings that visibly change a code path.
     const playerOptsActiveEl = document.getElementById('playerOptsActive');
     const playerOptsPanel = document.getElementById('playerOptsPanel');
+    // Codec name -> [wasm module filename, mxfCodec, packetMode]. Mirrors the table in
+    // demo/plugin-test.html; kept in sync manually since these are separate static demo pages.
+    const PLUGIN_TARGETS = {
+      prores:     { file: 'prores-decoder.js', mxfCodec: 'prores', packetMode: 'frame' },
+      mpeg2video: { file: 'mpeg2-decoder.js',  mxfCodec: 'mpeg2',  packetMode: 'stream' },
+    };
+    function getPluginVideoDecoders() {
+      const enabled = [];
+      if (document.getElementById('optPluginProres').checked) enabled.push('prores');
+      if (document.getElementById('optPluginMpeg2').checked) enabled.push('mpeg2video');
+      return enabled.map(ffmpegCodec => {
+        const t = PLUGIN_TARGETS[ffmpegCodec];
+        return { ffmpegCodec, moduleUrl: `/wasm-plugin/${t.file}`, mxfCodec: t.mxfCodec, packetMode: t.packetMode };
+      });
+    }
     function getPlayerOpts() {
       const num = (id, fallback) => {
         const v = parseFloat(document.getElementById(id).value);
         return Number.isFinite(v) ? v : fallback;
       };
+      const videoDecoder = getPluginVideoDecoders();
       return {
         // Omit forceIndexMode entirely when 'auto' so the worker uses the detected mode.
         forceIndexMode: document.getElementById('optForceIndexMode').value || undefined,
@@ -617,6 +646,11 @@
         resumeBufferSeconds: num('optResumeBuffer', 1.5),
         maxSourceCacheBytes: Math.round(num('optSourceCache', 0) * 1024 * 1024),
         debug: document.getElementById('optDebug').checked,
+        // The player auto-picks whichever entry's mxfCodec matches the loaded file; no manual
+        // per-file choice. Omitted entirely (not an empty array) when nothing is checked, so a
+        // codec neither plugin covers falls through to the built-in path exactly as if `plugins`
+        // had never been set.
+        plugins: videoDecoder.length ? { videoDecoder } : undefined,
       };
     }
     function syncPlayerOptsBadge() {
@@ -626,6 +660,7 @@
       if (o.seekMode !== 'accurate') notable.push(`seek=${o.seekMode}`);
       if (o.pcmAudioMode !== 'auto') notable.push(`pcm=${o.pcmAudioMode}`);
       if (!o.debug) notable.push('debug off');
+      if (o.plugins) notable.push(`plugins=[${o.plugins.videoDecoder.map(p => p.ffmpegCodec).join(',')}]`);
       playerOptsActiveEl.textContent = notable.length ? `· ${notable.join(', ')}` : '';
     }
     // Delegated: any select/number/checkbox change inside the panel refreshes the badge.

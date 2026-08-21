@@ -13,7 +13,7 @@ function pictureDescriptor(over: Partial<PictureDescriptor> & { codec: VideoCode
     width: 0, height: 0, storedWidth: 0, storedHeight: 0,
     frameRateNumerator: 25, frameRateDenominator: 1,
     aspectRatioNum: 0, aspectRatioDen: 0,
-    spsNALU: null, ppsNALU: null, pictureEssenceCodingUL: null,
+    spsNALU: null, ppsNALU: null, pictureEssenceCodingUL: null, proresProfile: 0,
     ...over,
   };
 }

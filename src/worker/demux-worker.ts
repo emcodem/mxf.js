@@ -119,8 +119,9 @@ function _diagAvccParamSets(buf: ArrayBuffer): { sps: boolean; pps: boolean; idr
   }
   return { sps, pps, idr };
 }
-// Config for the wasm plugin, carried from the init command so handleInit can use it.
-let activePluginConfig: WorkerPluginConfig | null = null;
+// Configured wasm plugin(s), carried from the init command so handleInit can use them. The one
+// whose mxfCodec matches the file's detected pd.codec (at most one should) is picked at runtime.
+let activePluginConfigs: WorkerPluginConfig[] = [];
 // Forced index mode override (testing/debugging only). Set from the init command; null = use detected.
 let pendingForceIndexMode: IndexMode | null = null;
 
@@ -388,9 +389,12 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       : 0;
 
     // -----------------------------------------------------------------------
-    // Wasm decoder plugin path — overrides native decoders when pd.codec matches
+    // Wasm decoder plugin path — overrides native decoders when pd.codec matches one of the
+    // configured plugins (there may be several, e.g. one for mpeg2video, one for prores; at most
+    // one should match a given file's single picture codec).
     // -----------------------------------------------------------------------
-    if (activePluginConfig && pd?.codec === activePluginConfig.mxfCodec) {
+    const activePluginConfig = activePluginConfigs.find(p => p.mxfCodec === pd?.codec);
+    if (activePluginConfig) {
       // LIVE: wait/poll for frame 0 on a too-fresh file (see findFirstVideoFrameLive); VOD: one-shot scan.
       let firstVideoFrame: EssenceFrame | null = null;
       if (liveMode) {
@@ -425,7 +429,8 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
         pipeline = await WasmTranscodePipeline.create(
           decoder, firstVideoFrame.data,
           storedEditRateNumerator, storedEditRateDenominator,
-          0, 0,
+          pd?.storedWidth ?? 0, pd?.storedHeight ?? 0,
+          activePluginConfig.packetMode,
         );
       } catch (e) {
         postError(`Plugin (${activePluginConfig.ffmpegCodec}): ${e instanceof Error ? e.message : String(e)}`, true);
@@ -719,6 +724,23 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       }
     }
 
+    // Reaching here with a picture track whose codec isn't 'h264' means: it isn't 'mpeg2' (that
+    // branch returns above unconditionally) and no configured plugin matched it either (the plugin
+    // branch also returns above on a match, so activePluginConfig is necessarily undefined here) —
+    // there is no decode/remux path for it. Report it cleanly instead of falling through to
+    // buildInitSegment(), which would otherwise emit a `mp4v` box MSE can't actually play. Audio
+    // (if any) still plays.
+    if (pd && pd.codec !== 'h264') {
+      videoCodecSupported = false;
+      post({
+        type: 'codecUnsupported',
+        codec: pd.codec,
+        reason: activePluginConfigs.length
+          ? `No plugin configured for codec '${pd.codec}' (configured plugin(s) decode: ${activePluginConfigs.map(p => p.mxfCodec).join(', ')})`
+          : `No decoder for codec '${pd.codec}' — configure plugins.videoDecoder to add one`,
+      });
+    }
+
     const resolvedMode: 'mse' | 'webcodecs' =
       (videoMode === 'webcodecs' && pendingVideoInit) ? 'webcodecs' : 'mse';
 
@@ -753,11 +775,11 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       post({ type: 'videoInit', codec, description: descBuf, width, height }, [descBuf]);
     } else {
       const includeAudio = sd?.codec !== 'pcm'; // PCM uses Web Audio — skip from moov
-      const initSeg = fragmenter!.buildInitSegment(includeAudio);
+      const initSeg = fragmenter!.buildInitSegment(includeAudio, videoCodecSupported);
       const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
       post({ type: 'initSegment', data: initBuf }, [initBuf]);
     }
-    liveMark('manifest + init posted (H.264) — handing to player');
+    liveMark(`manifest + init posted (${pd?.codec ?? 'audio-only'}) — handing to player`);
 
   } catch (e) {
     postError(`Failed to parse MXF: ${e instanceof Error ? e.message : String(e)}`, true);
@@ -1680,14 +1702,14 @@ type CommandHandlers = { [K in WorkerCommand['type']]: (cmd: Extract<WorkerComma
 const commandHandlers: CommandHandlers = {
   initUrl: (cmd) => {
     videoMode = cmd.videoMode ?? 'mse';
-    activePluginConfig = cmd.plugins?.videoDecoder ?? null;
+    activePluginConfigs = cmd.plugins?.videoDecoder ?? [];
     pendingForceIndexMode = cmd.forceIndexMode ?? null;
     const loader = wrapWithSourceCache(new HttpLoader(cmd.url), cmd.cacheBytes ?? 0, !!cmd.live);
     handleInit(loader, cmd.debug, cmd.live, cmd.startEditUnit, cmd.liveFromStart).catch(e => postError(String(e), true));
   },
   initFile: (cmd) => {
     videoMode = cmd.videoMode ?? 'mse';
-    activePluginConfig = cmd.plugins?.videoDecoder ?? null;
+    activePluginConfigs = cmd.plugins?.videoDecoder ?? [];
     pendingForceIndexMode = cmd.forceIndexMode ?? null;
     const loader = wrapWithSourceCache(new FileLoader(cmd.file), cmd.cacheBytes ?? 0, !!cmd.live);
     handleInit(loader, cmd.debug, cmd.live, cmd.startEditUnit, cmd.liveFromStart).catch(e => postError(String(e), true));

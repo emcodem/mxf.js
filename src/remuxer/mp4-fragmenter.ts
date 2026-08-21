@@ -1,4 +1,5 @@
 import { MxfMetadata } from '../parser/metadata.js';
+import type { VideoCodec } from '../parser/descriptor.js';
 import { EssenceFrame } from '../essence/essence-extractor.js';
 import { isAnnexB, annexBtoAVCC, extractSPSPPS, parseSPSCodedDimensions } from '../essence/avc-tools.js';
 import {
@@ -29,7 +30,12 @@ export class Mp4Fragmenter {
   private spsNALUs: Uint8Array[] = [];
   private ppsNALUs: Uint8Array[] = [];
   private seqNum = 0;
-  private videoCodec: 'h264' | 'mpeg2' | 'unknown' = 'unknown';
+  // Every transcode path (MPEG-2 JS decoder, and any wasm plugin incl. ProRes) calls
+  // enableTranscodeMode() before buildInitSegment(), which forces this to 'h264' — so at the point
+  // buildInitSegment() reads it, it is always 'h264' or 'mpeg2' (raw MXF codec, native remux) or
+  // 'unknown'. Typed as the full VideoCodec union anyway since it's assigned straight from
+  // PictureDescriptor.codec at line ~72 below.
+  private videoCodec: VideoCodec = 'unknown';
   private transcodeWidth = 0;
   private transcodeHeight = 0;
   // Display (active, post-crop) dimensions for the transcode path — used only to derive the pixel
@@ -42,7 +48,13 @@ export class Mp4Fragmenter {
     this.metadata = metadata;
   }
 
-  buildInitSegment(includeAudio = true): Uint8Array {
+  /**
+   * `includeVideo=false` omits the video trak even when a `PictureDescriptor` is present — for a
+   * codec with no decode/remux path (no plugin configured, no native support), building a video
+   * trak anyway would emit a codec box (e.g. `mp4v`) MSE can't actually play. The caller should
+   * report the codec as unsupported and fall back to audio-only playback instead.
+   */
+  buildInitSegment(includeAudio = true, includeVideo = true): Uint8Array {
     const pd = this.metadata.pictureDescriptor;
     const sd = this.metadata.soundDescriptor;
 
@@ -74,7 +86,7 @@ export class Mp4Fragmenter {
 
     const tracks: Uint8Array[] = [];
 
-    if (pd) {
+    if (pd && includeVideo) {
       // In transcode mode use dimensions from the MPEG-2 elementary stream (parsed by the
       // decoder from sequence headers) rather than the MXF descriptor, which may be wrong
       // (e.g. 1920×544 stored-height for a 1920×1080 programme) or missing entirely.
