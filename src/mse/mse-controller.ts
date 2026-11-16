@@ -14,6 +14,9 @@ export interface MseControllerEvents {
   appended: { track: TrackType };
 }
 
+/** endOfStream() may trim the duration by at most this much (last-frame/timestamp rounding). */
+const EOS_DURATION_TOLERANCE_SECONDS = 0.5;
+
 type QueueOp =
   | { kind: 'append'; data: ArrayBuffer }
   | { kind: 'remove'; start: number; end: number };
@@ -25,6 +28,8 @@ export class MseController extends EventEmitter<MseControllerEvents> {
   private sourceBuffers = new Map<TrackType, SourceBuffer>();
   private queues = new Map<TrackType, QueueOp[]>();
   private processing = new Map<TrackType, boolean>();
+  /** The full stream duration last set via setDuration(). endOfStream() must not shrink below it. */
+  private targetDuration = 0;
   private readonly debug: boolean;
 
   constructor(video: HTMLVideoElement, debug = false) {
@@ -229,7 +234,17 @@ export class MseController extends EventEmitter<MseControllerEvents> {
     }
   }
 
+  /** Highest buffered end time across all SourceBuffers (what endOfStream() would set as duration). */
+  private highestBufferedEnd(): number {
+    let end = 0;
+    for (const sb of this.sourceBuffers.values()) {
+      if (sb.buffered.length > 0) end = Math.max(end, sb.buffered.end(sb.buffered.length - 1));
+    }
+    return end;
+  }
+
   setDuration(seconds: number): void {
+    this.targetDuration = seconds;
     if (this.mediaSource && this.mediaSource.readyState === 'open') {
       try {
         this.mediaSource.duration = seconds;
@@ -239,16 +254,29 @@ export class MseController extends EventEmitter<MseControllerEvents> {
     }
   }
 
+  /**
+   * Signal end of stream — but only once doing so can't shrink the timeline. Per the MSE spec,
+   * endOfStream() sets `duration` to the highest buffered end time. The player calls this as soon as
+   * its fetch frontier reaches the last frame, which after a skip to the end can be while only a small
+   * part of the file is buffered (or the final appends are still queued). The duration then collapsed
+   * to that buffered end, and every later seek beyond it was silently clamped by the browser: the
+   * player waited for buffer at its seek target while the element sat at the clamped position — a
+   * permanent freeze. So: wait for queued and in-flight appends, then end only if the buffered end
+   * reaches the full duration (minus a small tolerance for last-frame rounding); otherwise skip — the
+   * player calls this again after the next append at EOF.
+   */
   endOfStream(): void {
     if (this.mediaSource && this.mediaSource.readyState === 'open') {
-      // Wait for all source buffers to finish
       const checkAndEnd = () => {
-        const updating = [...this.sourceBuffers.values()].some(sb => sb.updating);
-        if (updating) {
-          setTimeout(checkAndEnd, 50);
-        } else {
-          try { this.mediaSource!.endOfStream(); } catch { /* ignore */ }
+        if (!this.mediaSource || this.mediaSource.readyState !== 'open') return;
+        const busy = [...this.sourceBuffers.values()].some(sb => sb.updating) ||
+          [...this.queues.values()].some(q => q.length > 0);
+        if (busy) { setTimeout(checkAndEnd, 50); return; }
+        if (this.highestBufferedEnd() < this.targetDuration - EOS_DURATION_TOLERANCE_SECONDS) {
+          if (this.debug) console.log(`[mse] endOfStream skipped: buffered end ${this.highestBufferedEnd().toFixed(2)} < duration ${this.targetDuration.toFixed(2)}`);
+          return;
         }
+        try { this.mediaSource.endOfStream(); } catch { /* ignore */ }
       };
       checkAndEnd();
     }

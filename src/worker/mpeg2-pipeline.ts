@@ -1,6 +1,5 @@
 import { Mpeg2Decoder, YUVFrame } from '../codec/mpeg2-decoder.js';
 import { Mpeg2Transcoder, TranscodedChunk } from '../codec/mpeg2-transcoder.js';
-import { TRANSCODE_KEYFRAME_INTERVAL_SECONDS } from '../core/constants.js';
 
 /** An MPEG-2 elementary-stream access unit. (System Item timecode is NOT threaded through the decoder:
  *  it is presentation-timeline metadata anchored by content-package edit unit in the worker, not a
@@ -54,23 +53,9 @@ export class Mpeg2Pipeline {
   // Display-order frame counter; each emitted frame gets timestamp = counter * frameDurUs.
   // Reset to the target frame on seek.
   private editUnitCounter: bigint;
-  // Forces the next emitted frame to be an encoded keyframe. True initially (the very first frame
-  // of the file) and after reset() (a real seek lands on an arbitrary position, so its first decoded
-  // picture must be a random-access point). NOT reset per decodeSegment() call: the transcoder is one
-  // persistent VideoEncoder session for the whole file, so an ordinary forward-playing chunk boundary
-  // is not a discontinuity — it can keep extending the same P-frame chain the previous chunk left
-  // off; "every MSE media segment must begin with a random-access point" (the previous assumption
-  // here) isn't actually a requirement for contiguous, gap-free appends. Forcing a fresh IDR on every
-  // ~1s chunk (CHUNK_DURATION_SECONDS) regardless of real need made the H.264 stream far more
-  // IDR-heavy than any normal encode (every ~1s instead of every several seconds, each IDR several
-  // times the size of a P-frame) — see todo_transcode_stall_and_fallback.md Issue A. Instead, a
-  // periodic keyframe (TRANSCODE_KEYFRAME_INTERVAL_SECONDS, see the decode callback below) keeps a
-  // random-access point within reach of an in-buffer backward seek without forcing one every chunk.
-  private needsKeyframe = true;
-  // Edit unit of the last emitted keyframe — the decode callback forces another one once
-  // TRANSCODE_KEYFRAME_INTERVAL_SECONDS worth of frames have passed since it.
-  private lastKeyframeEU: number;
-  private readonly keyframeIntervalFrames: number;
+  // Set true at the start of each segment so the first emitted frame is encoded as a keyframe —
+  // every MSE media segment must begin with a random-access point.
+  private firstFrameOfSegment = true;
   // After a display-based reset (seek), the first emitted frame is the random-access I; its true
   // presentation edit unit is the keyframe's STORAGE edit unit + its temporal_reference (decode ≠
   // display order in Long-GOP). We can't know the temporal_reference until that frame decodes, so the
@@ -107,8 +92,6 @@ export class Mpeg2Pipeline {
     this.pps = pps;
     this.frameDurUs = frameDurUs;
     this.editUnitCounter = BigInt(startFrame);
-    this.lastKeyframeEU = startFrame;
-    this.keyframeIntervalFrames = Math.max(1, Math.round(TRANSCODE_KEYFRAME_INTERVAL_SECONDS * 1_000_000 / frameDurUs));
     this._srcCodW = probe.codedWidth;
     this._srcCodH = probe.codedHeight;
     // Encoder dims (may be half-res when scaleFactor=0.5 was used for Safari workaround).
@@ -222,11 +205,9 @@ export class Mpeg2Pipeline {
         pipeline.editUnitCounter = BigInt(pipeline.pendingDisplayBase + decoded.temporalReference);
         pipeline.pendingDisplayBase = null;
       }
-      const eu = Number(pipeline.editUnitCounter);
-      const tsUs = eu * pipeline.frameDurUs;
-      const forceKey = pipeline.needsKeyframe || (eu - pipeline.lastKeyframeEU) >= pipeline.keyframeIntervalFrames;
-      if (forceKey) { pipeline.needsKeyframe = false; pipeline.lastKeyframeEU = eu; }
-      transcoder.encodeFrame(decoded, tsUs, forceKey);
+      const tsUs = Number(pipeline.editUnitCounter) * pipeline.frameDurUs;
+      transcoder.encodeFrame(decoded, tsUs, pipeline.firstFrameOfSegment);
+      pipeline.firstFrameOfSegment = false;
       pipeline.editUnitCounter++;
     });
 
@@ -261,8 +242,7 @@ export class Mpeg2Pipeline {
   reset(toFrame: number, useDisplayBase = true): void {
     this.editUnitCounter = BigInt(toFrame);
     this.pendingDisplayBase = useDisplayBase ? toFrame : null;
-    this.needsKeyframe = true;
-    this.lastKeyframeEU = toFrame;
+    this.firstFrameOfSegment = true;
     this.decoder.reset();
   }
 
@@ -281,6 +261,8 @@ export class Mpeg2Pipeline {
     flushHeldAnchor: boolean,
     shouldAbort: () => boolean,
   ): Promise<DecodeSegmentResult> {
+    // Force the first emitted frame of this segment to be a keyframe (random-access point).
+    this.firstFrameOfSegment = true;
     const counterBefore = this.editUnitCounter;
 
     const decodeT0 = performance.now();
