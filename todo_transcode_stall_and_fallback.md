@@ -8,6 +8,12 @@ that they existed only as uncommitted working-tree changes. The stall recovery i
 these three issues were caught (the watchdog logs made the failure visible instead of a silent
 freeze).
 
+**Update 2026-11-17:** the MPEG-2 half of the Issue A change (a keyframe only every
+`TRANSCODE_KEYFRAME_INTERVAL_SECONDS` instead of at the start of every chunk) was **reverted** in
+`3f9be75`. MSE drops appended frames until the next keyframe after any `remove()`/`abort()`/
+timestamp discontinuity, so without a keyframe per chunk, playback after a seek or rewind painted
+almost no frames (skip-seek-freeze E2E). The ProRes all-intra change stays.
+
 ## Context: what was being tested and with what
 
 The user asked to (1) benchmark decode speed of synthetic XAVC-like MXF files, (2) push to
