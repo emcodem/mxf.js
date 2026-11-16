@@ -10,10 +10,25 @@ import type { ITranscodePipeline, DecodeSegmentResult } from './mpeg2-pipeline.j
  * display-order frames the B-frame reorder buffer releases (e.g. EU containing B2 may cause
  * both B2 and the previously-held P3 to be emitted together). All returned frames are encoded
  * sequentially — do NOT collapse or discard them.
+ *
+ * Every emitted frame is re-encoded as an H.264 IDR keyframe (see encodeDecodedFrame) — no P-frames
+ * at all. This wasm-plugin path currently serves ProRes exclusively, and ProRes has no inter-frame
+ * prediction in its own bitstream (every source frame is already independently decodable), so
+ * introducing an H.264 P-frame reference chain here is a pure choice, not a technical requirement —
+ * unlike Mpeg2Pipeline, whose Long-GOP source genuinely has temporal structure worth preserving.
+ * Real repro testing (todo_transcode_stall_and_fallback.md Issue A) found that a P-frame chain
+ * introduced here reliably exposed a Chrome D3D11 hardware H.264 decoder reliability bug under
+ * sustained MSE buffer underflow (which this pipeline's below-realtime decode throughput causes
+ * often): once the decoder failed to resume from one particular underflow, it stayed permanently
+ * wedged, matching the watchdog's own diagnosis of "a decode-dependency break behind the playhead".
+ * All-intra output has no such dependency to break — any available frame is decodable on its own,
+ * so an underflow is just a transient stall again instead of a permanent one (confirmed: 100%
+ * reliable full playthrough vs. reliably wedging within the first ~10s with P-frames). The bitrate
+ * cost is real (H.264 without inter-prediction can't exploit whatever temporal pixel redundancy
+ * ProRes's own encode ignored) but is the right trade against a hard freeze.
  */
 export class WasmTranscodePipeline implements ITranscodePipeline {
   private editUnitCounter: bigint;
-  private firstFrameOfSegment = true;
   // After reset() (seek/scrub), suppress output until the first I-frame. Open-GOP leading
   // P-frames reference unavailable prior content and render as corruption, same issue the
   // native JS decoder solves with its suppressUntilKeyframe flag. All-intra codecs (e.g. ProRes)
@@ -165,16 +180,16 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
   // keyframe's true presentation edit unit. Seek labelling stays storage-based for this path.
   reset(toFrame: number, _useDisplayBase = true): void {
     this.editUnitCounter = BigInt(toFrame);
-    this.firstFrameOfSegment = true;
     this.suppressUntilKey = true;
     this.decoder.reset();
   }
 
   private encodeDecodedFrame(f: DecodedFrame, tsUs: number): void {
+    // Always a keyframe — see the class doc comment for why.
     if (this.useI420) {
-      this.transcoder.encodeI420Frame(f.data, f.width, f.height, tsUs, this.firstFrameOfSegment);
+      this.transcoder.encodeI420Frame(f.data, f.width, f.height, tsUs, true);
     } else {
-      this.transcoder.encodeRgbaFrame(f.data, f.width, f.height, tsUs, this.firstFrameOfSegment);
+      this.transcoder.encodeRgbaFrame(f.data, f.width, f.height, tsUs, true);
     }
   }
 
@@ -183,7 +198,6 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
     flushDecoder: boolean,
     shouldAbort: () => boolean,
   ): Promise<DecodeSegmentResult> {
-    this.firstFrameOfSegment = true;
     const counterBefore = this.editUnitCounter;
     const decodeT0 = performance.now();
     // pict_type: 1=I, 2=P, 3=B. Record which types come out per EU (e.g. "3:B" = 1 B-frame at EU 3).
@@ -203,7 +217,6 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
         }
         const tsUs = Number(this.editUnitCounter) * this.frameDurUs;
         this.encodeDecodedFrame(f, tsUs);
-        this.firstFrameOfSegment = false;
         this.editUnitCounter++;
       }
     }
@@ -220,7 +233,6 @@ export class WasmTranscodePipeline implements ITranscodePipeline {
         }
         const tsUs = Number(this.editUnitCounter) * this.frameDurUs;
         this.encodeDecodedFrame(f, tsUs);
-        this.firstFrameOfSegment = false;
         this.editUnitCounter++;
       }
     }

@@ -75,6 +75,18 @@ export const FIRST_CHUNK_DURATION_SECONDS = 0.5;
 export const MIN_CHUNK_FRAMES = 3;
 /** Seconds of already-played media to keep behind the playhead before evicting. */
 export const BACK_BUFFER_SECONDS = 6;
+/** How often a transcode pipeline (`Mpeg2Pipeline`/`WasmTranscodePipeline`) forces a fresh IDR
+ *  keyframe during otherwise-continuous forward playback, independent of `CHUNK_DURATION_SECONDS`.
+ *  The transcoder is one persistent VideoEncoder session for the whole file, so an ordinary chunk
+ *  boundary is not a decode discontinuity and doesn't itself need a keyframe — only a real seek/reset
+ *  does (handled separately). This periodic keyframe exists purely so an in-buffer backward seek that
+ *  bypasses reset() (`isSeekServedByBuffer`, MSE resuming decode from data still resident in the
+ *  SourceBuffer) always has a random-access point within reach. Must stay comfortably under
+ *  BACK_BUFFER_SECONDS so that reach: eviction never removes the ONLY keyframe covering a still-
+ *  resident range. Previously every chunk (1s) forced one — needlessly IDR-heavy (each IDR several
+ *  times the size of a P-frame) for a stream that's continuously decodable without it; see
+ *  todo_transcode_stall_and_fallback.md Issue A. */
+export const TRANSCODE_KEYFRAME_INTERVAL_SECONDS = 4;
 /** Minimum buffered-ahead seconds required before (re)starting playback after a cold start, a seek,
  *  or a stall. Small so resume stays responsive (the first picture is shown as soon as it decodes,
  *  while still "buffering"), but large enough that playback doesn't immediately re-stall and stutter
