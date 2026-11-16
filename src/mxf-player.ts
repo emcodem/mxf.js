@@ -167,6 +167,42 @@ function resolvePluginsCommand(plugins: MxfConfig['plugins']): { videoDecoder: W
   return { videoDecoder: list.map(resolveWorkerPlugin) };
 }
 
+/**
+ * Post-seek fetch size, in frames: decode keyframe→target (plus a small margin) so the seeked
+ * picture appears quickly instead of transcoding a full chunk; forward playback then resumes with
+ * normal-size chunks from `nextFetchFrame`.
+ *
+ * Floored to `framesPerChunk` in two cases:
+ * - `indexMode === 'none'`: no keyframe→byte map, so the worker repositions APPROXIMATELY to the
+ *   target by byte percentage (`keyframe === targetFrame` in that case) — a keyframe→target
+ *   sub-decode is meaningless there, and a tiny chunk would underfeed a reorder-holding transcode
+ *   decoder (MPEG-2/Long-GOP emit nothing until they have a GOP), stalling the first post-seek paint.
+ * - `isTranscode` (source codec differs from the delivered/resolved one — MPEG-2 or ProRes
+ *   re-encoded to H.264): needed even WITH a real index. Confirmed by direct repro that a tiny
+ *   (~3-frame) post-seek chunk reliably wedges the browser's H.264 decoder when a seek-in-place
+ *   stall recovery re-targets the exact position it's already stuck at (`keyframe ===
+ *   seekTargetFrame` for an all-intra source collapses the formula below to its "+3" floor every
+ *   time) — the re-encoded bitstream itself was confirmed syntactically valid (NAL-by-NAL: correct
+ *   I/P slice types, `first_mb_in_slice=0`), so this isn't a bad-bitstream bug, but a decode-pipeline
+ *   limit on splicing such a short re-encoded segment at that exact seam. A full chunk covering the
+ *   same position plays through cleanly. Native H.264 remux (no transcode) keeps the small,
+ *   latency-optimized formula — it isn't re-encoding, so it never exhibited the stall and doesn't
+ *   need the floor. See todo_transcode_stall_and_fallback.md Issue A.
+ */
+export function computeSeekChunkFrames(
+  indexMode: IndexMode | null,
+  isTranscode: boolean,
+  framesPerChunk: number,
+  seekTargetFrame: number,
+  keyframe: number,
+): number {
+  // null (no manifest index info yet) gets the same safe floor as 'none' — an unknown index mode
+  // can't support the cheap keyframe-relative formula either.
+  return (indexMode === 'none' || indexMode === null || isTranscode)
+    ? framesPerChunk
+    : Math.min(framesPerChunk, Math.max(1, seekTargetFrame - keyframe + 3));
+}
+
 const DEFAULT_CONFIG: Required<MxfConfig> = {
   startBufferSeconds: 10,
   maxBufferSeconds: 30,
@@ -217,6 +253,20 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   // buffer alone is over quota — e.g. high-bitrate AVC-Intra). Blocks fetching until the playhead
   // advances and trimBackBuffer() frees room; cleared in onTimeUpdate.
   private bufferFull = false;
+  // Stall watchdog — see checkStallWatchdog(). Runs on a plain timer (not just timeupdate) because it
+  // must still fire while genuinely stalled, which is exactly the condition that stops timeupdate
+  // from firing at all.
+  private stallWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private stallLastPosition = -1;
+  private stallLastBufferedEnd = -1;
+  private stallHasStartedPlaying = false;
+  private stallNoProgressTicks = 0;
+  private stallRecoveryAttempts = 0;
+  // Set once the 'recovery attempts exhausted' error has been emitted, so it fires once per stall
+  // episode instead of every STALL_TICKS_BEFORE_RECOVERY seconds; cleared when playback progresses.
+  private stallGaveUp = false;
+  private readonly STALL_TICKS_BEFORE_RECOVERY = 4; // ~4s of zero currentTime movement while playing
+  private readonly STALL_MAX_RECOVERY_ATTEMPTS = 4;
   private editRateNumerator = 25;
   private editRateDenominator = 1;
   private seqBase = 0;
@@ -820,6 +870,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
         this.pendingSeeks = Math.max(0, this.pendingSeeks - 1);
         // Only the last outstanding seek matters — the worker decoder is now positioned for it.
         if (this.pendingSeeks > 0) break;
+        if (!this.manifest) break;
         const keyframe = event.nearestKeyframeEditUnit;
         this.nextFetchFrame = keyframe;
         this.fetchPending = false;
@@ -834,18 +885,12 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
           break;
         }
 
-        // Accurate: decode keyframe→target (plus a couple frames) so the seeked picture appears
-        // quickly instead of transcoding a full 2 s chunk; forward playback then resumes with
-        // normal-size chunks from nextFetchFrame.
-        //
-        // 'none' mode has no keyframe→byte map: the worker repositions APPROXIMATELY to the target by
-        // byte percentage (keyframe == targetFrame here), so a keyframe→target sub-decode is meaningless
-        // and a tiny chunk would underfeed a reorder-holding transcode decoder (MPEG-2/Long-GOP emit
-        // nothing until they have a GOP), stalling the first post-seek paint. Fetch a full chunk so the
-        // landing GOP decodes and emits.
-        const seekChunk = this.indexMode === 'none'
-          ? this.framesPerChunk
-          : Math.min(this.framesPerChunk, Math.max(1, this.seekTargetFrame - keyframe + 3));
+        // See computeSeekChunkFrames() for the full rationale (index mode / transcode floor).
+        const isTranscode = this.manifest.pictureDescriptor != null &&
+          this.manifest.pictureDescriptor.codec !== this.manifest.resolvedVideoCodec;
+        const seekChunk = computeSeekChunkFrames(
+          this.indexMode, isTranscode, this.framesPerChunk, this.seekTargetFrame, keyframe,
+        );
         this.fetchNextChunk(seekChunk);
         break;
       }
@@ -925,6 +970,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // Arm the one-shot buffer gate for the very first playback, so an autoplaying <video> is held to
     // RESUME_BUFFER_SECONDS (showing "buffering") instead of stuttering through the thin cold buffer.
     this.startupGating = true;
+    this.startStallWatchdog();
 
     // Reset timecode state for the new file.
     this.manifestTimecodes = event.timecodes ?? [];
@@ -1098,6 +1144,99 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     }
   }
 
+  private startStallWatchdog(): void {
+    if (this.stallWatchdogTimer) return;
+    this.stallWatchdogTimer = setInterval(() => this.checkStallWatchdog(), 1000);
+  }
+
+  private stopStallWatchdog(): void {
+    if (this.stallWatchdogTimer !== null) { clearInterval(this.stallWatchdogTimer); this.stallWatchdogTimer = null; }
+    this.stallLastPosition = -1;
+    this.stallLastBufferedEnd = -1;
+    this.stallHasStartedPlaying = false;
+    this.stallNoProgressTicks = 0;
+    this.stallRecoveryAttempts = 0;
+    this.stallGaveUp = false;
+  }
+
+  /**
+   * Detects "currentTime hasn't moved for several seconds while we should be playing" and forces a
+   * fresh, ordinary seek to the current position — the same recovery path a user-initiated seek
+   * already uses (initiateSeek → clearForward + a worker `seek` command that re-derives decode state
+   * from a keyframe). Deliberately does NOT try to diagnose *why* playback stalled: an earlier version
+   * of this watchdog tried to detect a specific cause (a presentation-time gap in `video.buffered`
+   * ahead of the playhead) and re-request just that range. Testing against a real failure showed that
+   * approach is fragile — the browser's own internal SourceBuffer eviction can remove a whole GOP's
+   * worth of data BEHIND the playhead, which breaks the decode-reference chain for frames just ahead
+   * even though `video.buffered` still reports that stretch as present and contiguous. A plain "no
+   * progress for N seconds → do a clean seek-in-place" is blunter but correct for ANY cause: that one,
+   * a forward gap, a future demux bug, or anything else — it doesn't need to know which. Runs on a
+   * plain timer (not `timeupdate`) because a genuine stall is exactly the condition that stops
+   * `timeupdate` from firing.
+   */
+  private checkStallWatchdog(): void {
+    // Gated on playIntent, NOT video.paused: initiateSeek() (our own recovery action) pauses the
+    // element while it rebuffers, same as any seek — gating on .paused would make the watchdog treat
+    // its own recovery as "nothing to check" and never notice if that recovery also didn't work.
+    // Likewise not gated on pendingSeeks: if a seek's worker reply were ever lost, that guard would
+    // block every future check forever — the same class of bug this watchdog exists to route around.
+    // Gated on video.ended: reaching the natural end of the file legitimately stops currentTime from
+    // advancing — that's not a stall, and a recovery seek-in-place at exactly the end would trip the
+    // same play()-at-EOF implicit "seek to earliest position" behavior as maybeResumePlayback() (see
+    // its own video.ended guard) — via a fresh initiateSeek() this time instead of play(), but the
+    // same wrong destination (frame 0).
+    if (!this.manifest || this.liveMode || !this.playIntent || this.scrub.isActive || this.video.ended) return;
+
+    const cur = this.video.currentTime;
+    if (cur > 0) this.stallHasStartedPlaying = true;
+    // Progress means EITHER playback advancing OR — ONLY before playback has ever actually started for
+    // this stall episode — the buffer still growing (paused-while-buffering during the very first fill
+    // is normal and must not be mistaken for a stall). Once currentTime has moved even once, a growing
+    // bufferedEnd stops counting: testing against a real failure showed a failed recovery seek can
+    // still append a few new bytes on each retry even though playback itself never advances, which
+    // made bufferedEnd alone reset the attempt counter on every tick — the watchdog logged "attempt
+    // 1/4" forever and never reached its bounded-failure error. Past first movement, only currentTime
+    // actually advancing counts as real progress.
+    const bufferedEnd = Math.max(
+      this.mseController?.getBufferedEnd('video') ?? 0,
+      this.mseController?.getBufferedEnd('audio') ?? 0,
+    );
+    const progressed = cur !== this.stallLastPosition ||
+      (!this.stallHasStartedPlaying && bufferedEnd !== this.stallLastBufferedEnd);
+    if (progressed) {
+      this.stallLastPosition = cur;
+      this.stallLastBufferedEnd = bufferedEnd;
+      this.stallNoProgressTicks = 0;
+      this.stallRecoveryAttempts = 0;
+      this.stallGaveUp = false;
+      return;
+    }
+    this.stallNoProgressTicks++;
+    if (this.stallNoProgressTicks < this.STALL_TICKS_BEFORE_RECOVERY) return;
+    this.stallNoProgressTicks = 0; // grace period before this attempt's outcome is judged
+
+    if (this.stallRecoveryAttempts >= this.STALL_MAX_RECOVERY_ATTEMPTS) {
+      // Repeated recovery seeks haven't helped — a genuine resource exhaustion (or something
+      // stranger). Stop retrying silently and let the app decide, rather than spinning forever
+      // behind a "buffering" spinner. Emitted once per stall episode, not on every later tick.
+      if (this.stallGaveUp) return;
+      this.stallGaveUp = true;
+      this.emit('error', { message: `Playback stalled at ${cur.toFixed(2)}s — recovery attempts exhausted`, fatal: false });
+      return;
+    }
+    this.stallRecoveryAttempts++;
+
+    if (this.config.debug) {
+      const gap = this.mseController?.findGapAhead('video', cur, this.config.maxBufferSeconds);
+      this.log(
+        `stall-watchdog: no progress at cur=${cur.toFixed(2)} for ~${this.STALL_TICKS_BEFORE_RECOVERY}s` +
+        (gap ? ` (forward gap [${gap.start.toFixed(2)}-${gap.end.toFixed(2)}])` : ' (no forward timestamp gap — likely a decode-dependency break behind the playhead)') +
+        ` — recovering via seek-in-place (attempt ${this.stallRecoveryAttempts}/${this.STALL_MAX_RECOVERY_ATTEMPTS})`,
+      );
+    }
+    this.initiateSeek(cur, this.config.seekMode);
+  }
+
   /** Return the current cold-start ramp size, then grow it ×2 toward framesPerChunk. A fresh load
    *  ramps ~0.25 s → 0.5 s → 1 s → 2 s so the first paint is fast without a big first download, then
    *  settles at the full chunk. Reset per file in onManifest. */
@@ -1203,6 +1342,12 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // rebuffer TOGETHER via the native 'waiting' → maybeResumePlayback gate (which already requires
     // both tracks). flush() also drops the anchor so the scheduler re-locks to the new playhead.
     // The cheap in-buffer seek path keeps audio.onSeek() (store preserved) for an instant re-seek.
+    // Drop any op stuck retrying at the front of either track's queue FIRST (quota back-pressure with
+    // nothing evictable can leave one there forever — see MseController.resetQueue) — otherwise
+    // clearForward()'s own evict() call just queues in behind it and never runs either, and a seek can
+    // no longer recover from that state than ordinary playback could.
+    this.mseController?.resetQueue('video');
+    this.mseController?.resetQueue('audio');
     this.mseController?.clearForward(targetTime);
     this.audio.flush();
 
@@ -1316,6 +1461,17 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   private maybeResumePlayback(): void {
     if (!this.playIntent || !this.manifest) return;
     if (this.scrub.isActive) return;          // the scrub controller owns the element while scrubbing
+    // The element has legitimately reached the end of the file (paused, currentTime === duration).
+    // Calling video.play() here would still pass every gate check below (fetchedToEof is exactly the
+    // condition that lets EOF start playback with a short remaining buffer) — but per the HTML spec,
+    // .play() when the current playback position already equals the effective end of the media first
+    // seeks to the earliest possible position. That fires a genuine native 'seeking' event at
+    // currentTime=0, which onVideoSeeking() (0 isn't in the tail-only buffered range) routes into a
+    // real initiateSeek(0, ...) — wiping the finished buffer and restarting the whole pipeline at
+    // frame 0. This was reproducible on the MPEG-2 transcode path (decode running well ahead of
+    // playback means an 'appended'/'canplay' callback lands exactly at this paused-at-end moment) but
+    // the underlying mistake isn't codec-specific, so guard it here instead.
+    if (this.video.ended) return;
     // A seek is in flight: its refetch is about to REPLACE the chunks around the target (insertChunk
     // stops the live audio source and the slow re-transcode leaves a gap), and the fetch frontier still
     // reflects the OLD position (a stale-EOF bypass). Resuming now plays onto a buffer that's about to
@@ -1952,6 +2108,7 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     this.reuseNextArmed = false;
     if (this.livePollTimer !== null) { clearTimeout(this.livePollTimer); this.livePollTimer = null; }
     this.clearStandbyWatchdog();
+    this.stopStallWatchdog();
     this.liveMode = false;
     this.liveAtEdge = false;
     this.liveStallPolls = 0;

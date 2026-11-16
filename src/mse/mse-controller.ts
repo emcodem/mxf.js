@@ -93,6 +93,33 @@ export class MseController extends EventEmitter<MseControllerEvents> {
   }
 
   /**
+   * Hard-reset a track's pending operation queue: drop everything queued — including an append stuck
+   * retrying at the FRONT under quota back-pressure (handleQuota re-queues it there on every failed
+   * attempt) — and clear the in-progress flag. `evict()`/`appendSegment()` only ever push to the
+   * BACK, so nothing they queue can ever run ahead of a stuck front-of-queue op; new work just piles
+   * up behind it forever. Callers that are about to supersede this track's forward timeline anyway
+   * (a real seek, or stall recovery re-seeking to the current position) can safely discard whatever
+   * was pending — it's for data about to be re-fetched fresh regardless.
+   *
+   * Also aborts the REAL SourceBuffer if it's still `updating`: resetting only `processing` (our own
+   * bookkeeping) leaves a genuinely in-flight `appendBuffer()`/`remove()` running uncancelled — it
+   * still completes on its own later, splicing its (now-stale) data into the buffer moments before our
+   * fresh recovery data lands on top of it. The MSE spec's own mechanism for "cancel what's in flight,
+   * I'm about to supersede it" is `SourceBuffer.abort()` (resets `updating` immediately and resets the
+   * segment parser state) — not calling it means every seek-in-place stall recovery potentially races
+   * a stale append against the fresh one, right at the exact timestamp the decoder is already stuck on.
+   */
+  resetQueue(trackType: TrackType): void {
+    const queue = this.queues.get(trackType);
+    if (queue) queue.length = 0;
+    this.processing.set(trackType, false);
+    const sb = this.sourceBuffers.get(trackType);
+    if (sb && sb.updating) {
+      try { sb.abort(); } catch { /* readyState may already have moved on; nothing to clean up */ }
+    }
+  }
+
+  /**
    * Remove buffered media AHEAD of `fromTime` on every track, keeping the frame at `fromTime`
    * painted so the seeked picture still jumps instantly. Called on a real seek so video can't coast
    * on a residual look-ahead buffer (a prior playthrough) while the Web-Audio PCM store refetches —
@@ -251,6 +278,35 @@ export class MseController extends EventEmitter<MseControllerEvents> {
       if (time >= start - 0.25 && time < end) return end - time;
     }
     return 0;
+  }
+
+  /**
+   * Is there a buffered discontinuity between `from` and `from + lookaheadSeconds`? Returns the gap
+   * if `from` sits inside a buffered range but that range ends before the horizon AND another range
+   * starts later — i.e. a hole SANDWICHED between two ranges we already believe are resident. This is
+   * never true during ordinary forward playback (which just has "nothing beyond here yet", not a hole
+   * followed by more data) — only when something removed data out from under an in-progress fetch
+   * plan: our own eviction, the browser's own internal SourceBuffer eviction (permitted by the MSE
+   * spec before it throws QuotaExceededError, and given with zero notification to page JS), or a
+   * future bug. Root cause doesn't matter here; this is the one check that catches all of them because
+   * it trusts `buffered` over any request bookkeeping.
+   */
+  findGapAhead(type: TrackType, from: number, lookaheadSeconds: number): { start: number; end: number } | null {
+    const sb = this.sourceBuffers.get(type);
+    if (!sb || sb.buffered.length === 0) return null;
+    const horizon = from + lookaheadSeconds;
+    for (let i = 0; i < sb.buffered.length; i++) {
+      const start = sb.buffered.start(i);
+      const end = sb.buffered.end(i);
+      if (from >= start - 0.25 && from < end) {
+        if (i + 1 < sb.buffered.length && end < horizon) {
+          const nextStart = sb.buffered.start(i + 1);
+          if (nextStart > end + 0.05) return { start: end, end: nextStart };
+        }
+        return null;
+      }
+    }
+    return null;
   }
 
   /** Returns the current buffered start time in seconds for a given track */
