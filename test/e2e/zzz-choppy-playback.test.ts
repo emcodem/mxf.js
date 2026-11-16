@@ -31,9 +31,9 @@ beforeAll(async () => {
 
 afterAll(async () => { await browser?.close(); await vite?.close(); });
 
-describe('choppy playback diagnosis', () => {
+// Diagnostic for one specific file: skip (like the other E2E tests) when it isn't present.
+describe.skipIf(!fs.existsSync(FILE))('choppy playback diagnosis', () => {
   test('sample playback health', async () => {
-    if (!fs.existsSync(FILE)) throw new Error(`missing ${FILE}`);
     const page = await browser.newPage();
     const console_: string[] = [];
     page.on('console', m => console_.push(`[${m.type()}] ${m.text()}`));
