@@ -54,7 +54,12 @@ export class Mpeg2Pipeline {
   // Reset to the target frame on seek.
   private editUnitCounter: bigint;
   // Set true at the start of each segment so the first emitted frame is encoded as a keyframe —
-  // every MSE media segment must begin with a random-access point.
+  // every MSE media segment must begin with a random-access point. Do NOT relax this to a periodic
+  // keyframe: a SourceBuffer sets its "need random access point" flag after every remove() (the
+  // player trims the back buffer during playback), abort(), and any timestamp discontinuity (e.g.
+  // scrub previews appended elsewhere in between), and then DROPS appended frames until the next
+  // keyframe. With a keyframe only every 4 s, playback after a seek/rewind ran its clock with almost
+  // no frames painted (skip-seek-freeze E2E: J×3 painted 2 frames instead of ~100).
   private firstFrameOfSegment = true;
   // After a display-based reset (seek), the first emitted frame is the random-access I; its true
   // presentation edit unit is the keyframe's STORAGE edit unit + its temporal_reference (decode ≠
