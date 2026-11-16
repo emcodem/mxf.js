@@ -37,13 +37,13 @@ function resolveChrome() {
 const vite = await createServer({
   root: projectRoot,
   logLevel: 'silent',
-  server: { port: PORT, headers: {} },
+  server: { port: PORT, headers: {}, open: false },
   worker: { format: 'es' },
 });
 await vite.listen();
 
 const browser = await puppeteer.launch({
-  headless: false,
+  headless: !process.env.E2E_HEADFUL,
   executablePath: resolveChrome(),
   args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=WebCodecs'],
 });

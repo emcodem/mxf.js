@@ -6,7 +6,7 @@
  * Set VERBOSE=1 for full console/log output.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'vitest';
-import { getChromePath } from './chrome-path.js';
+import { getChromePath, HEADLESS } from './chrome-path.js';
 import puppeteer, { type Browser } from 'puppeteer';
 import { createServer, type ViteDevServer } from 'vite';
 import { fileURLToPath } from 'url';
@@ -36,7 +36,7 @@ beforeAll(async () => {
   await vite.listen();
 
   browser = await puppeteer.launch({
-    headless: false,
+    headless: HEADLESS,
     executablePath: getChromePath(),
     args: [
       '--no-sandbox',

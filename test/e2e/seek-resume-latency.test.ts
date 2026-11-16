@@ -11,7 +11,7 @@
  * Defaults to xdcam_vistek.mxf (MPEG-2 long-GOP). Skips if absent.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'vitest';
-import { getChromePath } from './chrome-path.js';
+import { getChromePath, HEADLESS } from './chrome-path.js';
 import puppeteer, { type Browser } from 'puppeteer';
 import { createServer, type ViteDevServer } from 'vite';
 import { fileURLToPath } from 'url';
@@ -30,7 +30,7 @@ beforeAll(async () => {
   vite = await createServer({ root: projectRoot, logLevel: 'silent', server: { port: PORT, headers: {} }, worker: { format: 'es' } });
   await vite.listen();
   browser = await puppeteer.launch({
-    headless: false,
+    headless: HEADLESS,
     executablePath: getChromePath(),
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=WebCodecs'],
   });

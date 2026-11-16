@@ -163,7 +163,10 @@ export default defineConfig({
   publicDir: false,
   plugins: [wasmPluginServer(), mediaServer()],
   server: {
-    open: '/demo/index.html',
+    // Open the demo for `npm run dev` only. E2E tests and the Puppeteer scripts start their own
+    // server through createServer(), which inherits this config — without this guard every test
+    // run opened the demo in the developer's normal browser.
+    open: process.env.VITEST || process.env.MXF_NO_OPEN ? false : '/demo/index.html',
     // NOTE: deliberately NOT setting COOP/COEP. `Cross-Origin-Embedder-Policy: require-corp`
     // makes the page cross-origin isolated, which blocks the worker's fetch() of an MXF served
     // from another origin (e.g. http://localhost:8000/clip.mxf) unless that server also sends
