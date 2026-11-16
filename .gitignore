@@ -17,3 +17,6 @@ dist/
 
 # local demo HLS test assets
 demo/hls/
+
+# FFMS2 index files (generated)
+*.ffindex

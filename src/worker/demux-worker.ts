@@ -323,6 +323,52 @@ async function findFirstVideoFrameLive(
   }
 }
 
+/**
+ * Cheap-first VOD probe ladder for the first video frame: each rung re-reads from edit unit 0 with a
+ * larger budget, so the common case (a picture element in edit unit 0, as standard OP1a/D-10 writes it)
+ * costs one small read and the wide scan only happens for pathologically interleaved files. The index
+ * path fetches the WHOLE requested range in one HTTP read before yielding (essence-extractor.ts), so an
+ * unconditional wide probe would pull ~50 edit units (~2 s of bytes on a thin line) just to reach frame 0
+ * — which the cold-start ramp then re-reads anyway.
+ */
+const PROBE_LADDER_DEFAULT = [2, 50];
+/** H.264 needs only the first frame's SPS/PPS, so it can start one edit unit cheaper. */
+const PROBE_LADDER_H264 = [1, 2, 50];
+/** Widest rung of a ladder — how many edit units a failed VOD probe actually scanned (for errors). */
+function probeDepth(ladder: number[]): number { return ladder[ladder.length - 1]; }
+
+/**
+ * Find the first video frame for a codec's init probe. LIVE waits/polls for a too-fresh file (see
+ * findFirstVideoFrameLive); VOD walks `ladder`. Shared by the plugin, MPEG-2 and H.264 init paths so
+ * all three recover from the same interleaving pathologies. Returns null when no video frame exists.
+ */
+async function probeFirstVideoFrame(
+  loader_: ILoader, bootstrap: MxfBootstrap, ladder: number[] = PROBE_LADDER_DEFAULT,
+): Promise<EssenceFrame | null> {
+  if (liveMode) return findFirstVideoFrameLive(loader_, bootstrap);
+  for (const probeCount of ladder) {
+    const extractor = new EssenceExtractor(loader_, bootstrap);
+    for await (const frame of extractor.fetchFrames(0n, probeCount)) {
+      if (frame.trackType === 'video') return frame;
+    }
+  }
+  return null;
+}
+
+/** Slack past a frame's KLV so the offset also covers the NEXT element's key+length header. */
+const FRAME_END_MARGIN = 64;
+/** Byte offset just past a frame's complete KLV — the player's min-preload threshold (see the
+ *  manifest's `firstFrameEndByte`). */
+function frameEndByte(f: EssenceFrame): number {
+  return Number(f.byteOffset) + f.data.byteLength + FRAME_END_MARGIN;
+}
+
+/** Transfer an init segment to the player (copied out of the fragmenter's view of its buffer). */
+function postInitSegment(initSeg: Uint8Array): void {
+  const buf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
+  post({ type: 'initSegment', data: buf }, [buf]);
+}
+
 async function handleInit(loader_: ILoader, debug = false, live = false, startEditUnit = 0, fromStart = false): Promise<void> {
   loader = loader_;
   workerDebug = debug;
@@ -388,6 +434,28 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       ? Number(metadata.duration) * (metadata.editRateDenominator / metadata.editRateNumerator)
       : 0;
 
+    // Manifest fields that are identical whichever decode path claims the file below. Each path
+    // spreads this and overrides only what it actually determines (display dims, resolved codec/mode,
+    // codec support, longGop, firstFrameEndByte) — so a new manifest field is added in ONE place.
+    const manifestBase = {
+      duration: durationSec,
+      editRateNumerator: storedEditRateNumerator,
+      editRateDenominator: storedEditRateDenominator,
+      tracks: metadata.packages.flatMap(p => p.tracks),
+      timecodes: manifestTimecodes(metadata),
+      pictureDescriptor: pd,
+      soundDescriptor: sd,
+      aspectRatio: pd?.aspectRatioNum && pd?.aspectRatioDen ? { num: pd.aspectRatioNum, den: pd.aspectRatioDen } : null,
+      // PCM audio uses Web Audio, never MSE — Chrome rejects an init segment carrying a `sowt` sample
+      // entry even inside a video-only SourceBuffer.
+      pcmMseSupported: false,
+      indexMode: bootstrap.indexMode,
+      audioChannelCount,
+      live: liveMode,
+      essenceStart: essenceStartNum,
+      firstEssenceKey,
+    };
+
     // -----------------------------------------------------------------------
     // Wasm decoder plugin path — overrides native decoders when pd.codec matches one of the
     // configured plugins (there may be several, e.g. one for mpeg2video, one for prores; at most
@@ -395,26 +463,14 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
     // -----------------------------------------------------------------------
     const activePluginConfig = activePluginConfigs.find(p => p.mxfCodec === pd?.codec);
     if (activePluginConfig) {
-      // LIVE: wait/poll for frame 0 on a too-fresh file (see findFirstVideoFrameLive); VOD: one-shot scan.
-      let firstVideoFrame: EssenceFrame | null = null;
-      if (liveMode) {
-        firstVideoFrame = await findFirstVideoFrameLive(loader_, bootstrap);
-      } else {
-        for (const probeCount of [2, 50]) {
-          const extractor = new EssenceExtractor(loader_, bootstrap);
-          for await (const frame of extractor.fetchFrames(0n, probeCount)) {
-            if (frame.trackType === 'video') { firstVideoFrame = frame; break; }
-          }
-          if (firstVideoFrame) break;
-        }
-      }
+      const firstVideoFrame = await probeFirstVideoFrame(loader_, bootstrap);
       if (!firstVideoFrame) {
         postError(liveMode
           ? `Plugin (${activePluginConfig.ffmpegCodec}): no complete video frame within ${LIVE_FIRST_FRAME_TIMEOUT_MS} ms (live source too fresh)`
-          : `Plugin (${activePluginConfig.ffmpegCodec}): no video frames found`, true);
+          : `Plugin (${activePluginConfig.ffmpegCodec}): no video frames found in the first ${probeDepth(PROBE_LADDER_DEFAULT)} edit units`, true);
         return;
       }
-      const firstFrameEndByte = Number(firstVideoFrame.byteOffset) + firstVideoFrame.data.byteLength + 64;
+      const firstFrameEndByte = frameEndByte(firstVideoFrame);
 
       let decoder: WasmFfmpegDecoder;
       try {
@@ -449,31 +505,17 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
 
       post({
         type: 'manifest',
-        duration: durationSec,
-        editRateNumerator: storedEditRateNumerator,
-        editRateDenominator: storedEditRateDenominator,
-        tracks: metadata.packages.flatMap(p => p.tracks),
-        timecodes: manifestTimecodes(metadata),
-        pictureDescriptor: pd,
-        soundDescriptor: sd,
+        ...manifestBase,
         displayWidth: pipeline.displayWidth,
         displayHeight: pipeline.displayHeight,
-        aspectRatio: pd?.aspectRatioNum && pd?.aspectRatioDen ? { num: pd.aspectRatioNum, den: pd.aspectRatioDen } : null,
         videoCodecSupported: true,
-        pcmMseSupported: false,
         resolvedVideoCodec: pipeline.codecString,
         resolvedVideoMode: 'mse',
-        indexMode: bootstrap.indexMode,
         longGop: false,
-        audioChannelCount,
-        live: liveMode,
-        essenceStart: essenceStartNum,
-        firstEssenceKey,
         firstFrameEndByte,
       });
 
-      const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
-      post({ type: 'initSegment', data: initBuf }, [initBuf]);
+      postInitSegment(initSeg);
       return;
     }
 
@@ -485,37 +527,18 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       // captures getKernels() at construction. Failure is non-fatal (JS fallback).
       await loadKernelsOnce();
 
-      // Find the first video frame for the probe-decode. The index path fetches the WHOLE requested
-      // range in one HTTP read before yielding (essence-extractor.ts), so the old `fetchFrames(0n, 50)`
-      // pulled ~50 edit units (~2 s of bytes on a thin line) just to grab frame 0 — then the cold-start
-      // ramp re-reads frame 0 anyway. Standard OP1a/D-10 puts the first picture element in edit unit 0,
-      // so read just the first edit unit or two; escalate to the wide scan only if pathological
-      // interleaving hides it, keeping the common case a tiny read.
-      // Find the first video frame for the probe-decode. In LIVE mode the file may be too fresh
-      // (header written, frame 0 not fully on disk) — wait/poll for it instead of erroring (a
-      // freshly-rotated standby successor hits this). VOD keeps the cheap one-shot [2,50] scan.
-      let firstVideoFrame: EssenceFrame | null = null;
-      if (liveMode) {
-        liveMark('MPEG-2 live first-frame probe START (waiting for frame 0 if too fresh)');
-        firstVideoFrame = await findFirstVideoFrameLive(loader_, bootstrap);
-        liveMark(`MPEG-2 live first-frame probe → ${firstVideoFrame ? 'got frame' : 'TIMEOUT/none'}`);
-      } else {
-        for (const probeCount of [2, 50]) {
-          const extractor = new EssenceExtractor(loader_, bootstrap);
-          for await (const frame of extractor.fetchFrames(0n, probeCount)) {
-            if (frame.trackType === 'video') { firstVideoFrame = frame; break; }
-          }
-          if (firstVideoFrame) break;
-        }
-      }
+      // Find the first video frame for the probe-decode (see probeFirstVideoFrame: cheap ladder on VOD,
+      // wait/poll on a too-fresh live file — a freshly-rotated standby successor hits the latter).
+      if (liveMode) liveMark('MPEG-2 live first-frame probe START (waiting for frame 0 if too fresh)');
+      const firstVideoFrame = await probeFirstVideoFrame(loader_, bootstrap);
+      if (liveMode) liveMark(`MPEG-2 live first-frame probe → ${firstVideoFrame ? 'got frame' : 'TIMEOUT/none'}`);
       if (!firstVideoFrame) {
         postError(liveMode
           ? `MPEG-2: no complete video frame within ${LIVE_FIRST_FRAME_TIMEOUT_MS} ms (live source too fresh)`
-          : 'MPEG-2: no video frames found in first 50 edit units', true);
+          : `MPEG-2: no video frames found in the first ${probeDepth(PROBE_LADDER_DEFAULT)} edit units`, true);
         return;
       }
-      // Byte offset just past frame 0's complete KLV — the player's min-preload threshold (see manifest).
-      const firstFrameEndByte = Number(firstVideoFrame.byteOffset) + firstVideoFrame.data.byteLength + 64;
+      const firstFrameEndByte = frameEndByte(firstVideoFrame);
 
       // Probe-decode the first frame for coded dimensions + chroma, then build the transcode
       // pipeline (encoder → SPS/PPS → persistent stream decoder). See Mpeg2Pipeline.
@@ -543,8 +566,7 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       // from them and the descriptor's DAR, so anamorphic SD/XDCAM-EX renders at the right shape.
       fragmenter!.enableTranscodeMode(pipeline.sps, pipeline.pps, pipeline.codedWidth, pipeline.codedHeight, pipeline.displayWidth, pipeline.displayHeight);
 
-      // PCM audio uses Web Audio — skip audio track from moov entirely. Chrome MSE rejects init
-      // segments containing unknown codec sample entries (sowt) even in a video-only SourceBuffer.
+      // Video-only moov: PCM audio goes to Web Audio (see manifestBase.pcmMseSupported).
       const initSeg = fragmenter!.buildInitSegment(false);
       if (workerDebug) console.log('[worker] MPEG-2 transcode init OK',
         'sps:', Array.from(pipeline.sps).map(b=>b.toString(16).padStart(2,'0')).join(' '),
@@ -555,35 +577,21 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
 
       post({
         type: 'manifest',
-        duration: durationSec,
-        editRateNumerator: storedEditRateNumerator,
-        editRateDenominator: storedEditRateDenominator,
-        tracks: metadata.packages.flatMap(p => p.tracks),
-        timecodes: manifestTimecodes(metadata),
-        pictureDescriptor: pd,
-        soundDescriptor: sd,
+        ...manifestBase,
         // Display dims from the elementary stream (active picture), not the per-field descriptor.
         displayWidth: pipeline.displayWidth,
         displayHeight: pipeline.displayHeight,
-        aspectRatio: pd?.aspectRatioNum && pd?.aspectRatioDen ? { num: pd.aspectRatioNum, den: pd.aspectRatioDen } : null,
         videoCodecSupported: true,
-        pcmMseSupported: false,
         // Codec string from the actual SPS bytes so it matches the constraint byte in the avcC box
         // (decoderConfig.codec may report constraints=0x00 while the SPS has e.g. 0x4c — that
         // mismatch causes a SourceBuffer error when Chrome checks MIME vs avcC on init append).
         resolvedVideoCodec: pipeline.codecString,
         resolvedVideoMode: 'mse',
-        indexMode: bootstrap.indexMode,
         longGop: false, // MPEG-2 transcode path handles reorder inside the decoder, not here
-        audioChannelCount,
-        live: liveMode,
-        essenceStart: essenceStartNum,
-        firstEssenceKey,
         firstFrameEndByte,
       });
 
-      const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
-      post({ type: 'initSegment', data: initBuf }, [initBuf]);
+      postInitSegment(initSeg);
       liveMark('manifest + init posted (MPEG-2) — handing to player');
       return;
     }
@@ -608,19 +616,14 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       let spsPocInfo: SpsPocInfo | null = null;
       let ppsFlagMap: Map<number, PpsPocInfo> = new Map();
       try {
-        // LIVE: wait/poll for frame 0 on a too-fresh file (see findFirstVideoFrameLive); VOD: one-shot.
-        let frame: EssenceFrame | null = null;
-        if (liveMode) {
-          liveMark('H.264 live first-frame probe START (waiting for frame 0 if too fresh)');
-          frame = await findFirstVideoFrameLive(loader_, bootstrap);
-        } else {
-          const extractor = new EssenceExtractor(loader_, bootstrap);
-          for await (const f of extractor.fetchFrames(0n, 1)) {
-            if (f.trackType === 'video') { frame = f; break; }
-          }
-        }
+        // Same probe as the MPEG-2/plugin paths (cheap ladder on VOD, wait/poll on a too-fresh live
+        // file). This previously read a single edit unit with no escalation, so a file whose frame 0
+        // sits behind pathological interleaving errored out fatally here while the other two paths
+        // recovered from it.
+        if (liveMode) liveMark('H.264 live first-frame probe START (waiting for frame 0 if too fresh)');
+        const frame = await probeFirstVideoFrame(loader_, bootstrap, PROBE_LADDER_H264);
         if (frame) {
-          firstFrameEndByte = Number(frame.byteOffset) + frame.data.byteLength + 64;
+          firstFrameEndByte = frameEndByte(frame);
           const avccData = isAnnexB(frame.data) ? annexBtoAVCC(frame.data) : frame.data;
           const { sps, pps } = extractSPSPPS(avccData);
           if (sps.length > 0 && pps.length > 0) {
@@ -647,7 +650,7 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       if (!gotSpsPps) {
         postError(liveMode
           ? `H.264: no complete first video frame within ${LIVE_FIRST_FRAME_TIMEOUT_MS} ms (live source too fresh), or it lacked SPS/PPS`
-          : 'H.264: no SPS/PPS in the first video frame — cannot build an init segment (the first frame must be a keyframe carrying parameter sets)', true);
+          : `H.264: no SPS/PPS in the first video frame found within ${probeDepth(PROBE_LADDER_H264)} edit units — cannot build an init segment (the first frame must be a keyframe carrying parameter sets)`, true);
         return;
       }
       liveMark('H.264 SPS/PPS probe fetched (from frame 0)');
@@ -746,26 +749,13 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
 
     post({
       type: 'manifest',
-      duration: durationSec,
-      editRateNumerator: storedEditRateNumerator,
-      editRateDenominator: storedEditRateDenominator,
-      tracks: metadata.packages.flatMap(p => p.tracks),
-      timecodes: manifestTimecodes(metadata),
-      pictureDescriptor: pd,
-      soundDescriptor: sd,
+      ...manifestBase,
       displayWidth: videoDisplayWidth,
       displayHeight: videoDisplayHeight,
-      aspectRatio: pd?.aspectRatioNum && pd?.aspectRatioDen ? { num: pd.aspectRatioNum, den: pd.aspectRatioDen } : null,
       videoCodecSupported,
-      pcmMseSupported: false,
       resolvedVideoCodec: pd?.codec ?? 'unknown',
       resolvedVideoMode: resolvedMode,
-      indexMode: bootstrap.indexMode,
       longGop: longGop !== null,
-      audioChannelCount,
-      live: liveMode,
-      essenceStart: essenceStartNum,
-      firstEssenceKey,
       firstFrameEndByte,
     });
 
@@ -775,9 +765,7 @@ async function handleInit(loader_: ILoader, debug = false, live = false, startEd
       post({ type: 'videoInit', codec, description: descBuf, width, height }, [descBuf]);
     } else {
       const includeAudio = sd?.codec !== 'pcm'; // PCM uses Web Audio — skip from moov
-      const initSeg = fragmenter!.buildInitSegment(includeAudio, videoCodecSupported);
-      const initBuf = initSeg.buffer.slice(initSeg.byteOffset, initSeg.byteOffset + initSeg.byteLength) as ArrayBuffer;
-      post({ type: 'initSegment', data: initBuf }, [initBuf]);
+      postInitSegment(fragmenter!.buildInitSegment(includeAudio, videoCodecSupported));
     }
     liveMark(`manifest + init posted (${pd?.codec ?? 'audio-only'}) — handing to player`);
 
