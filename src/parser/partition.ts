@@ -6,8 +6,10 @@ export type PartitionKind = 'header' | 'body' | 'footer';
 
 export interface PartitionPack {
   kind: PartitionKind;
-  /** 0=closed/complete, 1=open/incomplete */
+  /** 1 = open, 0 = closed (key byte 14). Completeness is reported separately in `complete`. */
   status: number;
+  /** Header metadata is complete (key byte 14 = 03 or 04). */
+  complete: boolean;
   majorVersion: number;
   minorVersion: number;
   kagSize: number;
@@ -33,14 +35,11 @@ export function parsePartitionPack(buffer: ArrayBuffer, bufferFileOffset: number
     throw new Error(`Expected Partition Pack key at offset ${bufferFileOffset + startOffset}`);
   }
 
-  // Byte 13 of the 16-byte key encodes partition type:
-  // 0x01 = Header Open, 0x02 = Header Closed, 0x03 = Body Open, 0x04 = Body Closed,
-  // 0x05 = Footer Open, 0x06 = Footer Closed
+  // ST 377-1: byte 13 = type (02 header, 03 body, 04 footer; isPartitionPack() guarantees one of these),
+  //           byte 14 = status (01 open/incomplete, 02 closed/incomplete, 03 open/complete, 04 closed/complete)
   const typeByte = klv.key[13];
-  let kind: PartitionKind;
-  if (typeByte <= 0x02) kind = 'header';
-  else if (typeByte <= 0x04) kind = 'body';
-  else kind = 'footer';
+  const statusByte = klv.key[14];
+  const kind: PartitionKind = typeByte === 0x02 ? 'header' : typeByte === 0x03 ? 'body' : 'footer';
 
   const r = new DataViewReader(buffer, klv.valueOffset);
 
@@ -72,7 +71,8 @@ export function parsePartitionPack(buffer: ArrayBuffer, bufferFileOffset: number
 
   return {
     kind,
-    status: typeByte % 2 === 1 ? 1 : 0, // odd = open, even = closed
+    status: statusByte === 0x01 || statusByte === 0x03 ? 1 : 0,
+    complete: statusByte === 0x03 || statusByte === 0x04,
     majorVersion,
     minorVersion,
     kagSize,

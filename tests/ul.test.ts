@@ -38,6 +38,31 @@ describe('isPartitionPack', () => {
   it('rejects a non-partition key', () => {
     expect(isPartitionPack(UL_PRIMER_PACK)).toBe(false);
   });
+
+  const key = (type: number, status: number, reg = 0x05) =>
+    new Uint8Array([0x06,0x0e,0x2b,0x34,0x02,reg,0x01,0x01,0x0d,0x01,0x02,0x01,0x01,type,status,0x00]);
+
+  it('accepts header, body and footer (byte 13 = 02/03/04) with any status', () => {
+    for (const type of [0x02, 0x03, 0x04]) {
+      for (const status of [0x01, 0x02, 0x03, 0x04]) {
+        expect(isPartitionPack(key(type, status))).toBe(true);
+      }
+    }
+  });
+  it('rejects the Random Index Pack, which shares the 13-byte prefix', () => {
+    expect(isPartitionPack(UL_RANDOM_INDEX_PACK)).toBe(false);
+  });
+  it('rejects the Primer Pack in both registry variants', () => {
+    expect(isPartitionPack(key(0x05, 0x01, 0x05))).toBe(false);
+    expect(isPartitionPack(key(0x05, 0x01, 0x53))).toBe(false);
+  });
+  it('rejects an Index Table Segment', () => {
+    expect(isPartitionPack(UL_INDEX_TABLE_SEGMENT_V1)).toBe(false);
+  });
+  it('the exported partition constants use the ST 377-1 layout', () => {
+    expect([...UL_HEADER_PARTITION_OPEN.slice(13, 15)]).toEqual([0x02, 0x01]);
+    expect([...UL_HEADER_PARTITION_CLOSED.slice(13, 15)]).toEqual([0x02, 0x04]);
+  });
 });
 
 describe('isEssenceElement', () => {
