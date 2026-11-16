@@ -162,7 +162,11 @@ async function runPattern(page: Page, name: string, keys: Key[], gapMs: number, 
     // After the K→Space recovery the player MUST be in healthy 1× playback: not paused, the playhead
     // advancing, frames painting, and the rate back to 1×. Anything else is a freeze (judged on the
     // TAIL so an advance-then-stall is caught, not just dead-from-start).
-    const froze = video.paused || tailAdvance < 0.3 || tailFrames === 0 || Math.abs(video.playbackRate - 1) > 0.01;
+    // Exception: a gesture that skips past the end of a short clip (e.g. 8 × +10 s on a 60 s file) lands
+    // on the last frame and the clip ends — that's correct, not a freeze.
+    const endedAtEof = video.ended && Math.abs(video.currentTime - video.duration) < 0.1;
+    const froze = !endedAtEof &&
+      (video.paused || tailAdvance < 0.3 || tailFrames === 0 || Math.abs(video.playbackRate - 1) > 0.01);
 
     // Dump internal latch flags (plain runtime props in the dist bundle). If a name was mangled it
     // shows as undefined — harmless.

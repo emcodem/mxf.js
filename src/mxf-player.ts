@@ -593,6 +593,11 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
   }
 
   play(): void {
+    // An explicit play() at the end of the file starts over from the beginning, like the HTML spec and
+    // every common player. (maybeResumePlayback() refuses to resume an ended element — that guard is
+    // for its automatic callbacks, which must not restart a finished clip on their own; a user's play()
+    // is the deliberate request.)
+    if (this.video.ended && this.manifest && !this.liveMode) this.seek(0);
     // If parked on a fast preview, re-establish a clean accurate decode at the current position
     // before playing forward so playback starts from a proper frame with correct timestamps.
     if (this.previewParked && this.manifest) this.initiateSeek(this.video.currentTime, 'accurate');
@@ -1330,9 +1335,15 @@ export class MxfPlayer extends EventEmitter<MxfPlayerEvents> {
     // applies — clear it so the post-seek fetch isn't blocked (otherwise a seek can stall forever).
     this.bufferFull = false;
 
-    this.seekTargetFrame = Math.round(
+    // Clamp to the LAST frame: a seek to exactly the duration (e.g. skipping past the end) would
+    // otherwise target frame N of an N-frame stream — nothing to fetch, so the element waited at the
+    // end forever with an empty buffer. Fetching the final GOP shows the last frame and lets the
+    // stream end normally (endOfStream once the tail is buffered).
+    const lastFrame = Math.max(0,
+      Math.round(this.manifest.duration * this.editRateNumerator / this.editRateDenominator) - 1);
+    this.seekTargetFrame = Math.min(lastFrame, Math.round(
       targetTime * this.editRateNumerator / this.editRateDenominator
-    );
+    ));
     this.pendingSeeks++;
 
     // Drop the residual look-ahead so video can't coast on a prior-playthrough buffer while audio
