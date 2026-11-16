@@ -41,6 +41,8 @@ interface EmscriptenModule {
 
 export class WasmFfmpegDecoder {
   private ctx: number;
+  private _pktPtr = 0;
+  private _pktCap = 0;
   private _rgbaPtr = 0;
   private _rgbaCap = 0;
   private _i420Ptr = 0;
@@ -96,13 +98,25 @@ export class WasmFfmpegDecoder {
   /**
    * Push a chunk of elementary-stream bytes; return any frames that are now ready.
    * Chunk size is arbitrary — the wasm mpegvideo parser handles boundaries internally.
+   *
+   * The input buffer is a grow-only scratch allocation (same pattern as `_rgbaPtr`/`_i420Ptr`
+   * below), not a fresh malloc/free per call. Real per-frame packets (e.g. ProRes, one edit unit
+   * per `decode()` call) are a different byte length on essentially every call — malloc/free-ing a
+   * new size each time fragments the wasm heap's free list, which manifests as allocation cost
+   * that climbs steadily over a long playback session rather than staying flat.
    */
   decode(esBytes: Uint8Array): DecodedFrame[] {
-    const ptr = this.mod._malloc(esBytes.length);
-    if (!ptr) throw new Error(`WasmFfmpegDecoder: _malloc(${esBytes.length}) returned 0 — wasm heap OOM`);
-    this.mod.HEAPU8.set(esBytes, ptr);
-    const ret = this._decSendPacket(this.ctx, ptr, esBytes.length);
-    this.mod._free(ptr);
+    if (esBytes.length > this._pktCap) {
+      if (this._pktPtr) this.mod._free(this._pktPtr);
+      this._pktPtr = this.mod._malloc(esBytes.length);
+      if (!this._pktPtr) {
+        this._pktCap = 0;
+        throw new Error(`WasmFfmpegDecoder: _malloc(${esBytes.length}) returned 0 — wasm heap OOM`);
+      }
+      this._pktCap = esBytes.length;
+    }
+    this.mod.HEAPU8.set(esBytes, this._pktPtr);
+    const ret = this._decSendPacket(this.ctx, this._pktPtr, esBytes.length);
     if (ret !== 0) console.warn(`[WasmFfmpegDecoder] dec_send_packet returned ${ret}`);
     return this._drain();
   }
@@ -129,6 +143,7 @@ export class WasmFfmpegDecoder {
 
   /** Recreate the decoder context (called on seek to drop stale reference frames). */
   reset(): void {
+    if (this._pktPtr) { this.mod._free(this._pktPtr); this._pktPtr = 0; this._pktCap = 0; }
     if (this._rgbaPtr) { this.mod._free(this._rgbaPtr); this._rgbaPtr = 0; this._rgbaCap = 0; }
     if (this._i420Ptr) { this.mod._free(this._i420Ptr); this._i420Ptr = 0; this._i420Cap = 0; }
     this._decFree(this.ctx);
@@ -137,6 +152,7 @@ export class WasmFfmpegDecoder {
   }
 
   close(): void {
+    if (this._pktPtr) { this.mod._free(this._pktPtr); this._pktPtr = 0; this._pktCap = 0; }
     if (this._rgbaPtr) { this.mod._free(this._rgbaPtr); this._rgbaPtr = 0; this._rgbaCap = 0; }
     if (this._i420Ptr) { this.mod._free(this._i420Ptr); this._i420Ptr = 0; this._i420Cap = 0; }
     if (this.ctx) { this._decFree(this.ctx); this.ctx = 0; }
