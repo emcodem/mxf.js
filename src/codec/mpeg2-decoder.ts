@@ -51,7 +51,8 @@ export interface Mpeg2DecoderImpl {
 // BitBuffer (buffer.js)
 // ---------------------------------------------------------------------------
 
-class BitBuffer {
+/** @internal Exported for unit tests only. */
+export class BitBuffer {
   bytes: Uint8Array;
   byteLength: number;
   index: number;
@@ -99,7 +100,11 @@ class BitBuffer {
   }
 
   findNextStartCode(): number {
-    for (let i = (this.index + 7) >> 3; i < this.byteLength; i++) {
+    // A start code plus its code byte needs 4 VALID bytes. The bytes behind byteLength are stale
+    // (write() compacts with copyWithin, reset() only zeroes byteLength), so scanning up to
+    // byteLength and reading i+1..i+3 turned a valid `00 00` tail + stale `01 xx` into a phantom
+    // start code (e.g. slice row 172 in a 68-row picture).
+    for (let i = (this.index + 7) >> 3; i + 3 < this.byteLength; i++) {
       if (this.bytes[i] === 0x00 && this.bytes[i + 1] === 0x00 && this.bytes[i + 2] === 0x01) {
         this.index = (i + 4) << 3;
         return this.bytes[i + 3];
@@ -119,8 +124,12 @@ class BitBuffer {
 
   nextBytesAreStartCode(): boolean {
     const i = (this.index + 7) >> 3;
+    // End of buffer ends the slice. With 1–2 valid bytes left no start code fits, so keep decoding
+    // (the last MBs of the last slice are read from there) — and never read stale bytes behind
+    // byteLength. Treating that case as a start code instead cuts the last MBs off pictures.
     return i >= this.byteLength ||
-      (this.bytes[i] === 0x00 && this.bytes[i + 1] === 0x00 && this.bytes[i + 2] === 0x01);
+      (i + 2 < this.byteLength &&
+        this.bytes[i] === 0x00 && this.bytes[i + 1] === 0x00 && this.bytes[i + 2] === 0x01);
   }
 
   read(count: number): number {
@@ -1082,6 +1091,10 @@ export class Mpeg2Decoder implements Mpeg2DecoderImpl {
   // -------------------------------------------------------------------------
 
   private decodeSlice(slice: number): void {
+    // A slice row beyond the picture can only come from a corrupt/phantom start code; decoding it
+    // would write macroblocks outside the picture. Skip it — the picture loop resyncs at the next
+    // start code.
+    if (slice > this.mbHeight) return;
     this.sliceBegin = true;
     this.macroblockAddress = (slice - 1) * this.mbWidth - 1;
     this.motionFwH = this.motionFwHPrev = 0;
