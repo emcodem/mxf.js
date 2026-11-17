@@ -162,6 +162,13 @@ async function actionPhase(page: Page, scrubWindowMs: number) {
     const tp0 = now();
     while (P.presented <= presentedAtPlay && now() - tp0 < 15_000) await sleep(16);
     const playToFirstFrameMs = now() - tPlay;
+    // Steady-state frame count: start the 1 s window only once playback is actually MOVING. The first
+    // painted frame can arrive well before that — the player shows the first decoded picture while it
+    // holds the element paused to fill the resume buffer — so counting from the first frame measured
+    // the buffering wait (0–1 frames), not steady playback.
+    const ct0 = video.currentTime;
+    while ((video.paused || video.currentTime <= ct0) && now() - tp0 < 15_000) await sleep(16);
+    await sleep(200); // let the renderer settle into cadence
     const presentedAfterFirst = P.presented;
     await sleep(1_000);
     const framesIn1sAfterStart = P.presented - presentedAfterFirst;
@@ -271,10 +278,10 @@ async function profile(srv: Srv): Promise<ScenarioResult & { runs: ScenarioResul
 }
 
 describe('URL playback under network latency', () => {
-  test('corporate (1ms) vs internet (50ms): reaction times, round-trips + frames displayed', async () => {
+  test('corporate (1ms) vs internet (50ms): reaction times, round-trips + frames displayed', async (ctx) => {
     if (!fs.existsSync(FILE_PATH)) {
       console.log(`skip latency test — file not found: ${FILE_PATH}`);
-      return;
+      return ctx.skip();
     }
 
     const low = await profile(lowSrv!);
