@@ -96,12 +96,14 @@ export const RESUME_BUFFER_SECONDS = CHUNK_DURATION_SECONDS + 0.5;
 /** Max cached scrub-preview segments (LRU, keyed by GOP-head keyframe edit unit). */
 export const SCRUB_CACHE_MAX = 128;
 /** Contiguous lookahead decoded at a scrub-preview keyframe so a paused <video> paints — TRANSCODE
- *  path (MPEG-2 / wasm plugin). Kept short (0.2 s) because each transcoded preview frame costs
- *  ~32 ms to decode+encode; the old 0.4 s (11 frames at 25 fps) was conservative. 0.2 s (6 frames)
- *  is enough for Chrome to settle a paused seek on the HD sources this path serves, halving
- *  per-preview decode time (~220 ms → ~4.5 new-GOP previews/s vs the old ~2.4/s). MIN_LOOKAHEAD_FRAMES
- *  (= 4) is the fps-independent floor and is unchanged. */
-export const SCRUB_PREVIEW_LOOKAHEAD_SECONDS = 0.2;
+ *  path (MPEG-2 / wasm plugin). Each transcoded preview frame costs ~32 ms to decode+encode, so it
+ *  is kept as short as Chrome allows — but no shorter: a paused seek into too short an isolated range
+ *  holds at readyState HAVE_METADATA and never paints. 0.2 s was tried and FAILED on XDCAM HD422
+ *  1080i50 open-GOP (leading B's dropped → only 4 frames / 0.16 s appended): a 3 s scrub sweep painted
+ *  2 new frames. Measured (latency.test.ts scrub sweep, headless Chrome, 1 ms and 50 ms RTT):
+ *  0.2 s → 2, 0.3 s → 5–6 (still rs=1), 0.4 s → 8–12 painted frames (rs=4), 0.6 s → 7, 1.0 s → 5
+ *  (paints, but each preview is slower). MIN_LOOKAHEAD_FRAMES (= 4) is the fps-independent floor. */
+export const SCRUB_PREVIEW_LOOKAHEAD_SECONDS = 0.4;
 /** Contiguous lookahead for the REMUX path (H.264 / AVC-Intra — no decode, just repackage).
  *  Must be LONGER: a high-bitrate UHD all-intra source (e.g. AVC-Intra Class 300, 3840×2160p50)
  *  will NOT let a paused <video> paint a seek into a 0.2 s isolated range — Chrome holds at
