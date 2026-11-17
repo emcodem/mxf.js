@@ -206,10 +206,10 @@ async function runPattern(page: Page, name: string, keys: Key[], gapMs: number, 
 }
 
 describe('skip/play freeze repro', () => {
-  test('chaotic skip + play gestures — does any wedge the playhead?', async () => {
+  test('chaotic skip + play gestures — does any wedge the playhead?', async (ctx) => {
     if (!fs.existsSync(SKIP_FILE)) {
       console.log(`skip freeze repro — file not found: ${SKIP_FILE} (set TEST_SKIP_FILE)`);
-      return;
+      return ctx.skip();
     }
 
     const page = await browser.newPage();

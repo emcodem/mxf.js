@@ -16,8 +16,8 @@ npm run typecheck  # tsc --noEmit
 
 Chrome path is resolved by `test/e2e/chrome-path.ts`: `CHROME_PATH` env → Puppeteer's bundled Chrome for Testing (`puppeteer.executablePath()`, has proprietary codecs) → Windows system-Chrome fallback. Set `CHROME_PATH` to force a specific binary.
 
-E2E tests and the Puppeteer scripts run **headless** by default; set `E2E_HEADFUL=1` to watch the browser. The Vite dev server only auto-opens the demo for `npm run dev` (not under Vitest, or with `MXF_NO_OPEN=1`).
+E2E tests and the Puppeteer scripts run **headless** by default; set `E2E_HEADFUL=1` to watch the browser. The Vite dev server only auto-opens the demo for `npm run dev` (not under Vitest, or with `MXF_NO_OPEN=1`). Tests whose media file is missing report as **skipped**, not passed.
 
-Safari E2E (`test/e2e/safari.test.ts`) drives safaridriver via raw WebDriver; requires Develop → Allow Remote Automation. Validates the Safari 16.x VideoEncoder ½-scale fallback.
+Safari E2E (`test/e2e/safari.test.ts`) drives safaridriver via raw WebDriver; requires Develop → Allow Remote Automation (skipped automatically on non-macOS). Validates the Safari 16.x VideoEncoder ½-scale fallback.
 
 **E2E tests run the built `dist` bundle** — run `npm run build` after changing player/worker source. Latency test knobs (env vars): `MXF_RATE_HIGH` (bytes/sec, 0=unlimited), `MXF_LAT_HIGH`/`MXF_LAT_LOW` (ms RTT), `TEST_URL_MXF`.

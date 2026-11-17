@@ -340,10 +340,10 @@ describe('MXF player E2E', () => {
   // "stops playing frames once I scrub". Uses the all-intra XAVC file (cheap remux preview path);
   // skips if absent.
   const SCRUB_FILE = process.env.TEST_SCRUB_FILE ?? 'C:/temp/mxf.js/xavc_p50_vistek.mxf';
-  test('fast scrub keeps rendering frames (no freeze)', async () => {
+  test('fast scrub keeps rendering frames (no freeze)', async (ctx) => {
     if (!fs.existsSync(SCRUB_FILE)) {
       console.log(`skip scrub test — file not found: ${SCRUB_FILE}`);
-      return;
+      return ctx.skip();
     }
     const page = await browser.newPage();
     const logs: string[] = [];
@@ -428,10 +428,10 @@ describe('MXF player E2E', () => {
   // drag outruns it, whereas XAVC remux stays smooth. Defaults to the MPEG-2 long-GOP file (the
   // interesting case); override with TEST_SPEED_FILE.
   const SPEED_FILE = process.env.TEST_SPEED_FILE ?? process.env.TEST_SCRUB_FILE ?? 'C:/temp/mxf.js/xdcam_vistek.mxf';
-  test('scrub throughput at varying speeds (frames actually displayed)', async () => {
+  test('scrub throughput at varying speeds (frames actually displayed)', async (ctx) => {
     if (!fs.existsSync(SPEED_FILE)) {
       console.log(`skip scrub-speed test — file not found: ${SPEED_FILE}`);
-      return;
+      return ctx.skip();
     }
     const page = await browser.newPage();
     const logs: string[] = [];
@@ -536,10 +536,10 @@ describe('MXF player E2E', () => {
   // (which saturated the worker and overflowed the SourceBuffer with QuotaExceededError). The
   // resident buffer must stay bounded and no quota/SourceBuffer error must fire.
   const BUFFER_FILE = process.env.TEST_BUFFER_FILE ?? 'C:/temp/mxf.js/xavc_class100_50i_vistek.mxf';
-  test('buffer stays bounded — no whole-file prefetch / quota overflow', async () => {
+  test('buffer stays bounded — no whole-file prefetch / quota overflow', async (ctx) => {
     if (!fs.existsSync(BUFFER_FILE)) {
       console.log(`skip buffer test — file not found: ${BUFFER_FILE}`);
-      return;
+      return ctx.skip();
     }
     const page = await browser.newPage();
     const logs: string[] = [];

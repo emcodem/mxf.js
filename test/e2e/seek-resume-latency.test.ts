@@ -39,8 +39,8 @@ beforeAll(async () => {
 afterAll(async () => { await browser?.close(); await vite?.close(); });
 
 describe('scrub-release → resume latency', () => {
-  test('drag 50%→75%, release, measure time to picture + playback resume', async () => {
-    if (!fs.existsSync(SKIP_FILE)) { console.log(`skip — file not found: ${SKIP_FILE}`); return; }
+  test('drag 50%→75%, release, measure time to picture + playback resume', async (ctx) => {
+    if (!fs.existsSync(SKIP_FILE)) { console.log(`skip — file not found: ${SKIP_FILE}`); return ctx.skip(); }
     const page = await browser.newPage();
     const logs: string[] = [];
     page.on('console', m => logs.push(`[${m.type()}] ${m.text()}`));

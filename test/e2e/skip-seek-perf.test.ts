@@ -159,10 +159,10 @@ async function runPhase(page: Page, key: 'ArrowUp' | 'ArrowDown', presses: numbe
 }
 
 describe('skip-seek + play response times', () => {
-  test('skip +10s×3 → play, then skip −10s×2 → play (characterization)', async () => {
+  test('skip +10s×3 → play, then skip −10s×2 → play (characterization)', async (ctx) => {
     if (!fs.existsSync(SKIP_FILE)) {
       console.log(`skip skip-seek test — file not found: ${SKIP_FILE} (set TEST_SKIP_FILE)`);
-      return;
+      return ctx.skip();
     }
 
     const page = await browser.newPage();

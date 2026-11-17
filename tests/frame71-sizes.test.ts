@@ -24,9 +24,9 @@ class FsLoader implements ILoader {
   destroy(): void { try { fs.closeSync(this.fd); } catch { } }
 }
 
-it('frame sizes around 71', async () => {
+it('frame sizes around 71', async (ctx) => {
   const FILE = process.env.TEST_MXF_FILE ?? path.resolve(__dirname, '../media/xdcamhd_1920_25i_16tracks.mxf');
-  if (!fs.existsSync(FILE)) { console.log(`skip: ${FILE} not found`); return; }
+  if (!fs.existsSync(FILE)) { console.log(`skip: ${FILE} not found`); return ctx.skip(); }
   const loader = new FsLoader(FILE);
   const bootstrap = await new MxfFile(loader, false).open();
   const ex = new EssenceExtractor(loader, bootstrap);

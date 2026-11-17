@@ -61,7 +61,11 @@ async function waitFor(fn: () => Promise<boolean>, timeoutMs = 30_000, pollMs = 
 let vite: ViteDevServer;
 let safariProc: ChildProcess;
 
+// safaridriver only exists on macOS: skip (instead of failing with spawn ENOENT) everywhere else.
+const IS_MAC = process.platform === 'darwin';
+
 beforeAll(async () => {
+  if (!IS_MAC) return;
   // Start Vite
   vite = await createServer({
     root: projectRoot,
@@ -93,7 +97,7 @@ afterAll(async () => {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-describe('MXF player E2E — Safari', () => {
+describe.skipIf(!IS_MAC)('MXF player E2E — Safari', () => {
 
   test('demo page loads', async () => {
     await navigate(`http://localhost:${VITE_PORT}/demo/index.html`);
@@ -133,10 +137,10 @@ describe('MXF player E2E — Safari', () => {
     expect(result.avc1Supported, 'H.264 mp4 not supported').toBe(true);
   });
 
-  test('MXF file: manifest received, no SourceBuffer error', async () => {
+  test('MXF file: manifest received, no SourceBuffer error', async (ctx) => {
     if (!fs.existsSync(TEST_FILE)) {
       console.log(`skip: ${TEST_FILE} not found`);
-      return;
+      return ctx.skip();
     }
 
     await navigate(`http://localhost:${VITE_PORT}/demo/index.html`);
