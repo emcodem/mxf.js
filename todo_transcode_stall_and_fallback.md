@@ -10,9 +10,11 @@ freeze).
 
 **Update 2026-11-17:** the MPEG-2 half of the Issue A change (a keyframe only every
 `TRANSCODE_KEYFRAME_INTERVAL_SECONDS` instead of at the start of every chunk) was **reverted** in
-`3f9be75`. MSE drops appended frames until the next keyframe after any `remove()`/`abort()`/
+`ed713ab`. MSE drops appended frames until the next keyframe after any `remove()`/`abort()`/
 timestamp discontinuity, so without a keyframe per chunk, playback after a seek or rewind painted
 almost no frames (skip-seek-freeze E2E). The ProRes all-intra change stays.
+(Commit hashes changed when the author email was rewritten on 2026-11-17. Old hashes quoted in
+commit messages map as: 996aaf9 → 1a4cf18, 74e4156 → e757bf3, 3f9be75 → ed713ab.)
 
 ## Context: what was being tested and with what
 
